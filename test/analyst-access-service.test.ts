@@ -1,0 +1,149 @@
+import { jest, describe, it, expect, beforeEach } from '@jest/globals';
+import { createHash } from 'crypto';
+import { AnalystAccessService } from '../src/services/analyst-access-service.js';
+import { AnalystAccessRepository } from '../src/gcp/analyst-access-repository.js';
+import { AnalystAccess } from '../src/types/analyst-access.js';
+
+function hash(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+describe('AnalystAccessService', () => {
+  let mockRepo: { [K in keyof AnalystAccessRepository]: jest.Mock };
+  let service: AnalystAccessService;
+
+  beforeEach(() => {
+    mockRepo = {
+      createClaim: jest.fn().mockResolvedValue(undefined),
+      getClaimByTokenHash: jest.fn(),
+      claimAndIssueCredential: jest.fn(),
+      resolveCredential: jest.fn(),
+    } as any;
+    service = new AnalystAccessService(mockRepo as unknown as AnalystAccessRepository);
+  });
+
+  describe('createClaim', () => {
+    it('generates a random token, stores only its hash, and returns the raw token', async () => {
+      const token = await service.createClaim('tenant-a', 'analyst@example.com');
+
+      expect(typeof token).toBe('string');
+      expect(token.length).toBeGreaterThan(20);
+
+      expect(mockRepo.createClaim).toHaveBeenCalledTimes(1);
+      const [tenantId, analystEmail, storedHash, expiresAt] = mockRepo.createClaim.mock.calls[0];
+      expect(tenantId).toBe('tenant-a');
+      expect(analystEmail).toBe('analyst@example.com');
+      expect(storedHash).toBe(hash(token));
+      expect(storedHash).not.toBe(token);
+      expect(expiresAt.getTime()).toBeGreaterThan(Date.now());
+    });
+  });
+
+  describe('claim', () => {
+    const baseRecord: AnalystAccess = {
+      claim_token_hash: 'irrelevant-for-lookup', // service looks up by hash(token) it computes itself
+      tenant_id: 'tenant-a',
+      analyst_email: 'analyst@example.com',
+      created_at: new Date(),
+      expires_at: new Date(Date.now() + 60_000),
+    };
+
+    it('returns null when the token is unknown', async () => {
+      mockRepo.getClaimByTokenHash.mockResolvedValue(null);
+      const result = await service.claim('some-token');
+      expect(result).toBeNull();
+      expect(mockRepo.claimAndIssueCredential).not.toHaveBeenCalled();
+    });
+
+    it('returns null when the token was already claimed', async () => {
+      mockRepo.getClaimByTokenHash.mockResolvedValue({ ...baseRecord, claimed_at: new Date() });
+      const result = await service.claim('some-token');
+      expect(result).toBeNull();
+      expect(mockRepo.claimAndIssueCredential).not.toHaveBeenCalled();
+    });
+
+    it('returns null when the token has expired', async () => {
+      mockRepo.getClaimByTokenHash.mockResolvedValue({ ...baseRecord, expires_at: new Date(Date.now() - 1000) });
+      const result = await service.claim('some-token');
+      expect(result).toBeNull();
+      expect(mockRepo.claimAndIssueCredential).not.toHaveBeenCalled();
+    });
+
+    it('handles a Firestore Timestamp-shaped expires_at (toMillis), not just a native Date', async () => {
+      mockRepo.getClaimByTokenHash.mockResolvedValue({
+        ...baseRecord,
+        expires_at: { toMillis: () => Date.now() - 1000 } as any,
+      });
+      const result = await service.claim('some-token');
+      expect(result).toBeNull();
+    });
+
+    it('issues a real API key on a valid, unclaimed, unexpired token', async () => {
+      mockRepo.getClaimByTokenHash.mockResolvedValue(baseRecord);
+      mockRepo.claimAndIssueCredential.mockImplementation(async (_claimTokenHash: string, credentialKeyHash: string) => ({
+        ...baseRecord,
+        claimed_at: new Date(),
+        credential_key_hash: credentialKeyHash,
+      }));
+
+      const result = await service.claim('some-token');
+
+      expect(result).not.toBeNull();
+      expect(result!.analystEmail).toBe('analyst@example.com');
+      expect(typeof result!.apiKey).toBe('string');
+      expect(result!.apiKey.length).toBeGreaterThan(20);
+
+      const [claimTokenHashArg, credentialKeyHashArg] = mockRepo.claimAndIssueCredential.mock.calls[0];
+      expect(claimTokenHashArg).toBe(hash('some-token'));
+      expect(credentialKeyHashArg).toBe(hash(result!.apiKey));
+    });
+
+    it('returns null if claimAndIssueCredential loses a race (concurrent claim)', async () => {
+      mockRepo.getClaimByTokenHash.mockResolvedValue(baseRecord);
+      mockRepo.claimAndIssueCredential.mockResolvedValue(null);
+
+      const result = await service.claim('some-token');
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('resolveCredential', () => {
+    it('returns null when no credential matches', async () => {
+      mockRepo.resolveCredential.mockResolvedValue(null);
+      const result = await service.resolveCredential('some-api-key');
+      expect(result).toBeNull();
+    });
+
+    it('returns null when the matching credential has been revoked', async () => {
+      mockRepo.resolveCredential.mockResolvedValue({
+        claim_token_hash: 'x',
+        credential_key_hash: hash('some-api-key'),
+        tenant_id: 'tenant-a',
+        analyst_email: 'analyst@example.com',
+        created_at: new Date(),
+        expires_at: new Date(),
+        claimed_at: new Date(),
+        revoked_at: new Date(),
+      });
+      const result = await service.resolveCredential('some-api-key');
+      expect(result).toBeNull();
+    });
+
+    it('resolves the tenant and analyst email for a valid, non-revoked credential', async () => {
+      mockRepo.resolveCredential.mockResolvedValue({
+        claim_token_hash: 'x',
+        credential_key_hash: hash('some-api-key'),
+        tenant_id: 'tenant-a',
+        analyst_email: 'analyst@example.com',
+        created_at: new Date(),
+        expires_at: new Date(),
+        claimed_at: new Date(),
+      });
+
+      const result = await service.resolveCredential('some-api-key');
+
+      expect(result).toEqual({ tenantId: 'tenant-a', analystEmail: 'analyst@example.com' });
+      expect(mockRepo.resolveCredential).toHaveBeenCalledWith(hash('some-api-key'));
+    });
+  });
+});

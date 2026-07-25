@@ -1,0 +1,191 @@
+import { describe, expect, it } from '@jest/globals';
+import Fastify from 'fastify';
+import { PiiRegistryService, type PiiDeclarationStore } from '../src/services/pii-registry-service.js';
+import { buildManualEntry } from '../src/services/pii-registry-validation.js';
+import { piiRegistryRoutes } from '../src/routes/pii-registry.js';
+import type { PiiRegistryDeclarationInput, PiiRegistryEntry } from '../src/types/pii-registry.js';
+
+const WRITE_TOKEN = 'test-write-token';
+
+const validInput: PiiRegistryDeclarationInput = {
+  resourceId: 'bigquery:acme.fivetran_hubspot.contacts',
+  system: 'bigquery',
+  resourceLayer: 'RAW',
+  tenantIdColumn: 'tenant_id',
+  userIdColumn: 'user_id',
+  piiFields: [{ name: 'email', classification: 'DIRECT_IDENTIFIER', handling: 'ENCRYPT' }],
+};
+
+class FakeStore implements PiiDeclarationStore {
+  public upserts: PiiRegistryEntry[] = [];
+  public deletes: Array<{ tenantId: string; resourceId: string }> = [];
+  async upsert(entry: PiiRegistryEntry): Promise<void> {
+    this.upserts.push(entry);
+  }
+  async delete(tenantId: string, resourceId: string): Promise<void> {
+    this.deletes.push({ tenantId, resourceId });
+  }
+}
+
+describe('buildManualEntry (validation)', () => {
+  it('assembles a manual entry from a valid declaration', () => {
+    const { entry, errors } = buildManualEntry(validInput, 'acme');
+    expect(errors).toEqual([]);
+    expect(entry).toBeDefined();
+    expect(entry?.ownerConnector).toBe('manual');
+    expect(entry?.tenantId).toBe('acme');
+    expect(entry?.status).toBe('PENDING_REVIEW');
+    expect(entry?.piiFields[0].confidence).toBe('DECLARED');
+  });
+
+  it('collects errors for bad enums and empty fields', () => {
+    const { entry, errors } = buildManualEntry(
+      { resourceId: 'not-a-uri', system: 'mysql' as never, piiFields: [] },
+      'acme'
+    );
+    expect(entry).toBeUndefined();
+    expect(errors.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('requires a tenantId', () => {
+    const { errors } = buildManualEntry(validInput, '');
+    expect(errors.some((e) => e.includes('tenantId'))).toBe(true);
+  });
+});
+
+describe('PiiRegistryService mutation + tenant scoping', () => {
+  it('persists through the store and serves the entry to its tenant only', async () => {
+    const store = new FakeStore();
+    const service = new PiiRegistryService([], store);
+    const { entry } = buildManualEntry(validInput, 'acme');
+    await service.upsertEntry(entry!);
+
+    expect(store.upserts).toHaveLength(1);
+    expect(service.getEntry(validInput.resourceId, 'acme')?.tenantId).toBe('acme');
+    // A different tenant must not see acme's declaration.
+    expect(service.getEntry(validInput.resourceId, 'globex')).toBeUndefined();
+    expect(service.listEntries({ tenantId: 'globex' })).toHaveLength(0);
+  });
+
+  it('keeps global (platform) entries visible to every tenant', () => {
+    const globalEntry = buildManualEntry(validInput, 'acme').entry!;
+    delete globalEntry.tenantId; // simulate a platform/global entry
+    const service = new PiiRegistryService([globalEntry]);
+    expect(service.getEntry(validInput.resourceId, 'anyone')).toBeDefined();
+  });
+
+  it('refuses to mutate a platform-owned entry', async () => {
+    const platformEntry: PiiRegistryEntry = { ...buildManualEntry(validInput, 'acme').entry!, ownerConnector: 'pipelines' };
+    const service = new PiiRegistryService([platformEntry]);
+    await expect(service.upsertEntry(platformEntry)).rejects.toThrow(/manually declared/);
+  });
+
+  it('removes a tenant-owned manual entry', async () => {
+    const store = new FakeStore();
+    const service = new PiiRegistryService([], store);
+    await service.upsertEntry(buildManualEntry(validInput, 'acme').entry!);
+    const removed = await service.removeEntry(validInput.resourceId, 'acme');
+    expect(removed).toBe(true);
+    expect(store.deletes).toHaveLength(1);
+    expect(service.getEntry(validInput.resourceId, 'acme')).toBeUndefined();
+  });
+});
+
+describe('piiRegistryRoutes write API (auth + lifecycle)', () => {
+  async function makeApp() {
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+    });
+    return app;
+  }
+
+  it('rejects a write without the bearer token', async () => {
+    const app = await makeApp();
+    const res = await app.inject({ method: 'POST', url: '/pii-registry/resources', payload: validInput });
+    expect(res.statusCode).toBe(401);
+    await app.close();
+  });
+
+  it('disables writes entirely when no token is configured', async () => {
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, { piiRegistryService: new PiiRegistryService([], new FakeStore()) });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: { authorization: 'Bearer anything' },
+      payload: validInput,
+    });
+    expect(res.statusCode).toBe(503);
+    await app.close();
+  });
+
+  it('declares, reads back per-tenant, and removes a resource', async () => {
+    const app = await makeApp();
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({ method: 'POST', url: '/pii-registry/resources', headers: auth, payload: validInput });
+    expect(create.statusCode).toBe(201);
+    expect(JSON.parse(create.body).resource.ownerConnector).toBe('manual');
+
+    // Visible to the declaring tenant...
+    const listAcme = await app.inject({ method: 'GET', url: '/pii-registry/resources', headers: { 'x-tenant-id': 'acme' } });
+    expect(JSON.parse(listAcme.body).count).toBe(1);
+    // ...but not to another tenant.
+    const listOther = await app.inject({ method: 'GET', url: '/pii-registry/resources', headers: { 'x-tenant-id': 'globex' } });
+    expect(JSON.parse(listOther.body).count).toBe(0);
+
+    const encoded = encodeURIComponent(validInput.resourceId);
+    const del = await app.inject({ method: 'DELETE', url: `/pii-registry/resources/${encoded}`, headers: auth });
+    expect(del.statusCode).toBe(200);
+    const listAfter = await app.inject({ method: 'GET', url: '/pii-registry/resources', headers: { 'x-tenant-id': 'acme' } });
+    expect(JSON.parse(listAfter.body).count).toBe(0);
+
+    await app.close();
+  });
+
+  it('lists discovery findings and hides ones already declared', async () => {
+    const service = new PiiRegistryService([], new FakeStore());
+    const finding = {
+      resourceId: 'bigquery:acme.fivetran_hubspot.contacts',
+      system: 'bigquery',
+      registryStatus: 'UNREGISTERED' as const,
+      columns: ['email', 'phone'],
+      lastSeen: '2026-07-02T00:00:00.000Z',
+    };
+    const discoverySource = { getWarehouseDiscoveryFindings: async () => [finding] };
+
+    const app = Fastify({ logger: false })
+    await app.register(piiRegistryRoutes, { piiRegistryService: service, writeToken: WRITE_TOKEN, discoverySource })
+
+    // Initially the finding is undeclared → surfaced.
+    const before = await app.inject({ method: 'GET', url: '/pii-registry/discovery', headers: { 'x-tenant-id': 'acme' } })
+    expect(JSON.parse(before.body).count).toBe(1)
+
+    // Declare it, then it should disappear from the discovery queue.
+    await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' },
+      payload: { ...validInput, resourceId: finding.resourceId },
+    })
+    const after = await app.inject({ method: 'GET', url: '/pii-registry/discovery', headers: { 'x-tenant-id': 'acme' } })
+    expect(JSON.parse(after.body).count).toBe(0)
+
+    await app.close()
+  });
+
+  it('returns 400 with issues for an invalid declaration', async () => {
+    const app = await makeApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' },
+      payload: { resourceId: 'bad', system: 'bigquery', piiFields: [] },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).issues.length).toBeGreaterThan(0);
+    await app.close();
+  });
+});

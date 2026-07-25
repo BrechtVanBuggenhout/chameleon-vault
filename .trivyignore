@@ -1,0 +1,39 @@
+# Fastify v4 vulnerabilities — all fixed in v5.
+# Risk accepted: Key Vault has INGRESS_TRAFFIC_INTERNAL_ONLY so is not reachable
+# from untrusted clients. Migrate to fastify v5 to resolve permanently.
+CVE-2026-25223
+GHSA-jx2c-rxcm-jvmq
+GHSA-mrq3-vjjr-p77c
+GHSA-444r-cwp2-x5xf
+
+# picomatch ReDoS in npm's own bundled copy (usr/local/lib/node_modules/npm/).
+# Not in our app code — cannot be fixed via npm overrides.
+# Fixed in picomatch 4.0.4/3.0.2/2.3.2 but updating system npm is outside scope.
+CVE-2026-33671
+
+# sigstore certificateOIDs verification bypass in npm's own bundled copy
+# (usr/local/lib/node_modules/npm/ — npm vendors sigstore for install provenance).
+# Not an app dependency (absent from package-lock); cannot be fixed via npm overrides.
+# npm's provenance verifier is never invoked at runtime, and the Key Vault is
+# INGRESS_TRAFFIC_INTERNAL_ONLY. Fixed in sigstore 4.1.1 (ships with a newer system npm).
+CVE-2026-48815
+
+# node-tar DoS (gzip bomb / malformed header) in npm's own bundled copy
+# (usr/local/lib/node_modules/npm/ — npm vendors tar for its own package
+# extraction). Absent from our package-lock entirely -- not an app dependency,
+# cannot be fixed via npm overrides. npm is never invoked at runtime (the
+# container's CMD is `node dist/main.js`), and the Key Vault is
+# INGRESS_TRAFFIC_INTERNAL_ONLY. Fixed in tar 7.5.18/7.5.19 (ships with a
+# newer system npm).
+CVE-2026-59873
+CVE-2026-59874
+
+# brace-expansion ReDoS in npm's own bundled copy (usr/local/lib/node_modules/npm/
+# -- npm vendors its own minimatch/brace-expansion for internal glob matching).
+# brace-expansion IS in our package-lock, but only via eslint -> minimatch, a
+# devDependency; the image's dependencies stage runs `npm ci --only=production`,
+# which excludes devDependencies, so that copy never reaches the final image.
+# The version Trivy flags in the scanned image is npm's own internal copy, not
+# reachable at runtime. Fixed in brace-expansion 5.0.7/2.1.2/1.1.16 (ships with
+# a newer system npm).
+CVE-2026-13149
