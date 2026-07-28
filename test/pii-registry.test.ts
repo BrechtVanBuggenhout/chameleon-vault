@@ -150,4 +150,81 @@ describe('piiRegistryRoutes', () => {
 
     await app.close();
   });
+
+  it('returns 503 when schema introspection is not configured', async () => {
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService(devPiiRegistry),
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/pii-registry/schema?resourceId=bigquery:proj.dataset.table',
+    });
+
+    expect(response.statusCode).toBe(503);
+    await app.close();
+  });
+
+  it('returns 400 when resourceId is missing', async () => {
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService(devPiiRegistry),
+      schemaSource: { getColumns: async () => [] },
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/pii-registry/schema' });
+
+    expect(response.statusCode).toBe(400);
+    await app.close();
+  });
+
+  it('returns discovered columns from the schema source', async () => {
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService(devPiiRegistry),
+      schemaSource: {
+        getColumns: async (resourceId: string) => {
+          expect(resourceId).toBe('bigquery:proj.dataset.federated_user');
+          return [
+            { name: 'email', dataType: 'STRING', nullable: true, ordinalPosition: 1 },
+            { name: 'username', dataType: 'STRING', nullable: false, ordinalPosition: 2 },
+          ];
+        },
+      },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/pii-registry/schema?resourceId=bigquery:proj.dataset.federated_user',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.count).toBe(2);
+    expect(body.columns[0]).toEqual({ name: 'email', dataType: 'STRING', nullable: true, ordinalPosition: 1 });
+
+    await app.close();
+  });
+
+  it('surfaces an invalid resourceId as a 400', async () => {
+    const app = Fastify({ logger: false });
+    const { InvalidResourceIdError } = await import('../src/gcp/bigquery-schema-service.js');
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService(devPiiRegistry),
+      schemaSource: {
+        getColumns: async () => {
+          throw new InvalidResourceIdError('bad resource id');
+        },
+      },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/pii-registry/schema?resourceId=not-a-real-id',
+    });
+
+    expect(response.statusCode).toBe(400);
+    await app.close();
+  });
 });

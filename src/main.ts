@@ -26,6 +26,7 @@ import { devPiiRegistry } from './data/pii-registry.js';
 import { FirestorePiiDeclarationRepository } from './gcp/pii-registry-declaration-repository.js';
 import { BigQueryPiiRegistryAuditMirror } from './gcp/pii-registry-audit-mirror.js';
 import { BigQueryPiiRegistryRepository, composePiiRegistry } from './gcp/pii-registry-repository.js';
+import { BigQuerySchemaService } from './gcp/bigquery-schema-service.js';
 import { SnowflakePiiRegistryRepository } from './snowflake/pii-registry-repository.js';
 import type { PiiRegistryEntry } from './types/pii-registry.js';
 
@@ -170,6 +171,7 @@ async function main() {
   if (!registryWriteToken) {
     logger.warn('PII_REGISTRY_WRITE_TOKEN not set; the declare API (POST/PUT/DELETE) is disabled.');
   }
+  const schemaService = new BigQuerySchemaService(projectId);
 
   const deletionRequestService = new DeletionRequestService(
     deletionRequestRepo,
@@ -222,7 +224,12 @@ async function main() {
   await fastify.register(lineageRoutes, { lineageRepository, firestoreRegistry, janitorService });
   await fastify.register(deletionRequestRoutes, { deletionRequestService });
   await fastify.register(certificateRoutes, { certificateService });
-  await fastify.register(piiRegistryRoutes, { piiRegistryService, writeToken: registryWriteToken, discoverySource: lineageRepository });
+  await fastify.register(piiRegistryRoutes, {
+    piiRegistryService,
+    writeToken: registryWriteToken,
+    discoverySource: lineageRepository,
+    schemaSource: schemaService,
+  });
   await fastify.register(analystClaimsRoutes, { analystAccessService });
 
   const port = parseInt(process.env.PORT || '8080', 10);

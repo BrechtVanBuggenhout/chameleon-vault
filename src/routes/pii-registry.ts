@@ -3,6 +3,7 @@ import { createLogger } from '../logging/index.js';
 import { PiiRegistryService, RegistryMutationError } from '../services/pii-registry-service.js';
 import { buildManualEntry } from '../services/pii-registry-validation.js';
 import { computeCoverage, toCoverageItems } from '../services/pii-coverage.js';
+import { InvalidResourceIdError, type DiscoveredColumn } from '../gcp/bigquery-schema-service.js';
 import type { PiiRegistryDeclarationInput } from '../types/pii-registry.js';
 import type { WarehouseDiscoveryFinding } from '../types/lineage.js';
 
@@ -15,6 +16,11 @@ export interface DiscoveryFindingsSource {
   getWarehouseDiscoveryFindings?(tenantId?: string): Promise<WarehouseDiscoveryFinding[]>;
 }
 
+/** Narrow dependency: just the schema reader, so tests don't need a real BigQuery client. */
+export interface SchemaSource {
+  getColumns(resourceId: string): Promise<DiscoveredColumn[]>;
+}
+
 export interface PiiRegistryRoutesOptions {
   piiRegistryService: PiiRegistryService;
   /**
@@ -24,6 +30,8 @@ export interface PiiRegistryRoutesOptions {
   writeToken?: string;
   /** Source of crawler discovery findings for the "declare undeclared table" workflow. */
   discoverySource?: DiscoveryFindingsSource;
+  /** Live BigQuery schema reader for the Declare form's column picker. Undefined disables it gracefully. */
+  schemaSource?: SchemaSource;
 }
 
 function tenantOf(request: FastifyRequest): string {
@@ -36,7 +44,7 @@ export async function piiRegistryRoutes(
   fastify: FastifyInstance,
   options: PiiRegistryRoutesOptions
 ): Promise<void> {
-  const { piiRegistryService, writeToken, discoverySource } = options;
+  const { piiRegistryService, writeToken, discoverySource, schemaSource } = options;
 
   // Gate every mutating route behind the shared-secret bearer token.
   const requireWriteAuth = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
@@ -143,6 +151,32 @@ export async function piiRegistryRoutes(
     } catch (error) {
       logger.error({ error }, 'Failed to list warehouse discovery findings');
       return reply.status(500).send({ error: 'Internal server error', statusCode: 500 });
+    }
+  });
+
+  // Live column list for a resource ID, so the Declare form can offer real
+  // columns to pick from instead of asking someone to type them from memory.
+  // Read-only (INFORMATION_SCHEMA only, never table data) — no write auth needed.
+  fastify.get('/pii-registry/schema', async (request, reply) => {
+    const { resourceId } = request.query as { resourceId?: string };
+    if (!resourceId) {
+      return reply.status(400).send({ error: 'resourceId query parameter is required', statusCode: 400 });
+    }
+    if (!schemaSource) {
+      return reply.status(503).send({ error: 'Schema introspection is not configured', statusCode: 503 });
+    }
+    try {
+      const columns = await schemaSource.getColumns(resourceId);
+      return reply.send({ resourceId, columns, count: columns.length, timestamp: new Date().toISOString() });
+    } catch (error) {
+      if (error instanceof InvalidResourceIdError) {
+        return reply.status(400).send({ error: error.message, statusCode: 400 });
+      }
+      logger.error({ error, resourceId }, 'Failed to read BigQuery schema');
+      return reply.status(502).send({
+        error: 'Failed to read the table schema — check the resource ID and that Key Vault has access to it.',
+        statusCode: 502,
+      });
     }
   });
 
