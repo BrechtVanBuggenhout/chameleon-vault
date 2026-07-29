@@ -21,6 +21,16 @@ export interface SchemaSource {
   getColumns(resourceId: string): Promise<DiscoveredColumn[]>;
 }
 
+/** Narrow dependency: just the on-demand sync trigger, so tests don't need real GCP auth. */
+export interface SyncTrigger {
+  trigger(): Promise<{
+    status: string;
+    resources_synced: number;
+    users_synced: number;
+    errors: Array<{ resourceId: string; error: string }>;
+  }>;
+}
+
 export interface PiiRegistryRoutesOptions {
   piiRegistryService: PiiRegistryService;
   /**
@@ -32,6 +42,8 @@ export interface PiiRegistryRoutesOptions {
   discoverySource?: DiscoveryFindingsSource;
   /** Live BigQuery schema reader for the Declare form's column picker. Undefined disables it gracefully. */
   schemaSource?: SchemaSource;
+  /** On-demand trigger for the pii_vault backfill/sync job. Undefined disables it gracefully. */
+  syncTrigger?: SyncTrigger;
 }
 
 function tenantOf(request: FastifyRequest): string {
@@ -44,7 +56,7 @@ export async function piiRegistryRoutes(
   fastify: FastifyInstance,
   options: PiiRegistryRoutesOptions
 ): Promise<void> {
-  const { piiRegistryService, writeToken, discoverySource, schemaSource } = options;
+  const { piiRegistryService, writeToken, discoverySource, schemaSource, syncTrigger } = options;
 
   // Gate every mutating route behind the shared-secret bearer token.
   const requireWriteAuth = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
@@ -175,6 +187,27 @@ export async function piiRegistryRoutes(
       logger.error({ error, resourceId }, 'Failed to read BigQuery schema');
       return reply.status(502).send({
         error: 'Failed to read the table schema — check the resource ID and that Key Vault has access to it.',
+        statusCode: 502,
+      });
+    }
+  });
+
+  // On-demand trigger for the same backfill/sync the daily scheduler runs --
+  // so a newly-declared field or resource doesn't have to wait for the next
+  // scheduled run. Gated behind requireWriteAuth like the declare API below:
+  // unlike the read-only routes above, this kicks off real encryption and
+  // BigQuery writes, not just a read.
+  fastify.post('/pii-registry/sync-now', { preHandler: requireWriteAuth }, async (request, reply) => {
+    if (!syncTrigger) {
+      return reply.status(503).send({ error: 'On-demand sync is not configured', statusCode: 503 });
+    }
+    try {
+      const result = await syncTrigger.trigger();
+      return reply.send({ ...result, timestamp: new Date().toISOString() });
+    } catch (error) {
+      logger.error({ error }, 'Failed to trigger on-demand PII vault sync');
+      return reply.status(502).send({
+        error: 'Failed to reach the PII sync worker',
         statusCode: 502,
       });
     }

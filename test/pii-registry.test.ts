@@ -228,3 +228,106 @@ describe('piiRegistryRoutes', () => {
     await app.close();
   });
 });
+
+describe('POST /pii-registry/sync-now', () => {
+  const WRITE_TOKEN = 'test-write-token';
+
+  it('returns 503 when no write token is configured', async () => {
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService(devPiiRegistry),
+      syncTrigger: { trigger: async () => ({ status: 'ok', resources_synced: 1, users_synced: 1, errors: [] }) },
+    });
+
+    const response = await app.inject({ method: 'POST', url: '/pii-registry/sync-now' });
+
+    expect(response.statusCode).toBe(503);
+    await app.close();
+  });
+
+  it('rejects requests without a valid write token, same as the declare API', async () => {
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService(devPiiRegistry),
+      writeToken: WRITE_TOKEN,
+      syncTrigger: { trigger: async () => ({ status: 'ok', resources_synced: 1, users_synced: 1, errors: [] }) },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/sync-now',
+      headers: { authorization: 'Bearer wrong-token' },
+    });
+
+    expect(response.statusCode).toBe(401);
+    await app.close();
+  });
+
+  it('returns 503 when no sync trigger is configured, even with a valid write token', async () => {
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService(devPiiRegistry),
+      writeToken: WRITE_TOKEN,
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/sync-now',
+      headers: { authorization: `Bearer ${WRITE_TOKEN}` },
+    });
+
+    expect(response.statusCode).toBe(503);
+    await app.close();
+  });
+
+  it('triggers the sync and returns its result', async () => {
+    const app = Fastify({ logger: false });
+    let triggered = false;
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService(devPiiRegistry),
+      writeToken: WRITE_TOKEN,
+      syncTrigger: {
+        trigger: async () => {
+          triggered = true;
+          return { status: 'ok', resources_synced: 2, users_synced: 5, errors: [] };
+        },
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/sync-now',
+      headers: { authorization: `Bearer ${WRITE_TOKEN}` },
+    });
+
+    expect(triggered).toBe(true);
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.resources_synced).toBe(2);
+    expect(body.users_synced).toBe(5);
+
+    await app.close();
+  });
+
+  it('surfaces a worker failure as a 502, not a 500', async () => {
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService(devPiiRegistry),
+      writeToken: WRITE_TOKEN,
+      syncTrigger: {
+        trigger: async () => {
+          throw new Error('worker unreachable');
+        },
+      },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/sync-now',
+      headers: { authorization: `Bearer ${WRITE_TOKEN}` },
+    });
+
+    expect(response.statusCode).toBe(502);
+    await app.close();
+  });
+});
