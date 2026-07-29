@@ -27,6 +27,7 @@ import { FirestorePiiDeclarationRepository } from './gcp/pii-registry-declaratio
 import { BigQueryPiiRegistryAuditMirror } from './gcp/pii-registry-audit-mirror.js';
 import { BigQueryPiiRegistryRepository, composePiiRegistry } from './gcp/pii-registry-repository.js';
 import { BigQuerySchemaService } from './gcp/bigquery-schema-service.js';
+import { PiiVaultSyncTrigger } from './gcp/pii-vault-sync-trigger.js';
 import { SnowflakePiiRegistryRepository } from './snowflake/pii-registry-repository.js';
 import type { PiiRegistryEntry } from './types/pii-registry.js';
 
@@ -173,6 +174,18 @@ async function main() {
   }
   const schemaService = new BigQuerySchemaService(projectId);
 
+  const piiIngestorWorkerServiceName = process.env.PII_INGESTOR_WORKER_SERVICE_NAME;
+  const piiIngestorWorkerRegion = process.env.PII_INGESTOR_WORKER_REGION;
+  const syncTrigger =
+    piiIngestorWorkerServiceName && piiIngestorWorkerRegion
+      ? new PiiVaultSyncTrigger(projectId, piiIngestorWorkerRegion, piiIngestorWorkerServiceName)
+      : undefined;
+  if (!syncTrigger) {
+    logger.info(
+      'PII_INGESTOR_WORKER_SERVICE_NAME/_REGION not set; on-demand PII vault sync (/pii-registry/sync-now) is disabled'
+    );
+  }
+
   const deletionRequestService = new DeletionRequestService(
     deletionRequestRepo,
     firestoreRegistry,
@@ -229,6 +242,7 @@ async function main() {
     writeToken: registryWriteToken,
     discoverySource: lineageRepository,
     schemaSource: schemaService,
+    syncTrigger,
   });
   await fastify.register(analystClaimsRoutes, { analystAccessService });
 
