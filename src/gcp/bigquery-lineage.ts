@@ -118,7 +118,6 @@ export class BigQueryLineageRepository implements ILineageRepository {
       const [rows] = await this.bq.query({
         query,
         params: { userId, tenantId },
-        location: 'US'
       });
 
       return {
@@ -169,7 +168,6 @@ export class BigQueryLineageRepository implements ILineageRepository {
       const [rows] = await this.bq.query({
         query,
         params: { userId, tenantId },
-        location: 'US'
       });
 
       return rows.map((row) => ({
@@ -226,7 +224,7 @@ export class BigQueryLineageRepository implements ILineageRepository {
     `;
 
     try {
-      const [rows] = await this.bq.query({ query, params: { tenantId }, location: 'US' });
+      const [rows] = await this.bq.query({ query, params: { tenantId } });
       return rows.map((row) => {
         let columns: string[] = [];
         try {

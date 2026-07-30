@@ -208,14 +208,14 @@ curl -X POST http://localhost:3000/key/generate \
 **Response:**
 ```json
 {
-  "ciphertext": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8gISIjJCUmJygpKissMi8gISIjJCUmJygpKissMy8g",
+  "ciphertext": "v1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8gISIjJCUmJygpKissMi8gISIjJCUmJygpKissMy8g",
   "userId": "user123",
   "timestamp": "2025-05-23T12:34:56.789Z"
 }
 ```
 
 **Response Fields:**
-- `ciphertext` (string) – Base64-encoded encrypted data. **Deterministic:** same plaintext + userId + key = same ciphertext.
+- `ciphertext` (string) – The key version ID that encrypted this value, a colon, then the base64-encoded encrypted data (`"<keyVersionId>:<base64>"`, e.g. `"v1:AQIDBA..."`). Always pass this **whole compound string**, colon included, back into `/decrypt` — do not strip what looks like a prefix, and do not pass only the part after the colon. **Deterministic:** same plaintext + userId + key = same ciphertext.
 - `userId` (string) – Echo of request userId
 - `timestamp` (string) – ISO 8601 timestamp
 
@@ -241,18 +241,18 @@ curl -X POST http://localhost:3000/encrypt \
 
 #### POST /decrypt
 
-**[DEMO ONLY]** Decrypt ciphertext using the user's DEK. Verifies GCM authentication tag (fails if tampered).
+**[DEMO ONLY]** Decrypt ciphertext using the user's DEK ("token" in Chameleon's own product vocabulary elsewhere — this is that same value). Verifies GCM authentication tag (fails if tampered).
 
 **Request:**
 ```json
 {
-  "ciphertext": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8gISIjJCUmJygpKissMi8gISIjJCUmJygpKissMy8g",
+  "ciphertext": "v1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8gISIjJCUmJygpKissMi8gISIjJCUmJygpKissMy8g",
   "userId": "user123"
 }
 ```
 
 **Parameters:**
-- `ciphertext` (string, required) – Base64-encoded ciphertext from `/encrypt` response
+- `ciphertext` (string, required) – The **entire** value returned by `/encrypt`, including the `<keyVersionId>:` prefix (e.g. `"v1:AQIDBA..."`). A bare base64 string with no colon is rejected with `400 Invalid ciphertext format` — this is the single most common mistake integrating against this endpoint.
 - `userId` (string, required) – User ID
 
 **Response:**
@@ -275,10 +275,12 @@ curl -X POST http://localhost:3000/encrypt \
 curl -X POST http://localhost:3000/decrypt \
   -H "Content-Type: application/json" \
   -d '{
-    "ciphertext": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8gISIjJCUmJygpKissMi8gISIjJCUmJygpKissMy8g",
+    "ciphertext": "v1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8gISIjJCUmJygpKissMi8gISIjJCUmJygpKissMy8g",
     "userId": "user123"
   }'
 ```
+
+**Where does this ciphertext value actually come from?** Copy it verbatim from a real `/encrypt` response's `ciphertext` field — do not hand-type or reconstruct it, and never drop the `v1:`-style prefix before the first colon.
 
 ---
 

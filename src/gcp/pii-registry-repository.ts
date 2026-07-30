@@ -171,8 +171,7 @@ export class BigQueryPiiRegistryRepository implements IPiiRegistryRepository {
 
   constructor(
     private readonly projectId: string,
-    private readonly datasetId: string,
-    private readonly location = 'US'
+    private readonly datasetId: string
   ) {
     this.bq = new BigQuery({ projectId });
   }
@@ -196,7 +195,7 @@ export class BigQueryPiiRegistryRepository implements IPiiRegistryRepository {
         field_name, classification, handling, confidence, detection_method,
         required_in_mart, registry_version
       FROM \`${this.projectId}.${this.datasetId}.pii_registry\``;
-    const [rows] = await this.bq.query({ query, location: this.location });
+    const [rows] = await this.bq.query({ query });
     return rows as RegistryRow[];
   }
 
@@ -204,7 +203,7 @@ export class BigQueryPiiRegistryRepository implements IPiiRegistryRepository {
     try {
       const query = `SELECT source_resource_id, field_name, downstream_model, hops
         FROM \`${this.projectId}.${this.datasetId}.pii_field_lineage\``;
-      const [rows] = await this.bq.query({ query, location: this.location });
+      const [rows] = await this.bq.query({ query });
       return rows as LineageRow[];
     } catch (error) {
       // Lineage is enrichment only — a missing table should not block the registry.
