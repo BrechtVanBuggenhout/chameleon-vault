@@ -111,7 +111,7 @@ export class DeletionRequestService {
                 deletionRequestId,
                 result.destination,
                 result.status === 'COMPLETE' ? 'SUCCEEDED' : 'FAILED',
-                { attempts: result.attempts }
+                { attempts: result.attempts, recordsFound: result.recordsFound }
               ).catch(err => logger.error({ err, destination: result.destination }, 'Failed to record janitor wipe status'));
             }
 
