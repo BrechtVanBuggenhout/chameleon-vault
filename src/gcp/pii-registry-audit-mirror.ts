@@ -40,8 +40,7 @@ export class BigQueryPiiRegistryAuditMirror {
   constructor(
     projectId: string,
     private readonly datasetId: string,
-    private readonly tableId = 'pii_metadata_registry',
-    private readonly location = 'US'
+    private readonly tableId = 'pii_metadata_registry'
   ) {
     this.bq = new BigQuery({ projectId });
   }
