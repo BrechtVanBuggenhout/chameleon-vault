@@ -53,7 +53,7 @@ export class HubSpotConnector implements IWipeConnector {
 
       if (!contacts || contacts.length === 0) {
         logger.info({ userId, tenantId }, 'No contact found in HubSpot for this user');
-        return { success: true, destination: 'hubspot' };
+        return { success: true, destination: 'hubspot', recordsFound: 0 };
       }
 
       // 2. Delete all matching contacts
@@ -64,7 +64,7 @@ export class HubSpotConnector implements IWipeConnector {
         logger.info({ userId, tenantId, contactId: contact.id }, 'Successfully wiped contact from HubSpot');
       }
 
-      return { success: true, destination: 'hubspot' };
+      return { success: true, destination: 'hubspot', recordsFound: contacts.length };
     } catch (error: any) {
       const status = error.response?.status;
       const isRetryable = status === 429 || (status >= 500 && status < 600);

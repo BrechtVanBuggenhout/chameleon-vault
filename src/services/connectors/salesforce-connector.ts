@@ -38,7 +38,7 @@ export class SalesforceConnector implements IWipeConnector {
 
       if (records.length === 0) {
         logger.info({ userId, tenantId }, 'No Salesforce Contact found for userId, nothing to wipe');
-        return { success: true, destination: 'salesforce' };
+        return { success: true, destination: 'salesforce', recordsFound: 0 };
       }
 
       // 3. Delete found records via REST API
@@ -54,7 +54,7 @@ export class SalesforceConnector implements IWipeConnector {
         });
       }
 
-      return { success: true, destination: 'salesforce' };
+      return { success: true, destination: 'salesforce', recordsFound: records.length };
     } catch (error: any) {
       const status = error.response?.status;
       const data = error.response?.data;

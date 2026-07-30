@@ -68,6 +68,27 @@ export class DeletionRequestRepository {
     return snapshot.docs[0].data() as DeletionRequest;
   }
 
+  /**
+   * The latest deletion request for a user that actually reached a real
+   * cascade outcome -- used to gate certificate issuance on real
+   * janitor_wipes results instead of freely regenerating claims from
+   * whatever destinations were ever logged (see certificate-service.ts).
+   */
+  async getLatestCompletedDeletionRequestForUser(userId: string, tenantId: string = 'default-tenant'): Promise<DeletionRequest | null> {
+    const snapshot = await this.collection
+      .where('user_id', '==', userId)
+      .where('tenant_id', '==', tenantId)
+      .where('status', 'in', ['CASCADE_COMPLETE', 'CERTIFICATE_ISSUED'])
+      .orderBy('created_at', 'desc')
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return null;
+    }
+    return snapshot.docs[0].data() as DeletionRequest;
+  }
+
   async updateDeletionRequestStatus(
     deletionRequestId: string,
     newStatus: DeletionRequestStatus,

@@ -1,8 +1,12 @@
 export interface CertificateLineageItem {
   system: string;
-  status: 'ERASED' | 'PENDING' | 'FAILED';
+  // CONFIRMED_ABSENT: the destination was genuinely checked and never held
+  // any PII for this user -- distinct from ERASED (real data was found and
+  // removed), since a certificate that can't tell these apart can overstate
+  // what actually happened.
+  status: 'ERASED' | 'CONFIRMED_ABSENT' | 'PENDING' | 'FAILED';
   // Add snake_case alias for consistency if needed, but ISO string is standard
-  // timestamp_iso?: string; 
+  // timestamp_iso?: string;
   timestamp: string;
 }
 

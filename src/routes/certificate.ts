@@ -29,7 +29,10 @@ export async function certificateRoutes(
         timestamp: new Date().toISOString()
       };
     } catch (error: unknown) {
-      if (error instanceof Error && error.message.includes('not shredded')) {
+      if (
+        error instanceof Error &&
+        (error.message.includes('not shredded') || error.message.includes('no completed deletion cascade'))
+      ) {
         return reply.status(404).send({
           statusCode: 404,
           error: 'Certificate not available',

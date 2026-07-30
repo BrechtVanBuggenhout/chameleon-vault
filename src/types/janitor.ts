@@ -5,4 +5,6 @@ export interface JanitorTask {
   destination: string;
   status: JanitorTaskStatus;
   attempts: number;
+  /** How many records the connector actually found and deleted, when known. See WipeResult. */
+  recordsFound?: number;
 }

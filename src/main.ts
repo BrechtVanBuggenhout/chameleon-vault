@@ -88,7 +88,7 @@ async function main() {
     dekKmsClient, // DEK KMS client for encryption/decryption
     pubSubDlqClient
   );
-  const certificateService = new CertificateService(firestoreRegistry, lineageRepository, signingKmsClient, gcsClient);
+  const certificateService = new CertificateService(firestoreRegistry, lineageRepository, signingKmsClient, gcsClient, deletionRequestRepo);
 
   // Federated PII registry, composed from three sources by owner:
   //  1. connector seed (devPiiRegistry) — bundled example/reference data for

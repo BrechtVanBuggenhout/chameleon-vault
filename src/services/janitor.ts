@@ -60,6 +60,7 @@ export class JanitorService {
       let success = false;
       let attempts = 0;
       let lastError = '';
+      let recordsFound: number | undefined;
 
       while (attempts < this.MAX_RETRIES && !success) {
         attempts++;
@@ -82,6 +83,7 @@ export class JanitorService {
         
         if (response.success) {
           success = true;
+          recordsFound = response.recordsFound;
           logger.info({ userId, destination: task.destination, attempts }, 'Janitor wipe successful');
         } else {
           lastError = response.error || 'Unknown error';
@@ -106,6 +108,7 @@ export class JanitorService {
         ...task,
         status: finalStatus,
         attempts,
+        recordsFound,
       });
 
       // Report SaaS_WIPE_COMPLETED
