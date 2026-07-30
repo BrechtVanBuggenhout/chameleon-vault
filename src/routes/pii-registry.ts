@@ -25,8 +25,8 @@ export interface SchemaSource {
 export interface SyncTrigger {
   trigger(): Promise<{
     status: string;
-    resources_synced: number;
-    users_synced: number;
+    resources_queued: number;
+    chunks_queued: number;
     errors: Array<{ resourceId: string; error: string }>;
   }>;
 }
