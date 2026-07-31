@@ -15,6 +15,7 @@ import { DeletionRequestRepository } from './gcp/deletion-request-repository.js'
 import { PubSubDLQClient } from './gcp/pubsub-dlq-client.js';
 import { GCSClient } from './gcp/gcs-client.js';
 import { AnalystAccessRepository } from './gcp/analyst-access-repository.js';
+import { CertificateChainRepository } from './gcp/certificate-chain-repository.js';
 
 // Import Services
 import { JanitorService } from './services/janitor.js';
@@ -80,6 +81,8 @@ async function main() {
   const deletionRequestRepo = new DeletionRequestRepository(projectId, firestoreDeletionRequestCollection, firestoreDatabaseId);
   const pubSubDlqClient = new PubSubDLQClient(projectId, dlqTopic);
   const gcsClient = new GCSClient(projectId, auditBucket);
+  const certificateChainCollection = process.env.FIRESTORE_CERTIFICATE_CHAIN_COLLECTION || 'certificate_chains';
+  const certificateChainRepo = new CertificateChainRepository(projectId, certificateChainCollection, firestoreDatabaseId);
 
   // 3. Initialize Services (Inject Dependencies)
   const janitorService = new JanitorService(
@@ -88,7 +91,7 @@ async function main() {
     dekKmsClient, // DEK KMS client for encryption/decryption
     pubSubDlqClient
   );
-  const certificateService = new CertificateService(firestoreRegistry, lineageRepository, signingKmsClient, gcsClient, deletionRequestRepo);
+  const certificateService = new CertificateService(firestoreRegistry, lineageRepository, signingKmsClient, gcsClient, deletionRequestRepo, certificateChainRepo);
 
   // Federated PII registry, composed from three sources by owner:
   //  1. connector seed (devPiiRegistry) — bundled example/reference data for

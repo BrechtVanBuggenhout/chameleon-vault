@@ -170,6 +170,9 @@ export class DeletionRequestService {
         const { gcsPath } = await this.certificateService.issueAndStoreCertificate(request.user_id, request.deletion_request_id, tenantId);
         
         updateFields.certificate_issued_at = new Date();
+        // Lets GET /certificate/:userId return the exact stored (chained)
+        // certificate instead of re-signing a fresh one on every call.
+        updateFields.certificate_gcs_path = gcsPath;
         await this.lineageRepo.recordEvent({
           operationId,
           deletionRequestId,

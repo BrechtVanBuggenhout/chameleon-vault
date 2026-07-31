@@ -1,5 +1,6 @@
 import { jest, describe, it, expect, beforeEach, afterAll } from '@jest/globals';
 import { FastifyInstance } from 'fastify';
+import * as crypto from 'crypto';
 
 process.env.GCP_PROJECT_ID = 'test-project';
 process.env.CLOUD_KMS_REGION = 'us-central1';
@@ -14,9 +15,14 @@ const mockRegistryStore: Map<string, { status: string; shredAt?: string }> = new
 // behind. Absent entirely means "no completed cascade for this user", which
 // is the exact gap that used to let /certificate issue claims for anyone
 // with a shredded key regardless of whether a cascade ever ran.
+// certificate_gcs_path is set once a real issueAndStoreCertificate() call
+// happens (mirroring deletion-request-service.ts) -- its presence, plus
+// status CERTIFICATE_ISSUED, is what lets GET /certificate/:userId return
+// the stored certificate instead of re-signing.
 const mockDeletionRequestStore: Map<string, {
   status: string;
   janitor_wipes: Array<{ destination: string; status: string; updated_at: string; details?: { recordsFound?: number } }>;
+  certificate_gcs_path?: string;
 }> = new Map();
 
 // ESM Mocks
@@ -57,6 +63,14 @@ await jest.unstable_mockModule('../src/gcp/deletion-request-repository.js', () =
       const entry = mockDeletionRequestStore.get(userId);
       if (!entry) return null;
       return { deletion_request_id: `del_${userId}`, user_id: userId, ...entry };
+    });
+    // deletion_request_id is always `del_${userId}` in this mock scheme
+    // (see above), so the id is enough to recover the userId to look up.
+    getDeletionRequest = jest.fn(async (deletionRequestId: string) => {
+      const userId = deletionRequestId.replace(/^del_/, '');
+      const entry = mockDeletionRequestStore.get(userId);
+      if (!entry) return null;
+      return { deletion_request_id: deletionRequestId, user_id: userId, ...entry };
     });
   }
 }));
@@ -104,6 +118,78 @@ await jest.unstable_mockModule('../src/config/env.js', () => ({
   getRequiredEnv: (name: string) => process.env[name] || 'mock-value',
 }));
 
+// Fake GCS: an in-memory map keyed by the gs:// path uploadCertificate
+// returns, so downloadCertificate can read back exactly what was stored --
+// this is what lets the "return stored cert, don't re-sign" tests actually
+// prove the round trip.
+const mockGcsStore = new Map<string, {
+  certificate: string;
+  userId: string;
+  deletionRequestId: string;
+  timestamp: string;
+  hash: string;
+  previousCertificateHash: string | null;
+  chainSequence?: number;
+}>();
+const mockUploadCertificate = jest.fn(async (
+  userId: string,
+  deletionRequestId: string,
+  certificate: string,
+  hash: string,
+  tenantId: string = 'default-tenant',
+  chain?: { previousCertificateHash: string | null; chainSequence: number }
+) => {
+  const gcsPath = `gs://test-bucket/certificates/${tenantId}/certificate-${deletionRequestId}.json`;
+  mockGcsStore.set(gcsPath, {
+    certificate,
+    userId,
+    deletionRequestId,
+    timestamp: new Date().toISOString(),
+    hash,
+    previousCertificateHash: chain?.previousCertificateHash ?? null,
+    chainSequence: chain?.chainSequence,
+  });
+  return gcsPath;
+});
+const mockDownloadCertificate = jest.fn(async (gcsPath: string) => {
+  const entry = mockGcsStore.get(gcsPath);
+  if (!entry) throw new Error(`No such object: ${gcsPath}`);
+  return entry;
+});
+
+await jest.unstable_mockModule('../src/gcp/gcs-client.js', () => ({
+  GCSClient: class {
+    uploadCertificate = mockUploadCertificate;
+    downloadCertificate = mockDownloadCertificate;
+  }
+}));
+
+// Fake certificate chain: a per-tenant {sequence, lastHash} map, mirroring
+// exactly what the real Firestore-transaction-backed repository tracks.
+// Deliberately does NOT test Firestore transaction mechanics itself (no
+// test in this repo mocks @google-cloud/firestore directly -- see
+// AnalystAccessRepository's equivalent transaction, tested the same way,
+// at the service level with the repository mocked away).
+const mockChainStore = new Map<string, { sequence: number; lastHash: string | null }>();
+const mockAppendToChain = jest.fn(async (
+  tenantId: string,
+  _deletionRequestId: string,
+  sign: (previousHash: string | null, sequence: number) => Promise<{ certificate: string; certificateHash: string }>
+) => {
+  const current = mockChainStore.get(tenantId) ?? { sequence: 0, lastHash: null };
+  const previousHash = current.lastHash;
+  const sequence = current.sequence + 1;
+  const result = await sign(previousHash, sequence);
+  mockChainStore.set(tenantId, { sequence, lastHash: result.certificateHash });
+  return { ...result, previousHash, sequence };
+});
+
+await jest.unstable_mockModule('../src/gcp/certificate-chain-repository.js', () => ({
+  CertificateChainRepository: class {
+    appendToChain = mockAppendToChain;
+  }
+}));
+
 // Import App dependencies after mocks
 const { default: Fastify } = await import('fastify');
 const { certificateRoutes } = await import('../src/routes/certificate.js');
@@ -112,6 +198,8 @@ const { FirestoreRegistry } = await import('../src/gcp/firestore-registry.js');
 const { BigQueryLineageRepository } = await import('../src/gcp/bigquery-lineage.js');
 const { CloudKMSClient } = await import('../src/gcp/cloud-kms.js');
 const { DeletionRequestRepository } = await import('../src/gcp/deletion-request-repository.js');
+const { CertificateChainRepository } = await import('../src/gcp/certificate-chain-repository.js');
+const { GCSClient } = await import('../src/gcp/gcs-client.js');
 
 describe('Certificate API Integration Tests', () => {
   let app: FastifyInstance;
@@ -121,10 +209,11 @@ describe('Certificate API Integration Tests', () => {
     const registry = new (FirestoreRegistry as any)('p', 'c', 'd');
     const lineage = new (BigQueryLineageRepository as any)();
     const kms = new (CloudKMSClient as any)('p', 'r', 'kr', 'kn');
-    const gcs = { uploadAuditLog: jest.fn() };
+    const gcs = new (GCSClient as any)('p', 'test-bucket');
     const deletionRequestRepo = new (DeletionRequestRepository as any)('p', 'c', 'd');
+    const chainRepo = new (CertificateChainRepository as any)('p', 'c', 'd');
 
-    certificateService = new (CertificateService as any)(registry, lineage, kms, gcs as any, deletionRequestRepo);
+    certificateService = new (CertificateService as any)(registry, lineage, kms, gcs, deletionRequestRepo, chainRepo);
 
     app = Fastify();
     await app.register(certificateRoutes, { certificateService });
@@ -137,11 +226,16 @@ describe('Certificate API Integration Tests', () => {
   beforeEach((): void => {
     mockRegistryStore.clear();
     mockDeletionRequestStore.clear();
+    mockGcsStore.clear();
+    mockChainStore.clear();
     mockAsymmetricSign.mockClear();
     mockGetNewestEnabledVersion.mockClear();
     mockListEnabledVersions.mockClear();
     mockCreateKeyVersion.mockClear();
     mockWaitForVersionEnabled.mockClear();
+    mockUploadCertificate.mockClear();
+    mockDownloadCertificate.mockClear();
+    mockAppendToChain.mockClear();
   });
 
   it('GET /public-key should return the PEM public key', async () => {
@@ -311,5 +405,109 @@ describe('Certificate API Integration Tests', () => {
     const certificate = JSON.parse(response.body).certificate as string;
     const header = JSON.parse(Buffer.from(certificate.split('.')[0], 'base64url').toString());
     expect(header.kid).toBe(newestVersion());
+  });
+
+  describe('Certificate hash chain', () => {
+  function setupShreddedUser(userId: string): void {
+    mockRegistryStore.set(userId, { status: 'SHREDDED', shredAt: '2026-06-02T10:00:00Z' });
+    mockDeletionRequestStore.set(userId, { status: 'CASCADE_COMPLETE', janitor_wipes: [] });
+  }
+
+  function decodeClaims(certificate: string): Record<string, unknown> {
+    return JSON.parse(Buffer.from(certificate.split('.')[1], 'base64url').toString());
+  }
+
+  it('signs the first certificate for a tenant with no previous hash and sequence 1', async () => {
+    setupShreddedUser('chain-user-1');
+
+    const { certificate } = await certificateService.issueAndStoreCertificate('chain-user-1', 'del_chain-user-1', 'tenant-a');
+    const claims = decodeClaims(certificate);
+
+    expect(claims.previousCertificateHash).toBeNull();
+    expect(claims.chainSequence).toBe(1);
+  });
+
+  it('links the second certificate in a tenant to the sha256 of the first', async () => {
+    setupShreddedUser('chain-user-2a');
+    setupShreddedUser('chain-user-2b');
+
+    const first = await certificateService.issueAndStoreCertificate('chain-user-2a', 'del_chain-user-2a', 'tenant-b');
+    const second = await certificateService.issueAndStoreCertificate('chain-user-2b', 'del_chain-user-2b', 'tenant-b');
+
+    const expectedFirstHash = crypto.createHash('sha256').update(first.certificate).digest('hex');
+    const secondClaims = decodeClaims(second.certificate);
+
+    expect(secondClaims.previousCertificateHash).toBe(expectedFirstHash);
+    expect(secondClaims.chainSequence).toBe(2);
+  });
+
+  it('keeps independent chains per tenant, both starting at sequence 1', async () => {
+    setupShreddedUser('chain-user-3a');
+    setupShreddedUser('chain-user-3b');
+
+    const a = await certificateService.issueAndStoreCertificate('chain-user-3a', 'del_chain-user-3a', 'tenant-x');
+    const b = await certificateService.issueAndStoreCertificate('chain-user-3b', 'del_chain-user-3b', 'tenant-y');
+
+    expect(decodeClaims(a.certificate).chainSequence).toBe(1);
+    expect(decodeClaims(b.certificate).chainSequence).toBe(1);
+    expect(decodeClaims(a.certificate).previousCertificateHash).toBeNull();
+    expect(decodeClaims(b.certificate).previousCertificateHash).toBeNull();
+  });
+
+  it('stores the chain fields in the GCS wrapper alongside the certificate', async () => {
+    setupShreddedUser('chain-user-4');
+
+    const { gcsPath } = await certificateService.issueAndStoreCertificate('chain-user-4', 'del_chain-user-4', 'tenant-c');
+    const stored = mockGcsStore.get(gcsPath)!;
+
+    expect(stored.chainSequence).toBe(1);
+    expect(stored.previousCertificateHash).toBeNull();
+  });
+});
+
+describe('GET /certificate/:userId returns the exact stored certificate', () => {
+  it('returns the stored certificate byte-for-byte instead of re-signing on repeated calls', async () => {
+    mockRegistryStore.set('stored-user', { status: 'SHREDDED', shredAt: '2026-06-02T10:00:00Z' });
+    mockDeletionRequestStore.set('stored-user', { status: 'CASCADE_COMPLETE', janitor_wipes: [] });
+
+    const { certificate: issued, gcsPath } = await certificateService.issueAndStoreCertificate('stored-user', 'del_stored-user', 'default-tenant');
+    // Mirrors what deletion-request-service.ts does once issuance succeeds.
+    mockDeletionRequestStore.set('stored-user', { status: 'CERTIFICATE_ISSUED', janitor_wipes: [], certificate_gcs_path: gcsPath });
+    mockAsymmetricSign.mockClear(); // only count signing that happens from here on
+
+    const firstResponse = await app.inject({ method: 'GET', url: '/certificate/stored-user' });
+    const secondResponse = await app.inject({ method: 'GET', url: '/certificate/stored-user' });
+
+    expect(firstResponse.statusCode).toBe(200);
+    expect(secondResponse.statusCode).toBe(200);
+    const firstCert = JSON.parse(firstResponse.body).certificate;
+    const secondCert = JSON.parse(secondResponse.body).certificate;
+
+    // The actual bug this fixes: repeated GETs used to each mint a fresh
+    // JWT (different jti/iat/signature) for the same underlying deletion.
+    expect(firstCert).toBe(issued);
+    expect(secondCert).toBe(issued);
+    expect(mockAsymmetricSign).not.toHaveBeenCalled();
+    expect(mockDownloadCertificate).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back to signing on demand (unchained) when no certificate was ever stored', async () => {
+    // status CASCADE_COMPLETE with no certificate_gcs_path -- the rare case
+    // of a prior CERTIFICATE_ISSUED transition failing mid-flight.
+    mockRegistryStore.set('fallback-user', { status: 'SHREDDED', shredAt: '2026-06-02T10:00:00Z' });
+    mockDeletionRequestStore.set('fallback-user', { status: 'CASCADE_COMPLETE', janitor_wipes: [] });
+
+    const response = await app.inject({ method: 'GET', url: '/certificate/fallback-user' });
+
+    expect(response.statusCode).toBe(200);
+    const certificate = JSON.parse(response.body).certificate as string;
+    const claims = JSON.parse(Buffer.from(certificate.split('.')[1], 'base64url').toString());
+
+    // Unchained: null, not a real sequence number -- a GET must never
+    // consume a slot in the tenant's certificate chain.
+    expect(claims.previousCertificateHash).toBeNull();
+    expect(claims.chainSequence).toBeNull();
+    expect(mockAppendToChain).not.toHaveBeenCalled();
+  });
   });
 });

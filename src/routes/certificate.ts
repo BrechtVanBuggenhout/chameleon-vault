@@ -12,15 +12,16 @@ export async function certificateRoutes(
 
   /**
    * GET /certificate/:userId
-   * Returns a signed Certificate of Destruction (JWT) for a shredded user.
+   * Returns the Certificate of Destruction (JWT) for a shredded user --
+   * the exact one actually issued and chained, not a freshly re-signed
+   * (and unchained) one. See CertificateService.getCertificateForUser.
    */
   fastify.get('/certificate/:userId', async (request, reply) => {
     const { userId } = request.params as { userId: string };
     const tenantId = (request.headers['x-tenant-id'] as string) || 'default-tenant';
 
     try {
-      const claims = await certificateService.generateCertificateClaims(userId, tenantId);
-      const certificate = await certificateService.signCertificate(claims);
+      const { certificate } = await certificateService.getCertificateForUser(userId, tenantId);
 
       return {
         certificate,

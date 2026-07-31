@@ -20,23 +20,29 @@ export class GCSClient {
     deletionRequestId: string,
     certificate: string,
     hash: string,
-    tenantId: string = 'default-tenant'
+    tenantId: string = 'default-tenant',
+    chain?: { previousCertificateHash: string | null; chainSequence: number }
   ): Promise<string> {
     try {
       const now = new Date();
       const datePath = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')}`;
       const certPath = `certificates/${tenantId}/${datePath}/certificate-${deletionRequestId}.json`;
       const hashPath = `certificates/${tenantId}/${datePath}/audit-hash-${deletionRequestId}.txt`;
-      
+
       const bucket = this.storage.bucket(this.bucketName);
 
-      // Save certificate JSON wrapper as required by infra specs
+      // Save certificate JSON wrapper as required by infra specs. Chain
+      // fields are duplicated here (they're also inside the signed JWT
+      // itself, the authoritative copy) purely so an auditor can inspect
+      // the chain without decoding the certificate.
       const certPayload = JSON.stringify({
         certificate,
         userId,
         deletionRequestId,
         timestamp: now.toISOString(),
-        hash
+        hash,
+        previousCertificateHash: chain?.previousCertificateHash ?? null,
+        chainSequence: chain?.chainSequence,
       });
 
       await bucket.file(certPath).save(certPayload, {
@@ -64,6 +70,35 @@ export class GCSClient {
       return `gs://${this.bucketName}/${certPath}`;
     } catch (error) {
       logger.error({ error, userId }, 'Failed to upload certificate to GCS');
+      throw error;
+    }
+  }
+
+  /**
+   * Reads back a previously-stored certificate JSON wrapper by the gs://
+   * URI returned from uploadCertificate. Lets callers return the exact
+   * certificate that was actually issued (and chained) instead of
+   * re-signing a fresh, unchained one on every read.
+   */
+  async downloadCertificate(gcsPath: string): Promise<{
+    certificate: string;
+    userId: string;
+    deletionRequestId: string;
+    timestamp: string;
+    hash: string;
+    previousCertificateHash: string | null;
+    chainSequence?: number;
+  }> {
+    try {
+      const match = gcsPath.match(/^gs:\/\/([^/]+)\/(.+)$/);
+      if (!match) {
+        throw new Error(`Invalid GCS path: ${gcsPath}`);
+      }
+      const [, bucketName, objectPath] = match;
+      const [contents] = await this.storage.bucket(bucketName).file(objectPath).download();
+      return JSON.parse(contents.toString('utf-8'));
+    } catch (error) {
+      logger.error({ error, gcsPath }, 'Failed to download certificate from GCS');
       throw error;
     }
   }

@@ -23,4 +23,9 @@ export interface DeletionRequest {
   key_destroyed_at?: Date;
   cascade_initiated_at?: Date;
   certificate_issued_at?: Date;
+  // gs:// URI of the stored certificate JSON, set alongside
+  // certificate_issued_at once issueAndStoreCertificate succeeds. Lets
+  // GET /certificate/:userId return the exact certificate that was actually
+  // issued (and chained) instead of re-signing a fresh one on every call.
+  certificate_gcs_path?: string;
 }

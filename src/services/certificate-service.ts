@@ -3,7 +3,9 @@ import { FirestoreRegistry } from '../gcp/firestore-registry.js';
 import { BigQueryLineageRepository } from '../gcp/bigquery-lineage.js';
 import { CloudKMSClient } from '../gcp/cloud-kms.js';
 import { DeletionRequestRepository } from '../gcp/deletion-request-repository.js';
-import { CertificateLineageItem, DestructionCertificateClaims } from '../types/index.js';
+import { CertificateChainRepository } from '../gcp/certificate-chain-repository.js';
+import { CertificateLineageItem, DestructionCertificateClaims, KeyStatus } from '../types/index.js';
+import { DeletionRequest } from '../types/deletion-request.js';
 import { createLogger } from '../logging/index.js';
 import { GCSClient } from '../gcp/gcs-client.js';
 
@@ -15,8 +17,27 @@ export class CertificateService {
     private readonly lineageRepo: BigQueryLineageRepository,
     private readonly signingKmsClient: CloudKMSClient,
     private readonly gcsClient: GCSClient,
-    private readonly deletionRequestRepo: DeletionRequestRepository
+    private readonly deletionRequestRepo: DeletionRequestRepository,
+    private readonly chainRepository: CertificateChainRepository
   ) {}
+
+  // Shared by generateCertificateClaims and getCertificateForUser so both
+  // enforce the exact same eligibility rule (and error wording) for issuing
+  // or returning a certificate -- key must be shredded, and a real deletion
+  // cascade must have actually completed. Split into two assertion
+  // functions (rather than one checking both) because a TS `asserts x is Y`
+  // clause can only narrow a single identifier.
+  private assertKeyShredded(userId: string, keyStatus: KeyStatus | null): asserts keyStatus is KeyStatus {
+    if (!keyStatus || (keyStatus.status !== 'SHREDDED' && keyStatus.status !== 'DELETED')) {
+      throw new Error(`Cannot generate certificate: Key for user ${userId} is not shredded.`);
+    }
+  }
+
+  private assertCascadeComplete(userId: string, deletionRequest: DeletionRequest | null): asserts deletionRequest is DeletionRequest {
+    if (!deletionRequest || (deletionRequest.status !== 'CASCADE_COMPLETE' && deletionRequest.status !== 'CERTIFICATE_ISSUED')) {
+      throw new Error(`Cannot generate certificate: no completed deletion cascade found for user ${userId}`);
+    }
+  }
 
   /**
    * Generates the unsigned claims for a Certificate of Destruction.
@@ -36,22 +57,17 @@ export class CertificateService {
     userId: string,
     tenantId: string = 'default-tenant',
     deletionRequestId?: string
-  ): Promise<DestructionCertificateClaims> {
+  ): Promise<Omit<DestructionCertificateClaims, 'previousCertificateHash' | 'chainSequence'>> {
     logger.info({ userId, tenantId, deletionRequestId }, 'Generating destruction certificate claims');
 
     const keyStatus = await this.firestoreRegistry.getKeyStatus(userId, tenantId);
-
-    if (!keyStatus || (keyStatus.status !== 'SHREDDED' && keyStatus.status !== 'DELETED')) {
-      throw new Error(`Cannot generate certificate: Key for user ${userId} is not shredded.`);
-    }
 
     const deletionRequest = deletionRequestId
       ? await this.deletionRequestRepo.getDeletionRequest(deletionRequestId)
       : await this.deletionRequestRepo.getLatestCompletedDeletionRequestForUser(userId, tenantId);
 
-    if (!deletionRequest || (deletionRequest.status !== 'CASCADE_COMPLETE' && deletionRequest.status !== 'CERTIFICATE_ISSUED')) {
-      throw new Error(`Cannot generate certificate: no completed deletion cascade found for user ${userId}`);
-    }
+    this.assertKeyShredded(userId, keyStatus);
+    this.assertCascadeComplete(userId, deletionRequest);
 
     // Only ever built from real, recorded outcomes -- never re-derived from
     // raw lineage/destination-name data. Filtering to SUCCEEDED is
@@ -70,7 +86,7 @@ export class CertificateService {
 
     const keyDestructionStatus = (keyStatus.status === 'SHREDDED' || keyStatus.status === 'DELETED') ? 'COMPLETE' : 'PENDING';
 
-    const claims: DestructionCertificateClaims = {
+    const claims: Omit<DestructionCertificateClaims, 'previousCertificateHash' | 'chainSequence'> = {
       iss: 'Chameleon Key Vault',
       sub: userId,
       tenantId,
@@ -92,16 +108,70 @@ export class CertificateService {
   }
 
   /**
-   * Issues, signs, and persists a Certificate of Destruction to GCS.
+   * Issues, signs, and persists a Certificate of Destruction to GCS. This is
+   * the one place a certificate is ever actually added to the tenant's hash
+   * chain -- see CertificateChainRepository.appendToChain for why the sign
+   * happens inside that transaction (reserves the sequence/previous-hash
+   * atomically, so two deletions completing for the same tenant at once
+   * can't corrupt the chain).
    */
   async issueAndStoreCertificate(userId: string, deletionRequestId: string, tenantId: string = 'default-tenant'): Promise<{ certificate: string; gcsPath: string }> {
-    const claims = await this.generateCertificateClaims(userId, tenantId, deletionRequestId);
-    const certificate = await this.signCertificate(claims);
-    
-    const auditHash = crypto.createHash('sha256').update(certificate).digest('hex');
-    const gcsPath = await this.gcsClient.uploadCertificate(userId, deletionRequestId, certificate, auditHash, tenantId);
-    
+    const baseClaims = await this.generateCertificateClaims(userId, tenantId, deletionRequestId);
+
+    const { certificate, certificateHash, previousHash, sequence } = await this.chainRepository.appendToChain(
+      tenantId,
+      deletionRequestId,
+      async (previousCertificateHash, chainSequence) => {
+        const claims: DestructionCertificateClaims = { ...baseClaims, previousCertificateHash, chainSequence };
+        const signed = await this.signCertificate(claims);
+        const hash = crypto.createHash('sha256').update(signed).digest('hex');
+        return { certificate: signed, certificateHash: hash };
+      }
+    );
+
+    const gcsPath = await this.gcsClient.uploadCertificate(
+      userId,
+      deletionRequestId,
+      certificate,
+      certificateHash,
+      tenantId,
+      { previousCertificateHash: previousHash, chainSequence: sequence }
+    );
+
     return { certificate, gcsPath };
+  }
+
+  /**
+   * Returns the Certificate of Destruction for a user, preferring the
+   * exact certificate that was actually issued and chained (read back from
+   * GCS via the deletion request's stored certificate_gcs_path) over
+   * re-signing a fresh one -- signing produces a different jti/iat/
+   * signature every time, so calling this repeatedly used to hand back a
+   * different "valid" certificate for the same deletion on every request.
+   *
+   * Falls back to re-signing on demand (unchained, not persisted) only for
+   * a request stuck at CASCADE_COMPLETE with no certificate ever actually
+   * stored -- e.g. a prior CERTIFICATE_ISSUED transition that failed after
+   * the status write but before/during GCS upload. A GET must never
+   * silently mutate deletion-request state or consume a slot in the
+   * tenant's certificate chain, so this fallback does neither.
+   */
+  async getCertificateForUser(userId: string, tenantId: string = 'default-tenant'): Promise<{ certificate: string; stored: boolean }> {
+    const [keyStatus, deletionRequest] = await Promise.all([
+      this.firestoreRegistry.getKeyStatus(userId, tenantId),
+      this.deletionRequestRepo.getLatestCompletedDeletionRequestForUser(userId, tenantId),
+    ]);
+    this.assertKeyShredded(userId, keyStatus);
+    this.assertCascadeComplete(userId, deletionRequest);
+
+    if (deletionRequest.status === 'CERTIFICATE_ISSUED' && deletionRequest.certificate_gcs_path) {
+      const stored = await this.gcsClient.downloadCertificate(deletionRequest.certificate_gcs_path);
+      return { certificate: stored.certificate, stored: true };
+    }
+
+    const claims = await this.generateCertificateClaims(userId, tenantId, deletionRequest.deletion_request_id);
+    const certificate = await this.signCertificate({ ...claims, previousCertificateHash: null, chainSequence: null });
+    return { certificate, stored: false };
   }
 
   // Base (unversioned) path of the signing CryptoKey -- static for the

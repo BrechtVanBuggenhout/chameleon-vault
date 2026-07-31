@@ -38,6 +38,16 @@ export interface DestructionCertificateClaims {
   keyDestructionStatus?: string;
   warehouseData?: string;
   user_id?: string;      // snake_case alias for sub (userId)
+  // Hash chain over this tenant's certificate log -- null on the very first
+  // certificate a tenant ever gets, otherwise sha256 of the previous signed
+  // certificate. Signed as part of the JWT (not appended after), so the
+  // chain is actually tamper-evident. See CertificateChainRepository.
+  previousCertificateHash: string | null;
+  // null specifically means this certificate was never added to the chain
+  // at all (the rare CertificateService.getCertificateForUser fallback for
+  // a request stuck at CASCADE_COMPLETE with no certificate ever actually
+  // issued) -- distinct from 1, the real first entry in a tenant's chain.
+  chainSequence: number | null;
 }
 
 export interface KeyStatus {
