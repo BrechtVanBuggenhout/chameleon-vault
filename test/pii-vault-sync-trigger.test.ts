@@ -29,7 +29,7 @@ describe('PiiVaultSyncTrigger', () => {
   it('resolves the worker URL via the Cloud Run Admin API, then mints an OIDC token scoped to it', async () => {
     mockRequest.mockResolvedValueOnce({ data: { uri: 'https://pii-ingestor-worker-abc123.a.run.app' } });
     mockIdTokenRequest.mockResolvedValueOnce({
-      data: { status: 'ok', resources_synced: 1, users_synced: 3, errors: [] },
+      data: { status: 'ok', resources_queued: 1, chunks_queued: 3, errors: [] },
     });
     const trigger = new PiiVaultSyncTrigger('proj', 'us-central1', 'chameleon-pii-ingestor-worker-dev');
 
@@ -48,13 +48,13 @@ describe('PiiVaultSyncTrigger', () => {
       url: 'https://pii-ingestor-worker-abc123.a.run.app/api/v1/pii-vault-sync',
       method: 'POST',
     });
-    expect(result).toEqual({ status: 'ok', resources_synced: 1, users_synced: 3, errors: [] });
+    expect(result).toEqual({ status: 'ok', resources_queued: 1, chunks_queued: 3, errors: [] });
   });
 
   it('caches the resolved URL instead of re-querying the Admin API on every trigger', async () => {
     mockRequest.mockResolvedValueOnce({ data: { uri: 'https://pii-ingestor-worker-abc123.a.run.app' } });
     mockIdTokenRequest.mockResolvedValue({
-      data: { status: 'ok', resources_synced: 0, users_synced: 0, errors: [] },
+      data: { status: 'ok', resources_queued: 0, chunks_queued: 0, errors: [] },
     });
     const trigger = new PiiVaultSyncTrigger('proj', 'us-central1', 'worker');
 

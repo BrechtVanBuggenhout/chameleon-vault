@@ -5,8 +5,8 @@ const logger = createLogger('pii-vault-sync-trigger');
 
 export interface SyncTriggerResult {
   status: string;
-  resources_synced: number;
-  users_synced: number;
+  resources_queued: number;
+  chunks_queued: number;
   errors: Array<{ resourceId: string; error: string }>;
 }
 
@@ -14,6 +14,13 @@ export interface SyncTriggerResult {
  * Fires the same backfill/sync the daily Cloud Scheduler job invokes, on
  * demand -- so a newly-declared field or resource doesn't have to wait for
  * the next scheduled run.
+ *
+ * The worker's own endpoint only enumerates and fans out per-chunk work
+ * over Pub/Sub, then returns immediately -- it does not wait for the
+ * actual encrypt-diff-insert work to finish, so this result is a queued
+ * count, not a final one. That's deliberate: enumeration is fast
+ * regardless of table size, which is what lets this call return quickly
+ * even for a resource with hundreds of thousands of users.
  *
  * The worker's URL is deliberately NOT passed in as config -- the worker
  * already depends on Key Vault's own URL (for its VAULT_BASE_URL env var),

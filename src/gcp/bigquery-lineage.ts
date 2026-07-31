@@ -102,7 +102,7 @@ export class BigQueryLineageRepository implements ILineageRepository {
     logger.info({ userId }, 'Querying BigQuery for user lineage summary');
     
     const datasetId = process.env.BIGQUERY_DATASET_ID || 'lineage_db';
-    const tableId = 'events'; // Matches lineage_table_id's default in chameleon-infra-gcp/variables.tf
+    const tableId = 'events'; // Assuming the table name from SYSTEM_INTEGRATION_MAP.md
     
     const query = `
       SELECT 
