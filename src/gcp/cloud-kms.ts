@@ -5,6 +5,13 @@ import { DeterministicAES } from '../crypto/deterministic-aes.js'; // Import Det
 
 const logger = createLogger('cloud-kms');
 
+// KMS version resource names end in an integer id (.../cryptoKeyVersions/3),
+// so a numeric comparison is needed to pick "the newest" -- lexicographic
+// sort would put version 10 before version 2.
+function versionNumber(versionName: string): number {
+  return Number(versionName.split('/').pop());
+}
+
 export class CloudKMSClient {
   private client: KeyManagementServiceClient;
   private projectId: string;
@@ -156,14 +163,29 @@ export class CloudKMSClient {
     return this.getKeyPath();
   }
 
-  /** Full resource name of the key's current primary (signing) version. */
+  /**
+   * Full resource name of the key's current primary (signing) version.
+   *
+   * GCP KMS does not auto-assign a primary version for ASYMMETRIC_SIGN keys
+   * the way it does for symmetric ENCRYPT_DECRYPT keys -- a key created
+   * before this app relied on "primary" (i.e. every signing key that
+   * predates rotation support) can have versions but no primary at all.
+   * Self-heals the first time this is hit: promotes the newest ENABLED
+   * version to primary, so every call after this one takes the fast path.
+   */
   async getPrimaryVersion(keyPath: string): Promise<string> {
     const [cryptoKey] = await this.client.getCryptoKey({ name: keyPath });
     const primary = cryptoKey.primary?.name;
-    if (!primary) {
-      throw new Error(`CryptoKey ${keyPath} has no primary version`);
+    if (primary) return primary;
+
+    logger.warn({ keyPath }, 'CryptoKey has no primary version set -- promoting the newest ENABLED version');
+    const versions = await this.listEnabledVersions(keyPath);
+    if (versions.length === 0) {
+      throw new Error(`CryptoKey ${keyPath} has no ENABLED versions to promote`);
     }
-    return primary;
+    const newest = versions.reduce((a, b) => versionNumber(a) > versionNumber(b) ? a : b);
+    await this.promoteVersion(keyPath, newest);
+    return newest;
   }
 
   /**
