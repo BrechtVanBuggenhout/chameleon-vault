@@ -105,23 +105,24 @@ export class CertificateService {
   }
 
   // Base (unversioned) path of the signing CryptoKey -- static for the
-  // process lifetime, unlike the primary *version*, which changes on rotation.
+  // process lifetime, unlike the current *version*, which changes on rotation.
   private getSigningKeyBasePath(): string {
     return this.signingKmsClient.getCryptoKeyPath();
   }
 
-  // The primary version changes only when rotateSigningKey() runs, so this
-  // is cached briefly rather than fetched from KMS on every sign/JWKS call.
-  // Invalidated immediately on rotation (see rotateSigningKey) so a rotation
-  // takes effect right away rather than waiting out the TTL.
-  private _primaryVersionCache: { value: string; expiresAt: number } | null = null;
-  private readonly PRIMARY_VERSION_TTL_MS = 5 * 60 * 1000;
+  // "Current" (the newest ENABLED version -- see getNewestEnabledVersion's
+  // own comment for why that's the right definition) changes only when
+  // rotateSigningKey() runs, so this is cached briefly rather than
+  // refetched from KMS on every sign/JWKS call. Invalidated immediately on
+  // rotation so it takes effect right away rather than waiting out the TTL.
+  private _currentVersionCache: { value: string; expiresAt: number } | null = null;
+  private readonly CURRENT_VERSION_TTL_MS = 5 * 60 * 1000;
 
   private async getCurrentSigningKeyVersion(): Promise<string> {
-    const cached = this._primaryVersionCache;
+    const cached = this._currentVersionCache;
     if (cached && cached.expiresAt > Date.now()) return cached.value;
-    const value = await this.signingKmsClient.getPrimaryVersion(this.getSigningKeyBasePath());
-    this._primaryVersionCache = { value, expiresAt: Date.now() + this.PRIMARY_VERSION_TTL_MS };
+    const value = await this.signingKmsClient.getNewestEnabledVersion(this.getSigningKeyBasePath());
+    this._currentVersionCache = { value, expiresAt: Date.now() + this.CURRENT_VERSION_TTL_MS };
     return value;
   }
 
@@ -209,21 +210,22 @@ export class CertificateService {
   }
 
   /**
-   * Mints a new signing key version and promotes it to primary. The old
-   * version is left ENABLED (never destroyed), so certificates it already
-   * signed remain verifiable via getJwks() indefinitely.
+   * Mints a new signing key version. It becomes "current" the moment it
+   * exists (see getNewestEnabledVersion) -- no separate promotion step, KMS
+   * doesn't support one for ASYMMETRIC_SIGN keys. The old version is left
+   * ENABLED (never destroyed), so certificates it already signed remain
+   * verifiable via getJwks() indefinitely.
    */
   async rotateSigningKey(): Promise<{ newVersion: string; previousVersion: string }> {
     const basePath = this.getSigningKeyBasePath();
-    const previousVersion = await this.signingKmsClient.getPrimaryVersion(basePath);
+    const previousVersion = await this.getCurrentSigningKeyVersion();
 
     const newVersion = await this.signingKmsClient.createKeyVersion(basePath);
     await this.signingKmsClient.waitForVersionEnabled(newVersion);
-    await this.signingKmsClient.promoteVersion(basePath, newVersion);
 
-    // Invalidate so the new primary takes effect immediately rather than
+    // Invalidate so the new version takes effect immediately rather than
     // waiting out the caches' TTLs.
-    this._primaryVersionCache = null;
+    this._currentVersionCache = null;
     this._enabledVersionsCache = null;
 
     logger.info({ previousVersion, newVersion }, 'Signing key rotated');

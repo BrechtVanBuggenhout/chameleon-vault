@@ -164,28 +164,24 @@ export class CloudKMSClient {
   }
 
   /**
-   * Full resource name of the key's current primary (signing) version.
+   * Full resource name of the version to sign new certificates with.
    *
-   * GCP KMS does not auto-assign a primary version for ASYMMETRIC_SIGN keys
-   * the way it does for symmetric ENCRYPT_DECRYPT keys -- a key created
-   * before this app relied on "primary" (i.e. every signing key that
-   * predates rotation support) can have versions but no primary at all.
-   * Self-heals the first time this is hit: promotes the newest ENABLED
-   * version to primary, so every call after this one takes the fast path.
+   * GCP KMS has no "primary version" concept for ASYMMETRIC_SIGN keys --
+   * unlike symmetric keys, callers always specify an exact version, so
+   * UpdateCryptoKeyPrimaryVersion outright rejects this purpose
+   * (FAILED_PRECONDITION: "Keys with purpose ASYMMETRIC_SIGN do not have a
+   * primary version"). "Current" is defined here instead, purely from the
+   * version list: KMS assigns version ids as a strictly increasing integer
+   * sequence per key, so the newest ENABLED version *is* the one rotation
+   * just created (or the original version, before any rotation ever ran) --
+   * no separate pointer to keep in sync, nothing that can drift.
    */
-  async getPrimaryVersion(keyPath: string): Promise<string> {
-    const [cryptoKey] = await this.client.getCryptoKey({ name: keyPath });
-    const primary = cryptoKey.primary?.name;
-    if (primary) return primary;
-
-    logger.warn({ keyPath }, 'CryptoKey has no primary version set -- promoting the newest ENABLED version');
+  async getNewestEnabledVersion(keyPath: string): Promise<string> {
     const versions = await this.listEnabledVersions(keyPath);
     if (versions.length === 0) {
-      throw new Error(`CryptoKey ${keyPath} has no ENABLED versions to promote`);
+      throw new Error(`CryptoKey ${keyPath} has no ENABLED versions`);
     }
-    const newest = versions.reduce((a, b) => versionNumber(a) > versionNumber(b) ? a : b);
-    await this.promoteVersion(keyPath, newest);
-    return newest;
+    return versions.reduce((a, b) => versionNumber(a) > versionNumber(b) ? a : b);
   }
 
   /**
@@ -232,17 +228,5 @@ export class CloudKMSClient {
       }
       await new Promise(resolve => setTimeout(resolve, pollMs));
     }
-  }
-
-  /** Promotes a version to be the key's primary -- new signatures use it from this point on. */
-  async promoteVersion(keyPath: string, versionName: string): Promise<void> {
-    const cryptoKeyVersionId = versionName.split('/').pop();
-    if (!cryptoKeyVersionId) {
-      throw new Error(`Could not extract version id from ${versionName}`);
-    }
-    await this.client.updateCryptoKeyPrimaryVersion({
-      name: keyPath,
-      cryptoKeyVersionId,
-    });
   }
 }

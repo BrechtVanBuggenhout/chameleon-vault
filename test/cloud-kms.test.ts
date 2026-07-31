@@ -1,19 +1,17 @@
 import { jest, describe, it, expect, beforeEach } from '@jest/globals';
 
-// A key created before this app relied on KMS's "primary version" concept
-// (i.e. every real signing key that predates rotation support) can have
-// versions but no primary at all -- GCP KMS doesn't auto-assign one for
-// ASYMMETRIC_SIGN keys the way it does for symmetric keys. This exercises
-// getPrimaryVersion()'s self-heal path for exactly that case, against the
-// raw @google-cloud/kms client (not the CloudKMSClient wrapper other tests
-// mock away), since the self-heal logic lives inside that wrapper.
+// GCP KMS has no "primary version" concept for ASYMMETRIC_SIGN keys --
+// UpdateCryptoKeyPrimaryVersion rejects it outright (FAILED_PRECONDITION).
+// getNewestEnabledVersion() is what stands in for "current" instead: KMS
+// assigns version ids as a strictly increasing integer sequence per key, so
+// the newest ENABLED version is unambiguous with no separate pointer to
+// keep in sync. This exercises that against the raw @google-cloud/kms
+// client (not the CloudKMSClient wrapper other tests mock away), since the
+// logic lives inside that wrapper.
 
 const KEY_PATH = 'projects/p/locations/r/keyRings/kr/cryptoKeys/kn';
 
-let mockPrimary: { name: string } | undefined;
-const mockGetCryptoKey = jest.fn(async () => [{ primary: mockPrimary }]);
-const mockUpdateCryptoKeyPrimaryVersion = jest.fn(async () => [{}]);
-async function* versionsIterable(versions: { name: string; state: string }[]) {
+async function* versionsIterable(versions: { name: string; state: string }[]): AsyncGenerator<{ name: string; state: string }> {
   for (const v of versions) yield v;
 }
 let mockVersions: { name: string; state: string }[] = [];
@@ -21,8 +19,6 @@ const mockListCryptoKeyVersionsAsync = jest.fn(() => versionsIterable(mockVersio
 
 await jest.unstable_mockModule('@google-cloud/kms', () => ({
   KeyManagementServiceClient: class {
-    getCryptoKey = mockGetCryptoKey;
-    updateCryptoKeyPrimaryVersion = mockUpdateCryptoKeyPrimaryVersion;
     listCryptoKeyVersionsAsync = mockListCryptoKeyVersionsAsync;
     cryptoKeyPath(project: string, location: string, keyRing: string, keyName: string): string {
       return `projects/${project}/locations/${location}/keyRings/${keyRing}/cryptoKeys/${keyName}`;
@@ -32,49 +28,42 @@ await jest.unstable_mockModule('@google-cloud/kms', () => ({
 
 const { CloudKMSClient } = await import('../src/gcp/cloud-kms.js');
 
-describe('CloudKMSClient.getPrimaryVersion', () => {
+describe('CloudKMSClient.getNewestEnabledVersion', () => {
   beforeEach(() => {
-    mockGetCryptoKey.mockClear();
-    mockUpdateCryptoKeyPrimaryVersion.mockClear();
     mockListCryptoKeyVersionsAsync.mockClear();
-    mockPrimary = undefined;
     mockVersions = [];
   });
 
-  it('returns the primary directly when KMS already has one set', async () => {
-    mockPrimary = { name: `${KEY_PATH}/cryptoKeyVersions/2` };
-    const client = new CloudKMSClient('p', 'r', 'kr', 'kn');
-
-    const result = await client.getPrimaryVersion(KEY_PATH);
-
-    expect(result).toBe(`${KEY_PATH}/cryptoKeyVersions/2`);
-    expect(mockUpdateCryptoKeyPrimaryVersion).not.toHaveBeenCalled();
-  });
-
-  it('self-heals by promoting the newest ENABLED version when no primary is set', async () => {
-    mockPrimary = undefined;
+  it('returns the numerically newest ENABLED version, not the lexicographically last', async () => {
     mockVersions = [
       { name: `${KEY_PATH}/cryptoKeyVersions/1`, state: 'ENABLED' },
-      { name: `${KEY_PATH}/cryptoKeyVersions/10`, state: 'ENABLED' }, // numeric, not lexicographic, sort
+      { name: `${KEY_PATH}/cryptoKeyVersions/10`, state: 'ENABLED' },
       { name: `${KEY_PATH}/cryptoKeyVersions/2`, state: 'ENABLED' },
-      { name: `${KEY_PATH}/cryptoKeyVersions/3`, state: 'DESTROYED' },
     ];
     const client = new CloudKMSClient('p', 'r', 'kr', 'kn');
 
-    const result = await client.getPrimaryVersion(KEY_PATH);
+    const result = await client.getNewestEnabledVersion(KEY_PATH);
 
     expect(result).toBe(`${KEY_PATH}/cryptoKeyVersions/10`);
-    expect(mockUpdateCryptoKeyPrimaryVersion).toHaveBeenCalledWith({
-      name: KEY_PATH,
-      cryptoKeyVersionId: '10',
-    });
   });
 
-  it('throws when no primary is set and no ENABLED version exists to promote', async () => {
-    mockPrimary = undefined;
+  it('ignores non-ENABLED versions (e.g. a disabled newest version falls back to the next one)', async () => {
+    mockVersions = [
+      { name: `${KEY_PATH}/cryptoKeyVersions/1`, state: 'ENABLED' },
+      { name: `${KEY_PATH}/cryptoKeyVersions/2`, state: 'ENABLED' },
+      { name: `${KEY_PATH}/cryptoKeyVersions/3`, state: 'DISABLED' },
+    ];
+    const client = new CloudKMSClient('p', 'r', 'kr', 'kn');
+
+    const result = await client.getNewestEnabledVersion(KEY_PATH);
+
+    expect(result).toBe(`${KEY_PATH}/cryptoKeyVersions/2`);
+  });
+
+  it('throws when there are no ENABLED versions at all', async () => {
     mockVersions = [{ name: `${KEY_PATH}/cryptoKeyVersions/1`, state: 'DESTROYED' }];
     const client = new CloudKMSClient('p', 'r', 'kr', 'kn');
 
-    await expect(client.getPrimaryVersion(KEY_PATH)).rejects.toThrow('no ENABLED versions to promote');
+    await expect(client.getNewestEnabledVersion(KEY_PATH)).rejects.toThrow('no ENABLED versions');
   });
 });

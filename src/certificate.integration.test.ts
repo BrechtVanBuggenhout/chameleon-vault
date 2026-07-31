@@ -65,15 +65,20 @@ const mockAsymmetricSign = jest.fn(async () => 'mock-sig-header.mock-sig-payload
 const mockGetPublicKey = jest.fn(async () => '-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEz2nHz6bvF37sprvNXq9/xdNXUYu5\nfQGLAvRlDyWA3zexY+lFarnwkl++ewAdhCmaPU1Qo04l6nJ8rslZxUV1Ag==\n-----END PUBLIC KEY-----');
 
 // Mutable, shared across tests within this file (mirrors what a real KMS
-// CryptoKey's version list/primary look like) so the rotation tests can
-// observe the base path growing a version and the primary pointer moving.
+// CryptoKey's version list looks like) so the rotation tests can observe
+// the version list growing. There's deliberately no separate "primary"
+// pointer to track -- GCP KMS has no such concept for ASYMMETRIC_SIGN keys,
+// so "current" is always just the newest entry in mockVersions itself.
 const BASE_KEY_PATH = 'projects/p/locations/r/keyRings/kr/cryptoKeys/kn';
 let mockVersions = [`${BASE_KEY_PATH}/cryptoKeyVersions/1`];
-let mockPrimaryVersion = mockVersions[0];
 let mockVersionCounter = 1;
 
+function newestVersion(): string {
+  return [...mockVersions].sort((a, b) => Number(a.split('/').pop()) - Number(b.split('/').pop())).pop()!;
+}
+
 const mockGetCryptoKeyPath = jest.fn(() => BASE_KEY_PATH);
-const mockGetPrimaryVersion = jest.fn(async () => mockPrimaryVersion);
+const mockGetNewestEnabledVersion = jest.fn(async () => newestVersion());
 const mockListEnabledVersions = jest.fn(async () => mockVersions);
 const mockCreateKeyVersion = jest.fn(async () => {
   mockVersionCounter += 1;
@@ -82,20 +87,16 @@ const mockCreateKeyVersion = jest.fn(async () => {
   return version;
 });
 const mockWaitForVersionEnabled = jest.fn(async () => undefined);
-const mockPromoteVersion = jest.fn(async (_keyPath: string, versionName: string) => {
-  mockPrimaryVersion = versionName;
-});
 
 await jest.unstable_mockModule('../src/gcp/cloud-kms.js', () => ({
   CloudKMSClient: class {
     asymmetricSign = mockAsymmetricSign;
     getPublicKey = mockGetPublicKey;
     getCryptoKeyPath = mockGetCryptoKeyPath;
-    getPrimaryVersion = mockGetPrimaryVersion;
+    getNewestEnabledVersion = mockGetNewestEnabledVersion;
     listEnabledVersions = mockListEnabledVersions;
     createKeyVersion = mockCreateKeyVersion;
     waitForVersionEnabled = mockWaitForVersionEnabled;
-    promoteVersion = mockPromoteVersion;
   }
 }));
 
@@ -137,11 +138,10 @@ describe('Certificate API Integration Tests', () => {
     mockRegistryStore.clear();
     mockDeletionRequestStore.clear();
     mockAsymmetricSign.mockClear();
-    mockGetPrimaryVersion.mockClear();
+    mockGetNewestEnabledVersion.mockClear();
     mockListEnabledVersions.mockClear();
     mockCreateKeyVersion.mockClear();
     mockWaitForVersionEnabled.mockClear();
-    mockPromoteVersion.mockClear();
   });
 
   it('GET /public-key should return the PEM public key', async () => {
@@ -270,11 +270,11 @@ describe('Certificate API Integration Tests', () => {
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
     expect(body.keys).toHaveLength(1);
-    expect(body.keys[0]).toMatchObject({ kid: mockPrimaryVersion, use: 'sig', alg: 'PS256' });
+    expect(body.keys[0]).toMatchObject({ kid: newestVersion(), use: 'sig', alg: 'PS256' });
   });
 
-  it('POST /admin/signing-key/rotate should mint a new version and promote it to primary', async () => {
-    const versionBefore = mockPrimaryVersion;
+  it('POST /admin/signing-key/rotate should mint a new version, with no promote-to-primary step', async () => {
+    const versionBefore = newestVersion();
 
     const response = await app.inject({ method: 'POST', url: '/admin/signing-key/rotate' });
 
@@ -285,8 +285,10 @@ describe('Certificate API Integration Tests', () => {
     expect(body.newVersion).not.toBe(versionBefore);
     expect(mockCreateKeyVersion).toHaveBeenCalledTimes(1);
     expect(mockWaitForVersionEnabled).toHaveBeenCalledWith(body.newVersion);
-    expect(mockPromoteVersion).toHaveBeenCalledWith(BASE_KEY_PATH, body.newVersion);
-    expect(mockPrimaryVersion).toBe(body.newVersion);
+    // The new version is "current" simply by being the newest ENABLED one --
+    // GCP KMS has no primary-version concept for ASYMMETRIC_SIGN keys, so
+    // there's no separate promotion call to assert here.
+    expect(newestVersion()).toBe(body.newVersion);
   });
 
   it('GET /.well-known/jwks.json should include both the old and new key after rotation', async () => {
@@ -299,7 +301,7 @@ describe('Certificate API Integration Tests', () => {
     expect(mockVersions.length).toBeGreaterThan(1);
   });
 
-  it('GET /certificate/:userId should sign with the new primary version after rotation', async () => {
+  it('GET /certificate/:userId should sign with the newest version after rotation', async () => {
     mockRegistryStore.set('user456', { status: 'SHREDDED', shredAt: '2026-06-02T10:00:00Z' });
     mockDeletionRequestStore.set('user456', { status: 'CASCADE_COMPLETE', janitor_wipes: [] });
 
@@ -308,6 +310,6 @@ describe('Certificate API Integration Tests', () => {
     expect(response.statusCode).toBe(200);
     const certificate = JSON.parse(response.body).certificate as string;
     const header = JSON.parse(Buffer.from(certificate.split('.')[0], 'base64url').toString());
-    expect(header.kid).toBe(mockPrimaryVersion);
+    expect(header.kid).toBe(newestVersion());
   });
 });
