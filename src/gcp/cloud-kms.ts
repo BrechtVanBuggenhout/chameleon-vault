@@ -150,4 +150,77 @@ export class CloudKMSClient {
       throw error;
     }
   }
+
+  /** The base CryptoKey path (no version) this client was constructed for. */
+  getCryptoKeyPath(): string {
+    return this.getKeyPath();
+  }
+
+  /** Full resource name of the key's current primary (signing) version. */
+  async getPrimaryVersion(keyPath: string): Promise<string> {
+    const [cryptoKey] = await this.client.getCryptoKey({ name: keyPath });
+    const primary = cryptoKey.primary?.name;
+    if (!primary) {
+      throw new Error(`CryptoKey ${keyPath} has no primary version`);
+    }
+    return primary;
+  }
+
+  /**
+   * Every non-destroyed, usable version of the key -- old versions are kept
+   * (never destroyed) so certificates signed under them stay verifiable, so
+   * this can return an unbounded, ever-growing list over the key's lifetime.
+   */
+  async listEnabledVersions(keyPath: string): Promise<string[]> {
+    const versions: string[] = [];
+    for await (const version of this.client.listCryptoKeyVersionsAsync({ parent: keyPath })) {
+      if (version.state === 'ENABLED' && version.name) {
+        versions.push(version.name);
+      }
+    }
+    return versions;
+  }
+
+  /** Mints a new key version. Callers must wait for it to become ENABLED before signing with it. */
+  async createKeyVersion(keyPath: string): Promise<string> {
+    const [version] = await this.client.createCryptoKeyVersion({
+      parent: keyPath,
+      cryptoKeyVersion: {},
+    });
+    if (!version.name) {
+      throw new Error(`Failed to create a new version for ${keyPath}`);
+    }
+    return version.name;
+  }
+
+  /**
+   * Asymmetric key versions generate their key material asynchronously --
+   * polls until the new version is actually usable (or fails/times out).
+   */
+  async waitForVersionEnabled(versionName: string, timeoutMs = 120_000, pollMs = 3_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const [version] = await this.client.getCryptoKeyVersion({ name: versionName });
+      if (version.state === 'ENABLED') return;
+      if (version.state === 'GENERATION_FAILED') {
+        throw new Error(`Key version ${versionName} failed to generate`);
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for key version ${versionName} to become ENABLED (last state: ${version.state})`);
+      }
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+  }
+
+  /** Promotes a version to be the key's primary -- new signatures use it from this point on. */
+  async promoteVersion(keyPath: string, versionName: string): Promise<void> {
+    const cryptoKeyVersionId = versionName.split('/').pop();
+    if (!cryptoKeyVersionId) {
+      throw new Error(`Could not extract version id from ${versionName}`);
+    }
+    await this.client.updateCryptoKeyPrimaryVersion({
+      name: keyPath,
+      cryptoKeyVersionId,
+    });
+  }
 }

@@ -5,7 +5,6 @@ import { CloudKMSClient } from '../gcp/cloud-kms.js';
 import { DeletionRequestRepository } from '../gcp/deletion-request-repository.js';
 import { CertificateLineageItem, DestructionCertificateClaims } from '../types/index.js';
 import { createLogger } from '../logging/index.js';
-import { getRequiredEnv } from '../config/env.js';
 import { GCSClient } from '../gcp/gcs-client.js';
 
 const logger = createLogger('certificate-service');
@@ -105,64 +104,129 @@ export class CertificateService {
     return { certificate, gcsPath };
   }
 
-  private getSigningKeyPath(): string {
-    const projectId = getRequiredEnv('GCP_PROJECT_ID');
-    const kmsRegion = getRequiredEnv('CLOUD_KMS_REGION');
-    const kmsKeyRing = getRequiredEnv('CLOUD_KMS_SIGNING_KEY_RING');
-    const kmsKeyName = getRequiredEnv('CLOUD_KMS_SIGNING_KEY_NAME');
-    const kmsKeyVersion = process.env.CLOUD_KMS_SIGNING_KEY_VERSION || '1';
-    return `projects/${projectId}/locations/${kmsRegion}/keyRings/${kmsKeyRing}/cryptoKeys/${kmsKeyName}/cryptoKeyVersions/${kmsKeyVersion}`;
+  // Base (unversioned) path of the signing CryptoKey -- static for the
+  // process lifetime, unlike the primary *version*, which changes on rotation.
+  private getSigningKeyBasePath(): string {
+    return this.signingKmsClient.getCryptoKeyPath();
+  }
+
+  // The primary version changes only when rotateSigningKey() runs, so this
+  // is cached briefly rather than fetched from KMS on every sign/JWKS call.
+  // Invalidated immediately on rotation (see rotateSigningKey) so a rotation
+  // takes effect right away rather than waiting out the TTL.
+  private _primaryVersionCache: { value: string; expiresAt: number } | null = null;
+  private readonly PRIMARY_VERSION_TTL_MS = 5 * 60 * 1000;
+
+  private async getCurrentSigningKeyVersion(): Promise<string> {
+    const cached = this._primaryVersionCache;
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    const value = await this.signingKmsClient.getPrimaryVersion(this.getSigningKeyBasePath());
+    this._primaryVersionCache = { value, expiresAt: Date.now() + this.PRIMARY_VERSION_TTL_MS };
+    return value;
   }
 
   async signCertificate(claims: DestructionCertificateClaims): Promise<string> {
-    const keyVersionPath = this.getSigningKeyPath();
+    const keyVersionPath = await this.getCurrentSigningKeyVersion();
 
-    const header = Buffer.from(JSON.stringify({ 
-      alg: 'PS256', 
+    const header = Buffer.from(JSON.stringify({
+      alg: 'PS256',
       typ: 'JWT',
       kid: keyVersionPath // Use full KMS resource name as kid for rotation mapping
     })).toString('base64url');
-    
+
     const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
-    
+
     const unsignedToken = `${header}.${payload}`;
-    
+
     const signature = await this.signingKmsClient.asymmetricSign(unsignedToken, keyVersionPath);
-    
+
     return `${unsignedToken}.${signature}`;
   }
 
   async getPublicKey(): Promise<string> {
-    return this.signingKmsClient.getPublicKey(this.getSigningKeyPath());
+    const keyVersionPath = await this.getCurrentSigningKeyVersion();
+    return this.signingKmsClient.getPublicKey(keyVersionPath);
   }
 
-  private _fingerprintCache: string | null = null;
+  // Keyed by version path -- a given version's public key/fingerprint never
+  // changes once ENABLED, so unlike the primary-version cache above this
+  // never needs a TTL or invalidation, just one entry per version ever seen.
+  private _fingerprintCache = new Map<string, string>();
 
   async getKeyFingerprint(): Promise<string> {
-    if (this._fingerprintCache) return this._fingerprintCache;
-    const pem = await this.getPublicKey();
+    const keyVersionPath = await this.getCurrentSigningKeyVersion();
+    const cached = this._fingerprintCache.get(keyVersionPath);
+    if (cached) return cached;
+    const pem = await this.signingKmsClient.getPublicKey(keyVersionPath);
     const keyObject = crypto.createPublicKey(pem);
     const der = keyObject.export({ type: 'spki', format: 'der' });
     const fingerprint = `sha256:${crypto.createHash('sha256').update(der).digest('hex')}`;
-    this._fingerprintCache = fingerprint;
+    this._fingerprintCache.set(keyVersionPath, fingerprint);
     return fingerprint;
   }
 
-  async getJwks(): Promise<{ keys: Record<string, unknown>[] }> {
-    const pem = await this.getPublicKey();
-    const keyVersionPath = this.getSigningKeyPath();
-    
-    // Convert PEM to JWK format
-    const keyObject = crypto.createPublicKey(pem);
-    const jwk = keyObject.export({ format: 'jwk' });
+  // Same never-expires reasoning as _fingerprintCache: a version's JWK is
+  // immutable once ENABLED.
+  private _jwkCache = new Map<string, Record<string, unknown>>();
+  private _enabledVersionsCache: { value: string[]; expiresAt: number } | null = null;
+  private readonly ENABLED_VERSIONS_TTL_MS = 10 * 60 * 1000;
 
-    return {
-      keys: [{
-        ...jwk,
+  private async getEnabledVersions(): Promise<string[]> {
+    const cached = this._enabledVersionsCache;
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    const value = await this.signingKmsClient.listEnabledVersions(this.getSigningKeyBasePath());
+    this._enabledVersionsCache = { value, expiresAt: Date.now() + this.ENABLED_VERSIONS_TTL_MS };
+    return value;
+  }
+
+  /**
+   * Every ENABLED signing key version, past and present -- not just the
+   * current primary. Old certificates carry a `kid` pointing at whichever
+   * version signed them, so a verifier resolving that `kid` against this set
+   * needs every version still around, not only the one currently signing new
+   * certificates. Old versions are kept indefinitely (never destroyed) so a
+   * certificate issued years ago stays verifiable.
+   */
+  async getJwks(): Promise<{ keys: Record<string, unknown>[] }> {
+    const versions = await this.getEnabledVersions();
+
+    const keys = await Promise.all(versions.map(async (keyVersionPath) => {
+      const cached = this._jwkCache.get(keyVersionPath);
+      if (cached) return cached;
+      const pem = await this.signingKmsClient.getPublicKey(keyVersionPath);
+      const keyObject = crypto.createPublicKey(pem);
+      const jwk = {
+        ...keyObject.export({ format: 'jwk' }),
         kid: keyVersionPath,
         use: 'sig',
-        alg: 'PS256'
-      }]
-    };
+        alg: 'PS256',
+      };
+      this._jwkCache.set(keyVersionPath, jwk);
+      return jwk;
+    }));
+
+    return { keys };
+  }
+
+  /**
+   * Mints a new signing key version and promotes it to primary. The old
+   * version is left ENABLED (never destroyed), so certificates it already
+   * signed remain verifiable via getJwks() indefinitely.
+   */
+  async rotateSigningKey(): Promise<{ newVersion: string; previousVersion: string }> {
+    const basePath = this.getSigningKeyBasePath();
+    const previousVersion = await this.signingKmsClient.getPrimaryVersion(basePath);
+
+    const newVersion = await this.signingKmsClient.createKeyVersion(basePath);
+    await this.signingKmsClient.waitForVersionEnabled(newVersion);
+    await this.signingKmsClient.promoteVersion(basePath, newVersion);
+
+    // Invalidate so the new primary takes effect immediately rather than
+    // waiting out the caches' TTLs.
+    this._primaryVersionCache = null;
+    this._enabledVersionsCache = null;
+
+    logger.info({ previousVersion, newVersion }, 'Signing key rotated');
+    return { newVersion, previousVersion };
   }
 }

@@ -63,10 +63,39 @@ await jest.unstable_mockModule('../src/gcp/deletion-request-repository.js', () =
 
 const mockAsymmetricSign = jest.fn(async () => 'mock-sig-header.mock-sig-payload.mock-signature');
 const mockGetPublicKey = jest.fn(async () => '-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEz2nHz6bvF37sprvNXq9/xdNXUYu5\nfQGLAvRlDyWA3zexY+lFarnwkl++ewAdhCmaPU1Qo04l6nJ8rslZxUV1Ag==\n-----END PUBLIC KEY-----');
+
+// Mutable, shared across tests within this file (mirrors what a real KMS
+// CryptoKey's version list/primary look like) so the rotation tests can
+// observe the base path growing a version and the primary pointer moving.
+const BASE_KEY_PATH = 'projects/p/locations/r/keyRings/kr/cryptoKeys/kn';
+let mockVersions = [`${BASE_KEY_PATH}/cryptoKeyVersions/1`];
+let mockPrimaryVersion = mockVersions[0];
+let mockVersionCounter = 1;
+
+const mockGetCryptoKeyPath = jest.fn(() => BASE_KEY_PATH);
+const mockGetPrimaryVersion = jest.fn(async () => mockPrimaryVersion);
+const mockListEnabledVersions = jest.fn(async () => mockVersions);
+const mockCreateKeyVersion = jest.fn(async () => {
+  mockVersionCounter += 1;
+  const version = `${BASE_KEY_PATH}/cryptoKeyVersions/${mockVersionCounter}`;
+  mockVersions = [...mockVersions, version];
+  return version;
+});
+const mockWaitForVersionEnabled = jest.fn(async () => undefined);
+const mockPromoteVersion = jest.fn(async (_keyPath: string, versionName: string) => {
+  mockPrimaryVersion = versionName;
+});
+
 await jest.unstable_mockModule('../src/gcp/cloud-kms.js', () => ({
   CloudKMSClient: class {
     asymmetricSign = mockAsymmetricSign;
     getPublicKey = mockGetPublicKey;
+    getCryptoKeyPath = mockGetCryptoKeyPath;
+    getPrimaryVersion = mockGetPrimaryVersion;
+    listEnabledVersions = mockListEnabledVersions;
+    createKeyVersion = mockCreateKeyVersion;
+    waitForVersionEnabled = mockWaitForVersionEnabled;
+    promoteVersion = mockPromoteVersion;
   }
 }));
 
@@ -108,6 +137,11 @@ describe('Certificate API Integration Tests', () => {
     mockRegistryStore.clear();
     mockDeletionRequestStore.clear();
     mockAsymmetricSign.mockClear();
+    mockGetPrimaryVersion.mockClear();
+    mockListEnabledVersions.mockClear();
+    mockCreateKeyVersion.mockClear();
+    mockWaitForVersionEnabled.mockClear();
+    mockPromoteVersion.mockClear();
   });
 
   it('GET /public-key should return the PEM public key', async () => {
@@ -228,5 +262,52 @@ describe('Certificate API Integration Tests', () => {
     expect(response.statusCode).toBe(200);
     const claims = JSON.parse(Buffer.from(JSON.parse(response.body).certificate.split('.')[1], 'base64url').toString());
     expect(claims.lineageSummary).toEqual([]);
+  });
+
+  it('GET /.well-known/jwks.json should return exactly one key before any rotation', async () => {
+    const response = await app.inject({ method: 'GET', url: '/.well-known/jwks.json' });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.keys).toHaveLength(1);
+    expect(body.keys[0]).toMatchObject({ kid: mockPrimaryVersion, use: 'sig', alg: 'PS256' });
+  });
+
+  it('POST /admin/signing-key/rotate should mint a new version and promote it to primary', async () => {
+    const versionBefore = mockPrimaryVersion;
+
+    const response = await app.inject({ method: 'POST', url: '/admin/signing-key/rotate' });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.status).toBe('rotated');
+    expect(body.previousVersion).toBe(versionBefore);
+    expect(body.newVersion).not.toBe(versionBefore);
+    expect(mockCreateKeyVersion).toHaveBeenCalledTimes(1);
+    expect(mockWaitForVersionEnabled).toHaveBeenCalledWith(body.newVersion);
+    expect(mockPromoteVersion).toHaveBeenCalledWith(BASE_KEY_PATH, body.newVersion);
+    expect(mockPrimaryVersion).toBe(body.newVersion);
+  });
+
+  it('GET /.well-known/jwks.json should include both the old and new key after rotation', async () => {
+    // The previous test already rotated once, so two ENABLED versions exist.
+    const response = await app.inject({ method: 'GET', url: '/.well-known/jwks.json' });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.keys.map((k: { kid: string }) => k.kid).sort()).toEqual([...mockVersions].sort());
+    expect(mockVersions.length).toBeGreaterThan(1);
+  });
+
+  it('GET /certificate/:userId should sign with the new primary version after rotation', async () => {
+    mockRegistryStore.set('user456', { status: 'SHREDDED', shredAt: '2026-06-02T10:00:00Z' });
+    mockDeletionRequestStore.set('user456', { status: 'CASCADE_COMPLETE', janitor_wipes: [] });
+
+    const response = await app.inject({ method: 'GET', url: '/certificate/user456' });
+
+    expect(response.statusCode).toBe(200);
+    const certificate = JSON.parse(response.body).certificate as string;
+    const header = JSON.parse(Buffer.from(certificate.split('.')[0], 'base64url').toString());
+    expect(header.kid).toBe(mockPrimaryVersion);
   });
 });

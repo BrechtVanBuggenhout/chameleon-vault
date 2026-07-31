@@ -74,4 +74,29 @@ export async function certificateRoutes(
       throw error;
     }
   });
+
+  /**
+   * POST /admin/signing-key/rotate
+   * Mints a new signing key version and promotes it to primary. Intended to
+   * be called on a schedule (Cloud Scheduler), not by end users -- gated by
+   * the same shared VAULT_API_KEY as every other non-exempt route.
+   */
+  fastify.post('/admin/signing-key/rotate', async (_request, reply) => {
+    try {
+      const result = await certificateService.rotateSigningKey();
+      return {
+        status: 'rotated',
+        newVersion: result.newVersion,
+        previousVersion: result.previousVersion,
+        timestamp: new Date().toISOString(),
+      };
+    } catch (error) {
+      logger.error({ error }, 'Failed to rotate signing key');
+      return reply.status(500).send({
+        statusCode: 500,
+        error: 'Rotation failed',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
 }
