@@ -45,7 +45,7 @@ function makeRepo() {
 
 const ENCRYPTED_ENTRY: PiiRegistryEntry = {
   registryVersion: '1',
-  resourceId: 'bigquery:proj.ds.raw_users',
+  resourceId: 'bigquery:proj.ds.pii_vault',
   system: 'bigquery',
   piiFields: [
     { name: 'email', classification: 'DIRECT_IDENTIFIER', handling: 'ENCRYPT', requiredInMart: false },
@@ -83,7 +83,7 @@ describe('DecryptedViewService', () => {
     const result = await service.declareView({
       tenantId: 'tenant-a',
       viewName: 'campaign_emails',
-      sourceResourceId: 'bigquery:proj.ds.raw_users',
+      sourceResourceId: 'bigquery:proj.ds.pii_vault',
       declaredFields: ['email'],
       businessJustification: 'Send campaign confirmations',
       createdBy: 'brecht@chameleon-data.com',
@@ -96,7 +96,19 @@ describe('DecryptedViewService', () => {
     expect(mockDataset).toHaveBeenCalledWith('decrypted_views');
     expect(mockCreateTable).toHaveBeenCalledWith(
       'tenant-a_campaign_emails',
-      expect.objectContaining({ view: expect.stringContaining('chameleon_batch_decrypt(email, user_id, tenant_id)') })
+      expect.objectContaining({
+        // pii_vault is long-format (one row per user+field), so each
+        // declared field is pivoted out by field_name, decrypting only
+        // encrypted_value (never the non-reversible token column), scoped
+        // to the declaring tenant.
+        view: expect.stringMatching(
+          /IF\(field_name = 'email', proj\.decrypted_views\.chameleon_batch_decrypt\(CAST\(encrypted_value AS STRING\), user_id, tenant_id\), NULL\)/
+        ),
+      })
+    );
+    expect(mockCreateTable).toHaveBeenCalledWith(
+      'tenant-a_campaign_emails',
+      expect.objectContaining({ view: expect.stringContaining("WHERE tenant_id = 'tenant-a'") })
     );
     expect(mockSetIamPolicy).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -111,7 +123,7 @@ describe('DecryptedViewService', () => {
       service.declareView({
         tenantId: 'tenant-a',
         viewName: 'v1',
-        sourceResourceId: 'bigquery:proj.ds.raw_users',
+        sourceResourceId: 'bigquery:proj.ds.pii_vault',
         declaredFields: ['phone'],
         businessJustification: 'x',
         createdBy: 'a@b.com',
@@ -126,7 +138,7 @@ describe('DecryptedViewService', () => {
       service.declareView({
         tenantId: 'tenant-a',
         viewName: 'v1',
-        sourceResourceId: 'bigquery:proj.ds.raw_users',
+        sourceResourceId: 'bigquery:proj.ds.pii_vault',
         declaredFields: ['plan'],
         businessJustification: 'x',
         createdBy: 'a@b.com',
@@ -155,7 +167,7 @@ describe('DecryptedViewService', () => {
       service.declareView({
         tenantId: 'tenant-a',
         viewName: 'v1',
-        sourceResourceId: 'bigquery:proj.ds.raw_users',
+        sourceResourceId: 'bigquery:proj.ds.pii_vault',
         declaredFields: ['email'],
         businessJustification: '   ',
         createdBy: 'a@b.com',
@@ -168,7 +180,7 @@ describe('DecryptedViewService', () => {
     await service.declareView({
       tenantId: 'tenant-a',
       viewName: 'campaign_emails',
-      sourceResourceId: 'bigquery:proj.ds.raw_users',
+      sourceResourceId: 'bigquery:proj.ds.pii_vault',
       declaredFields: ['email'],
       businessJustification: 'x',
       createdBy: 'a@b.com',

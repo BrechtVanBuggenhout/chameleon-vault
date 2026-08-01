@@ -81,18 +81,7 @@ export class DecryptedViewService {
 
     const { projectId, datasetId, tableId } = parseBigQueryResourceId(input.sourceResourceId);
     const viewId = `${input.tenantId}_${input.viewName}`;
-
-    // user_id/tenant_id pass straight through; every declared field routes
-    // through the remote function, so the ciphertext column never leaves
-    // BigQuery's own query execution in plaintext form.
-    const selectColumns = [
-      'user_id',
-      'tenant_id',
-      ...input.declaredFields.map(
-        (field) => `${this.batchDecryptFunctionRef}(${field}, user_id, tenant_id) AS ${field}`
-      ),
-    ].join(', ');
-    const viewSql = `SELECT ${selectColumns} FROM \`${projectId}.${datasetId}.${tableId}\``;
+    const viewSql = this.buildViewSql(input, projectId, datasetId, tableId);
 
     const dataset = this.bq.dataset(this.decryptedViewsDataset);
     const [view] = await dataset.createTable(viewId, { view: viewSql });
@@ -113,6 +102,44 @@ export class DecryptedViewService {
       bigquery_dataset: this.decryptedViewsDataset,
       bigquery_view_name: viewId,
     });
+  }
+
+  /**
+   * The source is always the central pii_vault table -- long/flattened
+   * (one row per user+resource+field: tenant_id, user_id, resource_id,
+   * field_name, key_id, token, encrypted_value, synced_at), not one named
+   * column per PII field. Each declared field is pivoted out by filtering
+   * to its field_name and picking the most recently synced value --
+   * ARRAY_AGG(...ORDER BY synced_at DESC LIMIT 1), not MAX(), since MAX()
+   * over decrypted strings has no "most recent" semantics. Only
+   * encrypted_value (real, reversible ciphertext) is ever decrypted here --
+   * never token, which is a one-way HMAC join key.
+   *
+   * WHERE tenant_id = ... is a real correctness requirement, not tidiness:
+   * pii_vault is one physical table across every tenant, so an unscoped
+   * view here would expose other tenants' rows.
+   */
+  private buildViewSql(input: DeclareViewInput, projectId: string, datasetId: string, tableId: string): string {
+    const escapeLiteral = (value: string) => value.replace(/'/g, "''");
+
+    const pivotColumns = input.declaredFields.map((field) => {
+      const fieldLiteral = escapeLiteral(field);
+      return (
+        `ARRAY_AGG(IF(field_name = '${fieldLiteral}', ` +
+        `${this.batchDecryptFunctionRef}(CAST(encrypted_value AS STRING), user_id, tenant_id), NULL) ` +
+        `IGNORE NULLS ORDER BY synced_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS ${field}`
+      );
+    });
+
+    return [
+      'SELECT',
+      '  user_id,',
+      '  tenant_id,',
+      `  ${pivotColumns.join(',\n  ')}`,
+      `FROM \`${projectId}.${datasetId}.${tableId}\``,
+      `WHERE tenant_id = '${escapeLiteral(input.tenantId)}'`,
+      'GROUP BY user_id, tenant_id',
+    ].join('\n');
   }
 
   async revokeView(tenantId: string, viewName: string, revokedBy: string): Promise<DecryptedViewDeclaration | null> {

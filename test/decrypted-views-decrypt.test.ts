@@ -1,4 +1,5 @@
 import { jest, describe, it, expect, beforeEach } from '@jest/globals';
+import { ChameleonAesGcm } from '../src/crypto/chameleon-aes-gcm.js';
 
 const ALLOWED_SA = 'connection-sa@proj.iam.gserviceaccount.com';
 // Fastify's inject() defaults the Host header to this when none is passed --
@@ -16,18 +17,23 @@ await jest.unstable_mockModule('google-auth-library', () => ({
 const { default: Fastify } = await import('fastify');
 const { decryptedViewsDecryptRoutes } = await import('../src/routes/decrypted-views-decrypt.js');
 
-// Mirrors the real DEK/DeterministicAES flow closely enough to exercise the
-// route's own logic without re-testing crypto.ts's already-covered decrypt
-// internals: a "shredded" user has no encryptedDek (matches
+// Mirrors the real DEK/ChameleonAesGcm flow closely enough to exercise the
+// route's own logic without re-testing chameleon-aes-gcm.test.ts's already-
+// covered decrypt internals: a "shredded" user has no encryptedDek (matches
 // firestore-registry.ts's real getKeyForUser behavior on a shredded key).
 const mockGetKeyForUser = jest.fn(async (userId: string) => {
   if (userId === 'shredded-user') return null;
-  if (userId === 'active-user') return { encryptedDek: Buffer.from('wrapped-dek'), activeDekId: 'v1', encryptionVersion: 'v1' };
+  if (userId === 'active-user' || userId === 'known-user') {
+    return { encryptedDek: Buffer.from('wrapped-dek'), activeDekId: 'v1', encryptionVersion: 'v1' };
+  }
   return null;
 });
 const fakeFirestoreRegistry = { getKeyForUser: mockGetKeyForUser } as any;
 
-const mockDecryptDataEncryptionKey = jest.fn(async () => Buffer.alloc(32, 7));
+// The DEK every mocked KMS unwrap resolves to -- fixed so tests can encrypt
+// a real ciphertext against it and expect the route to decrypt it back.
+const TEST_DEK = Buffer.alloc(32, 7);
+const mockDecryptDataEncryptionKey = jest.fn(async () => TEST_DEK);
 const fakeKmsClient = { decryptDataEncryptionKey: mockDecryptDataEncryptionKey } as any;
 
 function buildApp() {
@@ -123,8 +129,11 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
       payload: {
         requestId: 'req-1',
         calls: [
-          ['v1:bm90LXJlYWwtY2lwaGVydGV4dA==', 'active-user', 'tenant-a'],
-          ['v1:bm90LXJlYWwtY2lwaGVydGV4dA==', 'shredded-user', 'tenant-a'],
+          // Well-formed 3-part shape (key_id:iv_b64:ciphertext_b64) but not
+          // real ciphertext -- exercises the decrypt-attempt-fails path,
+          // distinct from the parts.length<3 malformed-shape short-circuit.
+          ['v1:bm90LWFuLWl2Cg==:bm90LXJlYWwtY2lwaGVydGV4dA==', 'active-user', 'tenant-a'],
+          ['v1:bm90LWFuLWl2Cg==:bm90LXJlYWwtY2lwaGVydGV4dA==', 'shredded-user', 'tenant-a'],
           [null, null, null],
         ],
       },
@@ -147,6 +156,30 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
       idToken: 'valid-token',
       audience: `https://${DEFAULT_HOST}`,
     });
+  });
+
+  it('successfully decrypts a real ciphertext and returns the plaintext', async () => {
+    mockVerifyIdToken.mockResolvedValue({
+      getPayload: () => ({ email: ALLOWED_SA, email_verified: true }),
+    });
+    const app = buildApp();
+    await registerRoutes(app);
+
+    const { ivB64, ciphertextB64 } = ChameleonAesGcm.encrypt('jane@example.com', 'known-user', TEST_DEK);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/internal/decrypted-views/batch-decrypt',
+      headers: { authorization: 'Bearer valid-token' },
+      payload: {
+        requestId: 'req-2',
+        calls: [[`v1:${ivB64}:${ciphertextB64}`, 'known-user', 'tenant-a']],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.replies).toEqual(['jane@example.com']);
   });
 
   it('derives the expected audience from the request Host header, not a fixed config value', async () => {

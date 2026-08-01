@@ -2,7 +2,7 @@ import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { OAuth2Client } from 'google-auth-library';
 import { FirestoreRegistry } from '../gcp/firestore-registry.js';
 import { CloudKMSClient } from '../gcp/cloud-kms.js';
-import { DeterministicAES } from '../crypto/deterministic-aes.js';
+import { ChameleonAesGcm } from '../crypto/chameleon-aes-gcm.js';
 import { createLogger } from '../logging/index.js';
 
 const logger = createLogger('decrypted-views-decrypt-route');
@@ -126,16 +126,24 @@ async function decryptOne(
 ): Promise<string | null> {
   if (!rawCiphertext || !userId) return null;
 
-  const [keyVersionId, actualCiphertext] = rawCiphertext.split(':', 2);
-  if (!keyVersionId || !actualCiphertext) return null;
+  // pii_vault.encrypted_value's real on-disk format (chameleon-data-pipelines'
+  // pii_vault_sync.py _encrypt_field): key_id:iv_b64:ciphertext_b64 -- three
+  // parts, not two. Randomized AES-GCM (ChameleonAesGcm), not the
+  // deterministic-IV scheme DeterministicAES uses; that class only ever
+  // matches Key Vault's own demoted /encrypt-/decrypt routes, never
+  // production ciphertext written by the pipeline.
+  const parts = rawCiphertext.split(':');
+  if (parts.length < 3) return null;
+  const [keyVersionId, ivB64] = parts;
+  const ciphertextB64 = parts.slice(2).join(':');
+  if (!keyVersionId || !ivB64 || !ciphertextB64) return null;
 
   const keyData = await firestoreRegistry.getKeyForUser(userId, tenantId || 'default-tenant', keyVersionId);
   if (!keyData || !keyData.encryptedDek) return null;
 
   try {
     const dek = await dekKmsClient.decryptDataEncryptionKey(keyData.encryptedDek, tenantId || 'default-tenant');
-    const { plaintext } = DeterministicAES.decrypt(actualCiphertext, userId, dek);
-    return plaintext;
+    return ChameleonAesGcm.decrypt(ivB64, ciphertextB64, userId, dek);
   } catch (error) {
     logger.warn({ error, userId }, 'Failed to decrypt one row in a decrypted-view batch');
     return null;
