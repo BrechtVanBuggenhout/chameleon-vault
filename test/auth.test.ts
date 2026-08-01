@@ -22,6 +22,15 @@ describe('isExemptFromAuth', () => {
     expect(isExemptFromAuth('/decrypt')).toBe(false);
     expect(isExemptFromAuth('/key/shred')).toBe(false);
   });
+
+  it('exempts the decrypted-views batch-decrypt route -- BigQuery has no way to present VAULT_API_KEY, it self-authenticates via ID token instead', () => {
+    expect(isExemptFromAuth('/internal/decrypted-views/batch-decrypt')).toBe(true);
+  });
+
+  it('does NOT exempt the decrypted-views management routes -- console-facing, still needs the shared key', () => {
+    expect(isExemptFromAuth('/decrypted-views')).toBe(false);
+    expect(isExemptFromAuth('/decrypted-views/some-view')).toBe(false);
+  });
 });
 
 describe('resolveAuth', () => {

@@ -16,6 +16,7 @@ import { PubSubDLQClient } from './gcp/pubsub-dlq-client.js';
 import { GCSClient } from './gcp/gcs-client.js';
 import { AnalystAccessRepository } from './gcp/analyst-access-repository.js';
 import { CertificateChainRepository } from './gcp/certificate-chain-repository.js';
+import { DecryptedViewsRepository } from './gcp/decrypted-views-repository.js';
 
 // Import Services
 import { JanitorService } from './services/janitor.js';
@@ -23,6 +24,7 @@ import { DeletionRequestService } from './services/deletion-request-service.js';
 import { CertificateService } from './services/certificate-service.js';
 import { PiiRegistryService } from './services/pii-registry-service.js';
 import { AnalystAccessService } from './services/analyst-access-service.js';
+import { DecryptedViewService } from './services/decrypted-view-service.js';
 import { devPiiRegistry } from './data/pii-registry.js';
 import { FirestorePiiDeclarationRepository } from './gcp/pii-registry-declaration-repository.js';
 import { BigQueryPiiRegistryAuditMirror } from './gcp/pii-registry-audit-mirror.js';
@@ -40,6 +42,8 @@ import { deletionRequestRoutes } from './routes/deletion-requests.js';
 import { certificateRoutes } from './routes/certificate.js';
 import { piiRegistryRoutes } from './routes/pii-registry.js';
 import { analystClaimsRoutes } from './routes/analyst-claims.js';
+import { decryptedViewsRoutes } from './routes/decrypted-views.js';
+import { decryptedViewsDecryptRoutes } from './routes/decrypted-views-decrypt.js';
 
 const logger = createLogger('main');
 
@@ -202,6 +206,28 @@ async function main() {
   const analystAccessRepo = new AnalystAccessRepository(projectId, analystAccessCollection, firestoreDatabaseId);
   const analystAccessService = new AnalystAccessService(analystAccessRepo);
 
+  // Decrypted views: fully optional, opt-in subsystem (mirrors
+  // enable_decrypted_views in chameleon-infra-gcp). DECRYPTED_VIEWS_DATASET
+  // is the on/off switch -- when unset, neither route below is registered
+  // at all (404, not a misconfigured 503), so an unconfigured deployment
+  // has zero surface area for this feature, not a half-wired one.
+  const decryptedViewsDataset = process.env.DECRYPTED_VIEWS_DATASET;
+  let decryptedViewService: DecryptedViewService | undefined;
+  let decryptedViewsRepo: DecryptedViewsRepository | undefined;
+  if (decryptedViewsDataset) {
+    const decryptedViewsCollection = process.env.FIRESTORE_DECRYPTED_VIEWS_COLLECTION || 'decrypted_views';
+    decryptedViewsRepo = new DecryptedViewsRepository(projectId, decryptedViewsCollection, firestoreDatabaseId);
+    decryptedViewService = new DecryptedViewService(
+      projectId,
+      decryptedViewsDataset,
+      getRequiredEnv('DECRYPTED_VIEWS_BATCH_DECRYPT_FUNCTION_REF'),
+      decryptedViewsRepo,
+      piiRegistryService
+    );
+  } else {
+    logger.info('DECRYPTED_VIEWS_DATASET not set; decrypted views are disabled');
+  }
+
   // API key auth. Two tiers:
   //  1. The shared VAULT_API_KEY (unchanged) grants full access -- this is
   //     service-to-service traffic (console, pipelines).
@@ -248,6 +274,17 @@ async function main() {
     syncTrigger,
   });
   await fastify.register(analystClaimsRoutes, { analystAccessService });
+  if (decryptedViewService && decryptedViewsRepo) {
+    await fastify.register(decryptedViewsRoutes, {
+      decryptedViewService,
+      decryptedViewsRepository: decryptedViewsRepo,
+    });
+    await fastify.register(decryptedViewsDecryptRoutes, {
+      firestoreRegistry,
+      dekKmsClient,
+      allowedCallerServiceAccount: process.env.DECRYPTED_VIEWS_CONNECTION_SA_EMAIL || '',
+    });
+  }
 
   const port = parseInt(process.env.PORT || '8080', 10);
   const address = '0.0.0.0';
