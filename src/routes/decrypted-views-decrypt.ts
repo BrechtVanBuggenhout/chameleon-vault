@@ -40,7 +40,14 @@ async function verifyCaller(
     const payload = ticket.getPayload();
     return payload?.email === allowedCallerServiceAccount && payload?.email_verified !== false;
   } catch (error) {
-    logger.warn({ error }, 'Decrypted-view caller ID token failed verification');
+    // Keyed "err", not "error" -- pino only applies its standard Error
+    // serializer (message/stack/type) to that exact key. Logging the raw
+    // Error under any other key silently prints "{}", since Error's own
+    // properties are non-enumerable -- which is exactly what masked the
+    // real cause of a real production 403 (audience/issuer mismatch vs.
+    // wrong caller identity are very different bugs, and this line alone
+    // couldn't tell them apart).
+    logger.warn({ err: error }, 'Decrypted-view caller ID token failed verification');
     return false;
   }
 }
