@@ -47,8 +47,29 @@ async function verifyCaller(
     // real cause of a real production 403 (audience/issuer mismatch vs.
     // wrong caller identity are very different bugs, and this line alone
     // couldn't tell them apart).
-    logger.warn({ err: error }, 'Decrypted-view caller ID token failed verification');
+    //
+    // decodeAudienceUnverified below reads the token's own "aud" claim
+    // without checking its signature, purely so a future audience mismatch
+    // (this exact bug, once already) is visible in one log line instead of
+    // requiring a second round of guess-fix-redeploy-retry. The claim isn't
+    // secret -- it's just the URL the caller intended to reach -- and it's
+    // never trusted for anything; verifyIdToken above already ran and
+    // failed by the time this executes.
+    logger.warn(
+      { err: error, requiredAudience: audience, actualAudience: decodeAudienceUnverified(idToken) },
+      'Decrypted-view caller ID token failed verification'
+    );
     return false;
+  }
+}
+
+function decodeAudienceUnverified(idToken: string): string | undefined {
+  try {
+    const payloadSegment = idToken.split('.')[1];
+    const payload = JSON.parse(Buffer.from(payloadSegment, 'base64url').toString('utf8'));
+    return typeof payload?.aud === 'string' ? payload.aud : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -68,13 +89,21 @@ async function verifyCaller(
  * Chameleon's own dev/prod.
  *
  * The expected audience is derived from the incoming request's own host
- * (`https://${request.hostname}`), not a static configured URL -- a Cloud
- * Run service can't reference its own `.uri` from within its own resource
- * block in Terraform (a real dependency cycle, not just an ordering
- * inconvenience), and this is the pattern Google's own docs recommend for
- * exactly this "service verifying tokens addressed to itself" case. The
- * Host seen here is set by Cloud Run's own front end, not client-supplied,
- * the same trust boundary Cloud Run's IAM check itself already relies on.
+ * and path (`https://${request.hostname}${request.url}`), not a static
+ * configured URL -- a Cloud Run service can't reference its own `.uri`
+ * from within its own resource block in Terraform (a real dependency
+ * cycle, not just an ordering inconvenience). The Host seen here is set by
+ * Cloud Run's own front end, not client-supplied, the same trust boundary
+ * Cloud Run's IAM check itself already relies on.
+ *
+ * Must include the path, not just the host: confirmed live (caught by
+ * decodeAudienceUnverified's diagnostic logging below) that BigQuery mints
+ * this token's "aud" claim as the exact endpoint URL configured on the
+ * remote function -- host *and* path
+ * (".../internal/decrypted-views/batch-decrypt") -- not just the service's
+ * base URL the way e.g. a Cloud Scheduler oidc_token audience normally
+ * would. Host-only here caused every real call to fail verification with
+ * "Wrong recipient, payload audience != requiredAudience".
  *
  * A failed decrypt for one row (shredded key, malformed ciphertext) returns
  * null for that row rather than failing the whole batch or dropping the
@@ -94,7 +123,7 @@ export async function decryptedViewsDecryptRoutes(
       return reply.status(503).send({ statusCode: 503, error: 'Decrypted views not configured' });
     }
 
-    const audience = `https://${request.hostname}`;
+    const audience = `https://${request.hostname}${request.url}`;
     const authorized = await verifyCaller(
       request.headers['authorization'] as string | undefined,
       authClient,

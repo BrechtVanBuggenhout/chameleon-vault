@@ -3,9 +3,13 @@ import { ChameleonAesGcm } from '../src/crypto/chameleon-aes-gcm.js';
 
 const ALLOWED_SA = 'connection-sa@proj.iam.gserviceaccount.com';
 // Fastify's inject() defaults the Host header to this when none is passed --
-// the route derives its expected audience from request.hostname, so this is
-// what verifyIdToken should be called with unless a test overrides the host.
+// the route derives its expected audience from request.hostname + request.url
+// (BigQuery mints the token's "aud" as the exact configured endpoint URL,
+// path included, not just the service's base URL), so this plus the route
+// path is what verifyIdToken should be called with unless a test overrides
+// the host.
 const DEFAULT_HOST = 'localhost:80';
+const ROUTE_PATH = '/internal/decrypted-views/batch-decrypt';
 
 const mockVerifyIdToken = jest.fn();
 await jest.unstable_mockModule('google-auth-library', () => ({
@@ -154,7 +158,7 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
     expect(body.replies[2]).toBeNull();
     expect(mockVerifyIdToken).toHaveBeenCalledWith({
       idToken: 'valid-token',
-      audience: `https://${DEFAULT_HOST}`,
+      audience: `https://${DEFAULT_HOST}${ROUTE_PATH}`,
     });
   });
 
@@ -182,7 +186,7 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
     expect(body.replies).toEqual(['jane@example.com']);
   });
 
-  it('derives the expected audience from the request Host header, not a fixed config value', async () => {
+  it('derives the expected audience from the request Host header and path, not a fixed config value', async () => {
     mockVerifyIdToken.mockResolvedValue({
       getPayload: () => ({ email: ALLOWED_SA, email_verified: true }),
     });
@@ -199,7 +203,7 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
     expect(response.statusCode).toBe(200);
     expect(mockVerifyIdToken).toHaveBeenCalledWith({
       idToken: 'valid-token',
-      audience: 'https://key-vault-dev-xyz.a.run.app',
+      audience: `https://key-vault-dev-xyz.a.run.app${ROUTE_PATH}`,
     });
   });
 
