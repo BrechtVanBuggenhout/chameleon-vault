@@ -45,12 +45,17 @@ async function verifyCaller(
       // different failure than the catch block below, and one that
       // previously had zero logging of its own, making it indistinguishable
       // from "no token at all" in the logs.
+      //
+      // Logging the full verified payload, not just email/email_verified --
+      // those two came back empty on a real live 403 (both fields simply
+      // absent from the object, not falsy), meaning whatever mints this
+      // token doesn't request the openid `email` scope by default. The
+      // payload's signature already passed verifyIdToken above, so every
+      // claim on it is trustworthy; logging all of it settles what claim
+      // this token actually carries (almost certainly `sub`, the SA's
+      // numeric unique ID) in one shot instead of guessing field-by-field.
       logger.warn(
-        {
-          expectedCallerServiceAccount: allowedCallerServiceAccount,
-          actualCallerEmail: payload?.email,
-          emailVerified: payload?.email_verified,
-        },
+        { expectedCallerServiceAccount: allowedCallerServiceAccount, payload },
         'Decrypted-view caller ID token verified but identity did not match the allowed caller'
       );
     }
