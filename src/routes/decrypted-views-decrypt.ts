@@ -38,7 +38,23 @@ async function verifyCaller(
   try {
     const ticket = await client.verifyIdToken({ idToken, audience });
     const payload = ticket.getPayload();
-    return payload?.email === allowedCallerServiceAccount && payload?.email_verified !== false;
+    const authorized = payload?.email === allowedCallerServiceAccount && payload?.email_verified !== false;
+    if (!authorized) {
+      // Token verified fine (right signature, right audience) but the
+      // caller identity itself didn't clear the bar -- a materially
+      // different failure than the catch block below, and one that
+      // previously had zero logging of its own, making it indistinguishable
+      // from "no token at all" in the logs.
+      logger.warn(
+        {
+          expectedCallerServiceAccount: allowedCallerServiceAccount,
+          actualCallerEmail: payload?.email,
+          emailVerified: payload?.email_verified,
+        },
+        'Decrypted-view caller ID token verified but identity did not match the allowed caller'
+      );
+    }
+    return authorized;
   } catch (error) {
     // Keyed "err", not "error" -- pino only applies its standard Error
     // serializer (message/stack/type) to that exact key. Logging the raw
