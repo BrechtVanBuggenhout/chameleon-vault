@@ -148,7 +148,7 @@ export class DecryptedViewService {
       const fieldLiteral = escapeLiteral(field);
       return (
         `ARRAY_AGG(IF(field_name = '${fieldLiteral}', ` +
-        `${this.batchDecryptFunctionRef}(CAST(encrypted_value AS STRING), user_id, tenant_id), NULL) ` +
+        `\`${this.batchDecryptFunctionRef}\`(CAST(encrypted_value AS STRING), user_id, tenant_id), NULL) ` +
         `IGNORE NULLS ORDER BY synced_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS ${field}`
       );
     });

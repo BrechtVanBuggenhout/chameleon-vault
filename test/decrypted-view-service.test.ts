@@ -59,10 +59,10 @@ describe('DecryptedViewService', () => {
     availableFieldRows = [{ field_name: 'email' }];
     repo = makeRepo();
     service = new DecryptedViewService(
-      'proj',
+      'my-proj-123',
       'decrypted_views',
-      'proj.decrypted_views.chameleon_batch_decrypt',
-      'bigquery:proj.ds.pii_vault',
+      'my-proj-123.decrypted_views.chameleon_batch_decrypt',
+      'bigquery:my-proj-123.ds.pii_vault',
       repo as any
     );
   });
@@ -80,7 +80,7 @@ describe('DecryptedViewService', () => {
     expect(result.status).toBe('active');
     expect(result.bigquery_view_name).toBe('tenant-a_campaign_emails');
     // Always the central pii_vault table -- never a customer-supplied source.
-    expect(result.source_resource_id).toBe('bigquery:proj.ds.pii_vault');
+    expect(result.source_resource_id).toBe('bigquery:my-proj-123.ds.pii_vault');
 
     expect(mockDataset).toHaveBeenCalledWith('decrypted_views');
     expect(mockCreateTable).toHaveBeenCalledWith(
@@ -90,8 +90,12 @@ describe('DecryptedViewService', () => {
         // declared field is pivoted out by field_name, decrypting only
         // encrypted_value (never the non-reversible token column), scoped
         // to the declaring tenant.
+        // The function ref is backtick-quoted in the generated SQL --
+        // project IDs routinely contain hyphens (e.g. "my-proj-123"), and
+        // BigQuery parses an unquoted hyphenated path as subtraction, not
+        // an identifier, breaking the CREATE VIEW statement outright.
         view: expect.stringMatching(
-          /IF\(field_name = 'email', proj\.decrypted_views\.chameleon_batch_decrypt\(CAST\(encrypted_value AS STRING\), user_id, tenant_id\), NULL\)/
+          /IF\(field_name = 'email', `my-proj-123\.decrypted_views\.chameleon_batch_decrypt`\(CAST\(encrypted_value AS STRING\), user_id, tenant_id\), NULL\)/
         ),
       })
     );
