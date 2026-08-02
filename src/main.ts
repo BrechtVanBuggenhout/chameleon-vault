@@ -221,8 +221,8 @@ async function main() {
       projectId,
       decryptedViewsDataset,
       getRequiredEnv('DECRYPTED_VIEWS_BATCH_DECRYPT_FUNCTION_REF'),
-      decryptedViewsRepo,
-      piiRegistryService
+      getRequiredEnv('PII_VAULT_RESOURCE_ID'),
+      decryptedViewsRepo
     );
   } else {
     logger.info('DECRYPTED_VIEWS_DATASET not set; decrypted views are disabled');

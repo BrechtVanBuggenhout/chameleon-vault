@@ -1,25 +1,16 @@
 import { BigQuery, Table } from '@google-cloud/bigquery';
 import { parseBigQueryResourceId } from '../gcp/bigquery-schema-service.js';
 import { DecryptedViewsRepository } from '../gcp/decrypted-views-repository.js';
-import { PiiRegistryService } from './pii-registry-service.js';
 import { DecryptedViewDeclaration } from '../types/decrypted-view.js';
 import { createLogger } from '../logging/index.js';
 
 const logger = createLogger('decrypted-view-service');
-
-// Only fields with an actual crypto anchor are eligible -- exposing a
-// decrypted view over something already plaintext or handled without
-// encryption/tokenization/surrogate defeats the point (see
-// chameleon_pii's own pii_shred_readiness, which uses this exact set to
-// mean "shreddable").
-const SHREDDABLE_HANDLING = new Set(['ENCRYPT', 'TOKENIZE', 'HASH_SURROGATE']);
 
 const VIEW_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
 export interface DeclareViewInput {
   tenantId: string;
   viewName: string;
-  sourceResourceId: string;
   declaredFields: string[];
   businessJustification: string;
   createdBy: string;
@@ -32,9 +23,23 @@ export interface DeclareViewInput {
  * (see chameleon-infra-gcp's decrypted_views.tf) stops at the static layer
  * -- the dataset, the connection, the base IAM role -- since it can't
  * manage end-user-triggered, dynamically-named resources.
+ *
+ * Every decrypted view sources from the central pii_vault table -- never a
+ * customer-supplied resource id. There's deliberately no "declare pii_vault
+ * as a PII resource first" step: pii_vault_sync.py only ever syncs fields
+ * whose ORIGINAL registered handling is literally ENCRYPT (see
+ * chameleon-data-pipelines' pii_vault_sync.py, enumerate_resource), so any
+ * field_name present in pii_vault at all is already guaranteed to have come
+ * from a real crypto anchor -- that classification decision was made once,
+ * correctly, at sync time against the field's true source resource. Making
+ * someone re-declare pii_vault itself in the registry would just be
+ * re-asserting something already true by construction.
  */
 export class DecryptedViewService {
   private readonly bq: BigQuery;
+  private readonly piiVaultProjectId: string;
+  private readonly piiVaultDatasetId: string;
+  private readonly piiVaultTableId: string;
 
   constructor(
     projectId: string,
@@ -44,10 +49,21 @@ export class DecryptedViewService {
     // this per selected field, it's what actually performs the live,
     // never-persisted decrypt at query time.
     private readonly batchDecryptFunctionRef: string,
-    private readonly repository: DecryptedViewsRepository,
-    private readonly registryService: PiiRegistryService
+    // Fully-qualified resource id of the central pii_vault table, e.g.
+    // `bigquery:proj.chameleon_dev.pii_vault` -- the one and only source
+    // every decrypted view is built on top of.
+    piiVaultResourceId: string,
+    private readonly repository: DecryptedViewsRepository
   ) {
     this.bq = new BigQuery({ projectId });
+    const parsed = parseBigQueryResourceId(piiVaultResourceId);
+    this.piiVaultProjectId = parsed.projectId;
+    this.piiVaultDatasetId = parsed.datasetId;
+    this.piiVaultTableId = parsed.tableId;
+  }
+
+  get piiVaultResourceId(): string {
+    return `bigquery:${this.piiVaultProjectId}.${this.piiVaultDatasetId}.${this.piiVaultTableId}`;
   }
 
   async declareView(input: DeclareViewInput): Promise<DecryptedViewDeclaration> {
@@ -61,41 +77,31 @@ export class DecryptedViewService {
       throw new Error('At least one declared field is required.');
     }
 
-    const entry = this.registryService.getEntry(input.sourceResourceId, input.tenantId);
-    if (!entry) {
-      throw new Error(
-        `No registered PII resource found for ${input.sourceResourceId} -- decrypted views can only source from already-declared resources.`
-      );
-    }
+    const available = await this.getAvailableFields(input.tenantId);
     for (const fieldName of input.declaredFields) {
-      const field = entry.piiFields.find((f) => f.name === fieldName);
-      if (!field) {
-        throw new Error(`Field "${fieldName}" is not declared on ${input.sourceResourceId}.`);
-      }
-      if (!SHREDDABLE_HANDLING.has(field.handling)) {
+      if (!available.includes(fieldName)) {
         throw new Error(
-          `Field "${fieldName}" has handling "${field.handling}" -- only ENCRYPT/TOKENIZE/HASH_SURROGATE fields can be exposed through a decrypted view.`
+          `Field "${fieldName}" has no synced rows in pii_vault for this tenant -- check the field name, or that it has actually been synced yet.`
         );
       }
     }
 
-    const { projectId, datasetId, tableId } = parseBigQueryResourceId(input.sourceResourceId);
     const viewId = `${input.tenantId}_${input.viewName}`;
-    const viewSql = this.buildViewSql(input, projectId, datasetId, tableId);
+    const viewSql = this.buildViewSql(input);
 
     const dataset = this.bq.dataset(this.decryptedViewsDataset);
     const [view] = await dataset.createTable(viewId, { view: viewSql });
     await this.grantViewerOnView(view, input.consumerServiceAccount);
 
     logger.info(
-      { tenantId: input.tenantId, viewName: input.viewName, sourceResourceId: input.sourceResourceId, viewId },
+      { tenantId: input.tenantId, viewName: input.viewName, viewId },
       'Decrypted view created'
     );
 
     return this.repository.create({
       tenant_id: input.tenantId,
       view_name: input.viewName,
-      source_resource_id: input.sourceResourceId,
+      source_resource_id: this.piiVaultResourceId,
       declared_fields: input.declaredFields,
       business_justification: input.businessJustification,
       created_by: input.createdBy,
@@ -105,21 +111,37 @@ export class DecryptedViewService {
   }
 
   /**
-   * The source is always the central pii_vault table -- long/flattened
-   * (one row per user+resource+field: tenant_id, user_id, resource_id,
-   * field_name, key_id, token, encrypted_value, synced_at), not one named
-   * column per PII field. Each declared field is pivoted out by filtering
-   * to its field_name and picking the most recently synced value --
-   * ARRAY_AGG(...ORDER BY synced_at DESC LIMIT 1), not MAX(), since MAX()
-   * over decrypted strings has no "most recent" semantics. Only
-   * encrypted_value (real, reversible ciphertext) is ever decrypted here --
-   * never token, which is a one-way HMAC join key.
+   * Distinct field_names actually present in pii_vault for a tenant --
+   * powers both declareView()'s own validation (catches a typo'd field
+   * name, doesn't re-litigate a classification already made at sync time)
+   * and the console's field picker (GET /decrypted-views/available-fields),
+   * so a customer sees real options instead of needing to know exact
+   * field_name strings by heart.
+   */
+  async getAvailableFields(tenantId: string): Promise<string[]> {
+    const [rows] = await this.bq.query({
+      query: `SELECT DISTINCT field_name FROM \`${this.piiVaultProjectId}.${this.piiVaultDatasetId}.${this.piiVaultTableId}\` WHERE tenant_id = @tenantId ORDER BY field_name`,
+      params: { tenantId },
+    });
+    return (rows as { field_name: string }[]).map((row) => row.field_name);
+  }
+
+  /**
+   * pii_vault is long/flattened (one row per user+resource+field:
+   * tenant_id, user_id, resource_id, field_name, key_id, token,
+   * encrypted_value, synced_at), not one named column per PII field. Each
+   * declared field is pivoted out by filtering to its field_name and
+   * picking the most recently synced value -- ARRAY_AGG(...ORDER BY
+   * synced_at DESC LIMIT 1), not MAX(), since MAX() over decrypted strings
+   * has no "most recent" semantics. Only encrypted_value (real, reversible
+   * ciphertext) is ever decrypted here -- never token, which is a one-way
+   * HMAC join key.
    *
    * WHERE tenant_id = ... is a real correctness requirement, not tidiness:
    * pii_vault is one physical table across every tenant, so an unscoped
    * view here would expose other tenants' rows.
    */
-  private buildViewSql(input: DeclareViewInput, projectId: string, datasetId: string, tableId: string): string {
+  private buildViewSql(input: DeclareViewInput): string {
     const escapeLiteral = (value: string) => value.replace(/'/g, "''");
 
     const pivotColumns = input.declaredFields.map((field) => {
@@ -136,7 +158,7 @@ export class DecryptedViewService {
       '  user_id,',
       '  tenant_id,',
       `  ${pivotColumns.join(',\n  ')}`,
-      `FROM \`${projectId}.${datasetId}.${tableId}\``,
+      `FROM \`${this.piiVaultProjectId}.${this.piiVaultDatasetId}.${this.piiVaultTableId}\``,
       `WHERE tenant_id = '${escapeLiteral(input.tenantId)}'`,
       'GROUP BY user_id, tenant_id',
     ].join('\n');

@@ -12,7 +12,6 @@ export interface DecryptedViewsRoutesOptions {
 
 interface DeclareViewBody {
   viewName?: string;
-  sourceResourceId?: string;
   declaredFields?: string[];
   businessJustification?: string;
   createdBy?: string;
@@ -41,7 +40,6 @@ export async function decryptedViewsRoutes(
       const declaration = await decryptedViewService.declareView({
         tenantId,
         viewName: body.viewName ?? '',
-        sourceResourceId: body.sourceResourceId ?? '',
         declaredFields: body.declaredFields ?? [],
         businessJustification: body.businessJustification ?? '',
         createdBy: body.createdBy ?? 'unknown',
@@ -62,6 +60,27 @@ export async function decryptedViewsRoutes(
     const tenantId = (request.headers['x-tenant-id'] as string) || 'default-tenant';
     const views = await decryptedViewsRepository.listByTenant(tenantId);
     return { views };
+  });
+
+  /**
+   * Field names actually synced into pii_vault for this tenant -- lets the
+   * console offer a real picker instead of requiring the customer to know
+   * exact field_name strings by heart. Same query declareView() itself
+   * uses to validate a declaration, exposed read-only here.
+   */
+  fastify.get('/decrypted-views/available-fields', async (request, reply) => {
+    const tenantId = (request.headers['x-tenant-id'] as string) || 'default-tenant';
+    try {
+      const fields = await decryptedViewService.getAvailableFields(tenantId);
+      return { fields };
+    } catch (error) {
+      logger.error({ error, tenantId }, 'Failed to list available pii_vault fields');
+      return reply.status(500).send({
+        statusCode: 500,
+        error: 'Failed to list available fields',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   });
 
   fastify.delete('/decrypted-views/:viewName', async (request, reply) => {

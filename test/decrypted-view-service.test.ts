@@ -1,5 +1,4 @@
 import { jest, describe, it, expect, beforeEach } from '@jest/globals';
-import type { PiiRegistryEntry } from '../src/types/pii-registry.js';
 
 const mockGetIamPolicy = jest.fn(async () => [{ bindings: [] }]);
 const mockSetIamPolicy = jest.fn(async () => [{}]);
@@ -11,14 +10,21 @@ const mockCreateTable = jest.fn(async () => [{
 const mockTable = jest.fn(() => ({ delete: mockDeleteTable }));
 const mockDataset = jest.fn(() => ({ createTable: mockCreateTable, table: mockTable }));
 
+// Field names with at least one synced row in pii_vault for the tenant --
+// what SELECT DISTINCT field_name ... WHERE tenant_id = @tenantId would
+// return. declareView() and the available-fields route both go through
+// getAvailableFields(), so this one mock covers both.
+let availableFieldRows: { field_name: string }[] = [{ field_name: 'email' }];
+const mockQuery = jest.fn(async () => [availableFieldRows]);
+
 await jest.unstable_mockModule('@google-cloud/bigquery', () => ({
   BigQuery: class {
     dataset = mockDataset;
+    query = mockQuery;
   },
 }));
 
 const { DecryptedViewService } = await import('../src/services/decrypted-view-service.js');
-const { PiiRegistryService } = await import('../src/services/pii-registry-service.js');
 
 function makeRepo() {
   const store = new Map<string, any>();
@@ -43,47 +49,28 @@ function makeRepo() {
   };
 }
 
-const ENCRYPTED_ENTRY: PiiRegistryEntry = {
-  registryVersion: '1',
-  resourceId: 'bigquery:proj.ds.pii_vault',
-  system: 'bigquery',
-  piiFields: [
-    { name: 'email', classification: 'DIRECT_IDENTIFIER', handling: 'ENCRYPT', requiredInMart: false },
-    { name: 'plan', classification: 'BEHAVIORAL', handling: 'REDACT', requiredInMart: false },
-  ],
-  ownerConnector: 'manual',
-  lineageDestination: 'raw_users',
-  deletionStrategy: 'CRYPTO_SHRED',
-  ghostDataScan: { enabled: false, scanMode: 'DISABLED', patterns: [] },
-  handlingPolicy: 'crypto-shred',
-  evidencePointers: [],
-  tenantId: 'tenant-a',
-};
-
 describe('DecryptedViewService', () => {
   let repo: ReturnType<typeof makeRepo>;
-  let registry: InstanceType<typeof PiiRegistryService>;
   let service: InstanceType<typeof DecryptedViewService>;
 
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetIamPolicy.mockResolvedValue([{ bindings: [] }] as any);
+    availableFieldRows = [{ field_name: 'email' }];
     repo = makeRepo();
-    registry = new PiiRegistryService([ENCRYPTED_ENTRY]);
     service = new DecryptedViewService(
       'proj',
       'decrypted_views',
       'proj.decrypted_views.chameleon_batch_decrypt',
-      repo as any,
-      registry
+      'bigquery:proj.ds.pii_vault',
+      repo as any
     );
   });
 
-  it('declares a view for a declared, encrypted field: creates the BigQuery view, grants dataViewer, persists the record', async () => {
+  it('declares a view for a field synced into pii_vault: creates the BigQuery view, grants dataViewer, persists the record', async () => {
     const result = await service.declareView({
       tenantId: 'tenant-a',
       viewName: 'campaign_emails',
-      sourceResourceId: 'bigquery:proj.ds.pii_vault',
       declaredFields: ['email'],
       businessJustification: 'Send campaign confirmations',
       createdBy: 'brecht@chameleon-data.com',
@@ -92,6 +79,8 @@ describe('DecryptedViewService', () => {
 
     expect(result.status).toBe('active');
     expect(result.bigquery_view_name).toBe('tenant-a_campaign_emails');
+    // Always the central pii_vault table -- never a customer-supplied source.
+    expect(result.source_resource_id).toBe('bigquery:proj.ds.pii_vault');
 
     expect(mockDataset).toHaveBeenCalledWith('decrypted_views');
     expect(mockCreateTable).toHaveBeenCalledWith(
@@ -118,48 +107,19 @@ describe('DecryptedViewService', () => {
     expect(repo.create).toHaveBeenCalledTimes(1);
   });
 
-  it('rejects a field that is not declared on the source resource', async () => {
+  it('rejects a field with no synced rows in pii_vault for the tenant', async () => {
+    availableFieldRows = [{ field_name: 'email' }]; // no 'phone'
     await expect(
       service.declareView({
         tenantId: 'tenant-a',
         viewName: 'v1',
-        sourceResourceId: 'bigquery:proj.ds.pii_vault',
         declaredFields: ['phone'],
         businessJustification: 'x',
         createdBy: 'a@b.com',
         consumerServiceAccount: 'sa@proj.iam.gserviceaccount.com',
       })
-    ).rejects.toThrow('not declared');
+    ).rejects.toThrow('no synced rows in pii_vault');
     expect(mockCreateTable).not.toHaveBeenCalled();
-  });
-
-  it('rejects a field without a crypto anchor (e.g. REDACT) -- decrypted views only make sense over ENCRYPT/TOKENIZE/HASH_SURROGATE fields', async () => {
-    await expect(
-      service.declareView({
-        tenantId: 'tenant-a',
-        viewName: 'v1',
-        sourceResourceId: 'bigquery:proj.ds.pii_vault',
-        declaredFields: ['plan'],
-        businessJustification: 'x',
-        createdBy: 'a@b.com',
-        consumerServiceAccount: 'sa@proj.iam.gserviceaccount.com',
-      })
-    ).rejects.toThrow('REDACT');
-    expect(mockCreateTable).not.toHaveBeenCalled();
-  });
-
-  it('rejects an undeclared source resource entirely', async () => {
-    await expect(
-      service.declareView({
-        tenantId: 'tenant-a',
-        viewName: 'v1',
-        sourceResourceId: 'bigquery:proj.ds.some_undeclared_table',
-        declaredFields: ['email'],
-        businessJustification: 'x',
-        createdBy: 'a@b.com',
-        consumerServiceAccount: 'sa@proj.iam.gserviceaccount.com',
-      })
-    ).rejects.toThrow('No registered PII resource found');
   });
 
   it('requires a business justification', async () => {
@@ -167,7 +127,6 @@ describe('DecryptedViewService', () => {
       service.declareView({
         tenantId: 'tenant-a',
         viewName: 'v1',
-        sourceResourceId: 'bigquery:proj.ds.pii_vault',
         declaredFields: ['email'],
         businessJustification: '   ',
         createdBy: 'a@b.com',
@@ -176,11 +135,32 @@ describe('DecryptedViewService', () => {
     ).rejects.toThrow('businessJustification is required');
   });
 
+  it('requires at least one declared field', async () => {
+    await expect(
+      service.declareView({
+        tenantId: 'tenant-a',
+        viewName: 'v1',
+        declaredFields: [],
+        businessJustification: 'x',
+        createdBy: 'a@b.com',
+        consumerServiceAccount: 'sa@proj.iam.gserviceaccount.com',
+      })
+    ).rejects.toThrow('At least one declared field');
+  });
+
+  it('getAvailableFields returns the distinct field names synced for a tenant', async () => {
+    availableFieldRows = [{ field_name: 'email' }, { field_name: 'phone' }];
+    const fields = await service.getAvailableFields('tenant-a');
+    expect(fields).toEqual(['email', 'phone']);
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.objectContaining({ params: { tenantId: 'tenant-a' } })
+    );
+  });
+
   it('revoking drops the BigQuery view and flips the Firestore record to revoked', async () => {
     await service.declareView({
       tenantId: 'tenant-a',
       viewName: 'campaign_emails',
-      sourceResourceId: 'bigquery:proj.ds.pii_vault',
       declaredFields: ['email'],
       businessJustification: 'x',
       createdBy: 'a@b.com',

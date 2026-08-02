@@ -6,12 +6,14 @@ const { decryptedViewsRoutes } = await import('../src/routes/decrypted-views.js'
 function makeFakes() {
   const declareView = jest.fn();
   const revokeView = jest.fn();
+  const getAvailableFields = jest.fn();
   const listByTenant = jest.fn();
   return {
-    decryptedViewService: { declareView, revokeView } as any,
+    decryptedViewService: { declareView, revokeView, getAvailableFields } as any,
     decryptedViewsRepository: { listByTenant } as any,
     declareView,
     revokeView,
+    getAvailableFields,
     listByTenant,
   };
 }
@@ -38,7 +40,6 @@ describe('Decrypted Views management routes', () => {
       headers: { 'x-tenant-id': 't1' },
       payload: {
         viewName: 'v1',
-        sourceResourceId: 'bigquery:p.d.t',
         declaredFields: ['email'],
         businessJustification: 'send receipts',
         createdBy: 'a@b.com',
@@ -92,5 +93,28 @@ describe('Decrypted Views management routes', () => {
 
     expect(response.statusCode).toBe(200);
     expect(fakes.revokeView).toHaveBeenCalledWith('default-tenant', 'v1', 'compliance@chameleon-data.com');
+  });
+
+  it('GET /decrypted-views/available-fields returns field names synced into pii_vault for the tenant', async () => {
+    fakes.getAvailableFields.mockResolvedValue(['email', 'phone']);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/decrypted-views/available-fields',
+      headers: { 'x-tenant-id': 't1' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fakes.getAvailableFields).toHaveBeenCalledWith('t1');
+    expect(JSON.parse(response.body).fields).toEqual(['email', 'phone']);
+  });
+
+  it('GET /decrypted-views/available-fields returns 500 with a message on failure, not a bare crash', async () => {
+    fakes.getAvailableFields.mockRejectedValue(new Error('BigQuery unavailable'));
+
+    const response = await app.inject({ method: 'GET', url: '/decrypted-views/available-fields' });
+
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).message).toContain('BigQuery unavailable');
   });
 });
