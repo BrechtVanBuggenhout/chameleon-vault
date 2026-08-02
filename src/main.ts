@@ -282,7 +282,7 @@ async function main() {
     await fastify.register(decryptedViewsDecryptRoutes, {
       firestoreRegistry,
       dekKmsClient,
-      allowedCallerServiceAccount: process.env.DECRYPTED_VIEWS_CONNECTION_SA_EMAIL || '',
+      allowedCallerUniqueId: process.env.DECRYPTED_VIEWS_CONNECTION_SA_UNIQUE_ID || '',
     });
   }
 

@@ -20,17 +20,35 @@ interface RemoteFunctionRequest {
 export interface DecryptedViewsDecryptRoutesOptions {
   firestoreRegistry: FirestoreRegistry;
   dekKmsClient: CloudKMSClient;
-  // The BigQuery connection's own service account email -- the only
-  // identity this route will ever accept a call from. Required, not
+  // The BigQuery connection's own auto-provisioned service account,
+  // identified by its numeric unique ID (the JWT "sub"/"azp" claim) -- the
+  // only identity this route will ever accept a call from. Required, not
   // optional: an unset value means "not configured," and this route must
   // fail closed, not silently skip verification.
-  allowedCallerServiceAccount: string;
+  //
+  // Deliberately NOT the SA's email. Confirmed live: a real, signature-
+  // verified token from this connection carries no "email" claim at all
+  // (just sub/azp/aud/iss/exp/iat) -- whatever mints BigQuery connection
+  // tokens doesn't request the openid `email` scope. Comparing against
+  // payload.email (the original implementation) meant this check could
+  // never pass for a real caller.
+  //
+  // This value can't be derived automatically: it must be captured once,
+  // manually, from a real request's verified JWT (surfaced by the logging
+  // below on any mismatch) and wired in as config. Confirmed Google
+  // exposes no API for it from a customer project -- iam.serviceAccounts.get
+  // denies access to this class of shadow/service-agent SA even for the
+  // project Owner, and BigQuery's own Connections API only ever returns
+  // the SA's email, never its numeric ID. Only needs re-capturing if this
+  // exact connection is ever destroyed and recreated (a new auto-
+  // provisioned SA gets a new unique ID).
+  allowedCallerUniqueId: string;
 }
 
 async function verifyCaller(
   authHeader: string | undefined,
   client: OAuth2Client,
-  allowedCallerServiceAccount: string,
+  allowedCallerUniqueId: string,
   audience: string
 ): Promise<boolean> {
   if (!authHeader?.startsWith('Bearer ')) return false;
@@ -38,7 +56,7 @@ async function verifyCaller(
   try {
     const ticket = await client.verifyIdToken({ idToken, audience });
     const payload = ticket.getPayload();
-    const authorized = payload?.email === allowedCallerServiceAccount && payload?.email_verified !== false;
+    const authorized = payload?.sub === allowedCallerUniqueId;
     if (!authorized) {
       // Token verified fine (right signature, right audience) but the
       // caller identity itself didn't clear the bar -- a materially
@@ -46,16 +64,12 @@ async function verifyCaller(
       // previously had zero logging of its own, making it indistinguishable
       // from "no token at all" in the logs.
       //
-      // Logging the full verified payload, not just email/email_verified --
-      // those two came back empty on a real live 403 (both fields simply
-      // absent from the object, not falsy), meaning whatever mints this
-      // token doesn't request the openid `email` scope by default. The
-      // payload's signature already passed verifyIdToken above, so every
-      // claim on it is trustworthy; logging all of it settles what claim
-      // this token actually carries (almost certainly `sub`, the SA's
-      // numeric unique ID) in one shot instead of guessing field-by-field.
+      // Logging the full verified payload -- its signature already passed
+      // verifyIdToken above, so every claim on it is trustworthy, and this
+      // is exactly how allowedCallerUniqueId's own real value gets
+      // (re-)captured if this connection is ever recreated.
       logger.warn(
-        { expectedCallerServiceAccount: allowedCallerServiceAccount, payload },
+        { expectedCallerUniqueId: allowedCallerUniqueId, payload },
         'Decrypted-view caller ID token verified but identity did not match the allowed caller'
       );
     }
@@ -135,11 +149,11 @@ export async function decryptedViewsDecryptRoutes(
   fastify: FastifyInstance,
   options: DecryptedViewsDecryptRoutesOptions
 ): Promise<void> {
-  const { firestoreRegistry, dekKmsClient, allowedCallerServiceAccount } = options;
+  const { firestoreRegistry, dekKmsClient, allowedCallerUniqueId } = options;
   const authClient = new OAuth2Client();
 
   fastify.post('/internal/decrypted-views/batch-decrypt', async (request: FastifyRequest, reply: FastifyReply) => {
-    if (!allowedCallerServiceAccount) {
+    if (!allowedCallerUniqueId) {
       logger.error('Decrypted-views batch-decrypt route is not configured -- refusing all requests');
       return reply.status(503).send({ statusCode: 503, error: 'Decrypted views not configured' });
     }
@@ -148,7 +162,7 @@ export async function decryptedViewsDecryptRoutes(
     const authorized = await verifyCaller(
       request.headers['authorization'] as string | undefined,
       authClient,
-      allowedCallerServiceAccount,
+      allowedCallerUniqueId,
       audience
     );
     if (!authorized) {

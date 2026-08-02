@@ -1,7 +1,10 @@
 import { jest, describe, it, expect, beforeEach } from '@jest/globals';
 import { ChameleonAesGcm } from '../src/crypto/chameleon-aes-gcm.js';
 
-const ALLOWED_SA = 'connection-sa@proj.iam.gserviceaccount.com';
+// The connection's unique ID (JWT "sub"/"azp" claim) -- not an email. A
+// real verified token from this kind of caller never carries an "email"
+// claim at all, so allowedCallerUniqueId is compared against payload.sub.
+const ALLOWED_CALLER_UNIQUE_ID = '113811724583999010840';
 // Fastify's inject() defaults the Host header to this when none is passed --
 // the route derives its expected audience from request.hostname + request.url
 // (BigQuery mints the token's "aud" as the exact configured endpoint URL,
@@ -45,11 +48,11 @@ function buildApp() {
   return app;
 }
 
-async function registerRoutes(app: ReturnType<typeof Fastify>, overrides: Partial<{ allowedCallerServiceAccount: string }> = {}) {
+async function registerRoutes(app: ReturnType<typeof Fastify>, overrides: Partial<{ allowedCallerUniqueId: string }> = {}) {
   await app.register(decryptedViewsDecryptRoutes, {
     firestoreRegistry: fakeFirestoreRegistry,
     dekKmsClient: fakeKmsClient,
-    allowedCallerServiceAccount: overrides.allowedCallerServiceAccount ?? ALLOWED_SA,
+    allowedCallerUniqueId: overrides.allowedCallerUniqueId ?? ALLOWED_CALLER_UNIQUE_ID,
   });
 }
 
@@ -72,9 +75,9 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
     expect(mockVerifyIdToken).not.toHaveBeenCalled();
   });
 
-  it('rejects a validly-signed token that belongs to the wrong service account', async () => {
+  it('rejects a validly-signed token that belongs to the wrong caller identity', async () => {
     mockVerifyIdToken.mockResolvedValue({
-      getPayload: () => ({ email: 'someone-else@proj.iam.gserviceaccount.com', email_verified: true }),
+      getPayload: () => ({ sub: 'some-other-unique-id', azp: 'some-other-unique-id' }),
     });
     const app = buildApp();
     await registerRoutes(app);
@@ -106,7 +109,7 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
 
   it('fails closed (503) when the route is registered but not configured -- never silently skips auth', async () => {
     const app = buildApp();
-    await registerRoutes(app, { allowedCallerServiceAccount: '' });
+    await registerRoutes(app, { allowedCallerUniqueId: '' });
 
     const response = await app.inject({
       method: 'POST',
@@ -121,7 +124,7 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
 
   it('decrypts a batch for an authorized caller, returning null for a shredded/unknown user rather than dropping the row', async () => {
     mockVerifyIdToken.mockResolvedValue({
-      getPayload: () => ({ email: ALLOWED_SA, email_verified: true }),
+      getPayload: () => ({ sub: ALLOWED_CALLER_UNIQUE_ID, azp: ALLOWED_CALLER_UNIQUE_ID }),
     });
     const app = buildApp();
     await registerRoutes(app);
@@ -164,7 +167,7 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
 
   it('successfully decrypts a real ciphertext and returns the plaintext', async () => {
     mockVerifyIdToken.mockResolvedValue({
-      getPayload: () => ({ email: ALLOWED_SA, email_verified: true }),
+      getPayload: () => ({ sub: ALLOWED_CALLER_UNIQUE_ID, azp: ALLOWED_CALLER_UNIQUE_ID }),
     });
     const app = buildApp();
     await registerRoutes(app);
@@ -188,7 +191,7 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
 
   it('derives the expected audience from the request Host header and path, not a fixed config value', async () => {
     mockVerifyIdToken.mockResolvedValue({
-      getPayload: () => ({ email: ALLOWED_SA, email_verified: true }),
+      getPayload: () => ({ sub: ALLOWED_CALLER_UNIQUE_ID, azp: ALLOWED_CALLER_UNIQUE_ID }),
     });
     const app = buildApp();
     await registerRoutes(app);
@@ -209,7 +212,7 @@ describe('POST /internal/decrypted-views/batch-decrypt', () => {
 
   it('rejects a malformed request body (no calls array) with a BigQuery-shaped error, not a generic 500', async () => {
     mockVerifyIdToken.mockResolvedValue({
-      getPayload: () => ({ email: ALLOWED_SA, email_verified: true }),
+      getPayload: () => ({ sub: ALLOWED_CALLER_UNIQUE_ID, azp: ALLOWED_CALLER_UNIQUE_ID }),
     });
     const app = buildApp();
     await registerRoutes(app);
