@@ -226,3 +226,135 @@ describe('DeletionRequestService - cascade outcome gates certificate issuance', 
     expect(mockCertificateService.issueAndStoreCertificate).toHaveBeenCalledWith('user-1', 'del-1', 'default-tenant');
   });
 });
+
+describe('DeletionRequestService - source redaction integration', () => {
+  let service: DeletionRequestService;
+  let mockDeletionRequestRepo: { [K in keyof DeletionRequestRepository]: jest.Mock };
+  let mockFirestoreRegistry: { [K in keyof FirestoreRegistry]: jest.Mock };
+  let mockLineageRepository: { [K in keyof BigQueryLineageRepository]: jest.Mock };
+  let mockJanitorService: { [K in keyof JanitorService]: jest.Mock };
+  let mockDekKmsClient: { [K in keyof CloudKMSClient]: jest.Mock };
+  let mockCertificateService: { [K in keyof CertificateService]: jest.Mock };
+  let mockSourceRedactionService: { planRedaction: jest.Mock; redactUserInDeclaredSources: jest.Mock };
+  let currentRequest: DeletionRequest;
+
+  beforeEach(() => {
+    currentRequest = {
+      deletion_request_id: 'del-1',
+      tenant_id: 'default-tenant',
+      user_id: 'user-1',
+      status: 'KEY_DESTROYED',
+      created_at: new Date(),
+      status_history: [],
+      janitor_wipes: [],
+    };
+
+    mockDeletionRequestRepo = {
+      createDeletionRequest: jest.fn(),
+      getActiveDeletionRequestForUser: jest.fn(),
+      updateJanitorWipeStatus: jest.fn().mockResolvedValue(undefined),
+      getDeletionRequest: jest.fn(async () => ({ ...currentRequest })),
+      updateDeletionRequestStatus: jest.fn(async (_id: string, newStatus: DeletionRequestStatus, updateFields: any) => {
+        currentRequest = { ...currentRequest, ...updateFields, status: newStatus };
+      }),
+    } as any;
+    mockFirestoreRegistry = { shredKeyForUser: jest.fn().mockResolvedValue(undefined) } as any;
+    mockLineageRepository = { recordEvent: jest.fn().mockResolvedValue(undefined) } as any;
+    // No SaaS tasks in this suite -- isolates source redaction's own effect
+    // on the shortcut logic and the certificate gate.
+    mockJanitorService = {
+      createCleanupPlan: jest.fn().mockResolvedValue([]),
+      processCleanup: jest.fn().mockResolvedValue([]),
+    } as any;
+    mockDekKmsClient = {} as any;
+    mockCertificateService = {
+      issueAndStoreCertificate: jest.fn().mockResolvedValue({ gcsPath: 'gs://certs/del-1.json' }),
+    } as any;
+    mockSourceRedactionService = {
+      planRedaction: jest.fn().mockReturnValue([]),
+      redactUserInDeclaredSources: jest.fn().mockResolvedValue([]),
+    };
+
+    service = new DeletionRequestService(
+      mockDeletionRequestRepo as unknown as DeletionRequestRepository,
+      mockFirestoreRegistry as unknown as FirestoreRegistry,
+      mockLineageRepository as unknown as BigQueryLineageRepository,
+      mockJanitorService as unknown as JanitorService,
+      mockDekKmsClient as unknown as CloudKMSClient,
+      mockCertificateService as unknown as CertificateService,
+      mockSourceRedactionService as any
+    );
+  });
+
+  async function flushMicrotasks(times = 15): Promise<void> {
+    for (let i = 0; i < times; i++) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  }
+
+  it('does not shortcut to CASCADE_COMPLETE when there are no SaaS tasks but there is a pending redaction resource', async () => {
+    mockSourceRedactionService.planRedaction.mockReturnValue([{ resourceId: 'bigquery:acme.crm.contacts' }]);
+    mockSourceRedactionService.redactUserInDeclaredSources.mockResolvedValue([
+      { resourceId: 'bigquery:acme.crm.contacts', success: true, rowsAffected: 1 },
+    ]);
+
+    await service.advanceRequest('del-1', 'CASCADE_PENDING', 'op-1');
+    await flushMicrotasks();
+
+    // Reached CASCADE_PENDING for real (not the empty-plan shortcut), and
+    // the redaction actually ran.
+    expect(mockSourceRedactionService.redactUserInDeclaredSources).toHaveBeenCalledWith('user-1', 'default-tenant');
+    expect(currentRequest.status).toBe('CERTIFICATE_ISSUED');
+  });
+
+  it('withholds the certificate when a source redaction fails, even if there are no SaaS tasks at all', async () => {
+    mockSourceRedactionService.planRedaction.mockReturnValue([{ resourceId: 'bigquery:acme.crm.contacts' }]);
+    mockSourceRedactionService.redactUserInDeclaredSources.mockResolvedValue([
+      { resourceId: 'bigquery:acme.crm.contacts', success: false, error: 'permission denied' },
+    ]);
+
+    await service.advanceRequest('del-1', 'CASCADE_PENDING', 'op-1');
+    await flushMicrotasks();
+
+    expect(mockDeletionRequestRepo.updateJanitorWipeStatus).toHaveBeenCalledWith(
+      'del-1', 'bigquery:acme.crm.contacts', 'FAILED', { rowsAffected: undefined, error: 'permission denied' }
+    );
+    expect(currentRequest.status).toBe('CASCADE_PARTIAL_FAILURE');
+    expect(mockCertificateService.issueAndStoreCertificate).not.toHaveBeenCalled();
+  });
+
+  it('reaches CERTIFICATE_ISSUED and records the resourceId as a destination when redaction succeeds', async () => {
+    mockSourceRedactionService.planRedaction.mockReturnValue([{ resourceId: 'bigquery:acme.crm.contacts' }]);
+    mockSourceRedactionService.redactUserInDeclaredSources.mockResolvedValue([
+      { resourceId: 'bigquery:acme.crm.contacts', success: true, rowsAffected: 1 },
+    ]);
+
+    await service.advanceRequest('del-1', 'CASCADE_PENDING', 'op-1');
+    await flushMicrotasks();
+
+    expect(mockDeletionRequestRepo.updateJanitorWipeStatus).toHaveBeenCalledWith(
+      'del-1', 'bigquery:acme.crm.contacts', 'SUCCEEDED', { rowsAffected: 1, error: undefined }
+    );
+    expect(currentRequest.status).toBe('CERTIFICATE_ISSUED');
+    expect(mockCertificateService.issueAndStoreCertificate).toHaveBeenCalledWith('user-1', 'del-1', 'default-tenant');
+  });
+
+  it('is a no-op when sourceRedactionService is not provided at all (backward compatible)', async () => {
+    const serviceWithoutRedaction = new DeletionRequestService(
+      mockDeletionRequestRepo as unknown as DeletionRequestRepository,
+      mockFirestoreRegistry as unknown as FirestoreRegistry,
+      mockLineageRepository as unknown as BigQueryLineageRepository,
+      mockJanitorService as unknown as JanitorService,
+      mockDekKmsClient as unknown as CloudKMSClient,
+      mockCertificateService as unknown as CertificateService
+      // sourceRedactionService omitted entirely
+    );
+
+    await serviceWithoutRedaction.advanceRequest('del-1', 'CASCADE_PENDING', 'op-1');
+    await flushMicrotasks();
+
+    // No SaaS tasks, no redaction service configured -> the original empty-
+    // plan shortcut still applies, reaching CERTIFICATE_ISSUED immediately.
+    expect(currentRequest.status).toBe('CERTIFICATE_ISSUED');
+  });
+});

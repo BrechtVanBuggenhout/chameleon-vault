@@ -21,6 +21,8 @@ import { DecryptedViewsRepository } from './gcp/decrypted-views-repository.js';
 // Import Services
 import { JanitorService } from './services/janitor.js';
 import { DeletionRequestService } from './services/deletion-request-service.js';
+import { SourceRedactionService } from './services/source-redaction-service.js';
+import { BigQuery } from '@google-cloud/bigquery';
 import { CertificateService } from './services/certificate-service.js';
 import { PiiRegistryService } from './services/pii-registry-service.js';
 import { AnalystAccessService } from './services/analyst-access-service.js';
@@ -193,13 +195,16 @@ async function main() {
     );
   }
 
+  const sourceRedactionService = new SourceRedactionService(piiRegistryService, new BigQuery({ projectId }));
+
   const deletionRequestService = new DeletionRequestService(
     deletionRequestRepo,
     firestoreRegistry,
     lineageRepository,
     janitorService,
     dekKmsClient, // DeletionRequestService also needs a KMS client for key destruction
-    certificateService
+    certificateService,
+    sourceRedactionService
   );
 
   const analystAccessCollection = process.env.FIRESTORE_ANALYST_ACCESS_COLLECTION || 'analyst_access';

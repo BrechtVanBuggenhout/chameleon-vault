@@ -3,6 +3,7 @@ import { DeletionRequestRepository } from '../gcp/deletion-request-repository.js
 import { FirestoreRegistry } from '../gcp/firestore-registry.js';
 import { BigQueryLineageRepository } from '../gcp/bigquery-lineage.js';
 import { JanitorService } from './janitor.js';
+import { SourceRedactionService } from './source-redaction-service.js';
 import { createLogger } from '../logging/index.js';
 import { CloudKMSClient } from '../gcp/cloud-kms.js';
 import { CertificateService } from './certificate-service.js';
@@ -16,7 +17,12 @@ export class DeletionRequestService {
     private readonly lineageRepo: BigQueryLineageRepository,
     private readonly janitorService: JanitorService,
     private readonly kmsClient: CloudKMSClient,
-    private readonly certificateService: CertificateService
+    private readonly certificateService: CertificateService,
+    // Optional: undefined means no manually-declared resource has ever
+    // opted into REDACT_IN_PLACE, so this step is skippable entirely rather
+    // than requiring every caller (including existing tests) to wire up a
+    // BigQuery client just for a feature they don't use.
+    private readonly sourceRedactionService?: SourceRedactionService
   ) {}
 
   async createRequest(userId: string, operationId: string, tenantId: string = 'default-tenant'): Promise<DeletionRequest> {
@@ -89,24 +95,31 @@ export class DeletionRequestService {
         break;
       case 'CASCADE_PENDING':
         const tasks = await this.janitorService.createCleanupPlan(request.user_id, tenantId);
-        
-        if (tasks.length === 0) {
-          logger.info({ userId: request.user_id }, 'No SaaS tasks found, advancing to complete');
-          // If no SaaS cleanup is needed, move straight to COMPLETE
+        const redactionResources = this.sourceRedactionService?.planRedaction(tenantId) ?? [];
+
+        if (tasks.length === 0 && redactionResources.length === 0) {
+          logger.info({ userId: request.user_id }, 'No SaaS tasks or source redactions found, advancing to complete');
+          // If no SaaS cleanup or source redaction is needed, move straight to COMPLETE
           return this.advanceRequest(deletionRequestId, 'CASCADE_COMPLETE', operationId);
         }
 
-        // Trigger the cleanup loop (SaaS wipes) after the
-        // CASCADE_PENDING state is persisted, otherwise fast connectors can race
-        // the state machine into an invalid transition.
+        // Trigger the cleanup loop (SaaS wipes + declared-resource source
+        // redaction) after the CASCADE_PENDING state is persisted, otherwise
+        // fast connectors can race the state machine into an invalid
+        // transition.
         afterStatusPersisted = () => {
-          this.janitorService.processCleanup(request.user_id, tenantId).then(async (results) => {
+          Promise.all([
+            this.janitorService.processCleanup(request.user_id, tenantId),
+            redactionResources.length > 0 && this.sourceRedactionService
+              ? this.sourceRedactionService.redactUserInDeclaredSources(request.user_id, tenantId)
+              : Promise.resolve([]),
+          ]).then(async ([janitorResults, redactionResults]) => {
             // Record each destination's real outcome on the request itself
             // (janitor_wipes), not just as a lineage event -- this is what
             // the next step actually gates on. processCleanup() already
             // retries and DLQs permanent failures; the point here is to
             // stop pretending nothing failed once it returns.
-            for (const result of results) {
+            for (const result of janitorResults) {
               await this.updateJanitorWipeStatus(
                 deletionRequestId,
                 result.destination,
@@ -114,14 +127,29 @@ export class DeletionRequestService {
                 { attempts: result.attempts, recordsFound: result.recordsFound }
               ).catch(err => logger.error({ err, destination: result.destination }, 'Failed to record janitor wipe status'));
             }
+            // Source-redaction resources are tracked the same way, using
+            // the resource id as the destination label -- a redaction
+            // failure withholds the certificate exactly like a SaaS wipe
+            // failure already does, since both mean the user's data
+            // demonstrably still exists somewhere Chameleon knows about.
+            for (const result of redactionResults) {
+              await this.updateJanitorWipeStatus(
+                deletionRequestId,
+                result.resourceId,
+                result.success ? 'SUCCEEDED' : 'FAILED',
+                { rowsAffected: result.rowsAffected, error: result.error }
+              ).catch(err => logger.error({ err, destination: result.resourceId }, 'Failed to record source redaction status'));
+            }
 
-            const failed = results.filter(r => r.status !== 'COMPLETE');
-            const nextStatus: DeletionRequestStatus = failed.length > 0 ? 'CASCADE_PARTIAL_FAILURE' : 'CASCADE_COMPLETE';
+            const failedJanitor = janitorResults.filter(r => r.status !== 'COMPLETE');
+            const failedRedaction = redactionResults.filter(r => !r.success);
+            const nextStatus: DeletionRequestStatus =
+              failedJanitor.length > 0 || failedRedaction.length > 0 ? 'CASCADE_PARTIAL_FAILURE' : 'CASCADE_COMPLETE';
             await this.advanceRequest(deletionRequestId, nextStatus, operationId, {
-              failedDestinations: failed.map(r => r.destination),
+              failedDestinations: [...failedJanitor.map(r => r.destination), ...failedRedaction.map(r => r.resourceId)],
             });
           }).catch(err =>
-            logger.error({ err, userId: request.user_id }, 'Janitor cleanup loop failed')
+            logger.error({ err, userId: request.user_id }, 'Janitor cleanup / source redaction loop failed')
           );
         };
 

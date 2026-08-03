@@ -11,6 +11,7 @@ import {
   type PiiResourceVisibility,
   type PiiSystem,
   type RegistryEntryStatus,
+  type SourceRedactionStrategy,
 } from '../types/pii-registry.js';
 
 const SYSTEMS: PiiSystem[] = ['bigquery', 'gcs', 'firestore', 'log', 'hubspot', 'salesforce', 'external'];
@@ -24,6 +25,7 @@ const CLASSIFICATIONS: PiiClassification[] = [
 ];
 const HANDLINGS: PiiHandling[] = ['ENCRYPT', 'TOKENIZE', 'REDACT', 'HASH_SURROGATE', 'ALLOW_AGGREGATE_ONLY', 'MANUAL_REVIEW'];
 const DELETION_STRATEGIES: DeletionStrategy[] = ['CRYPTO_SHRED', 'DELETE_ROWS', 'REDACT_FIELDS', 'EXTERNAL_WIPE', 'MANUAL_REVIEW'];
+const SOURCE_REDACTION_STRATEGIES: SourceRedactionStrategy[] = ['NONE', 'REDACT_IN_PLACE', 'SHADOW_COPY'];
 const LAYERS: PiiResourceLayer[] = ['RAW', 'STAGING', 'INTERMEDIATE', 'MART', 'SAAS'];
 const VISIBILITIES: PiiResourceVisibility[] = ['CUSTOMER_FACING', 'INTERNAL'];
 const STATUSES: RegistryEntryStatus[] = ['APPROVED', 'PENDING_REVIEW', 'DEPRECATED', 'DISABLED'];
@@ -74,6 +76,23 @@ export function buildManualEntry(
   }
   if (input.deletionStrategy !== undefined && !DELETION_STRATEGIES.includes(input.deletionStrategy)) {
     errors.push(`deletionStrategy must be one of: ${DELETION_STRATEGIES.join(', ')}.`);
+  }
+  if (
+    input.sourceRedactionStrategy !== undefined &&
+    !SOURCE_REDACTION_STRATEGIES.includes(input.sourceRedactionStrategy)
+  ) {
+    errors.push(`sourceRedactionStrategy must be one of: ${SOURCE_REDACTION_STRATEGIES.join(', ')}.`);
+  }
+  // REDACT_IN_PLACE generates a real UPDATE against the customer's own table,
+  // scoped by userIdColumn -- without one there is no safe WHERE clause, and
+  // this is real destructive-write functionality, not just descriptive
+  // metadata like the rest of this schema. Fail closed rather than silently
+  // accepting a declaration that could later redact an entire table.
+  if (
+    (input.sourceRedactionStrategy === 'REDACT_IN_PLACE' || input.sourceRedactionStrategy === 'SHADOW_COPY') &&
+    !isNonEmptyString(input.userIdColumn)
+  ) {
+    errors.push('userIdColumn is required when sourceRedactionStrategy is REDACT_IN_PLACE or SHADOW_COPY.');
   }
   if (input.status !== undefined && !STATUSES.includes(input.status)) {
     errors.push(`status must be one of: ${STATUSES.join(', ')}.`);
@@ -131,6 +150,7 @@ export function buildManualEntry(
     ownerConnector: MANUAL_OWNER_CONNECTOR,
     lineageDestination: input.resourceId,
     deletionStrategy: input.deletionStrategy ?? 'CRYPTO_SHRED',
+    sourceRedactionStrategy: input.sourceRedactionStrategy ?? 'NONE',
     ghostDataScan,
     handlingPolicy: 'manual_declaration',
     evidencePointers: ['console:manual-declaration'],

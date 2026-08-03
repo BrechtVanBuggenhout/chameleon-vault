@@ -31,6 +31,33 @@ export type DeletionStrategy =
   | 'EXTERNAL_WIPE'
   | 'MANUAL_REVIEW';
 
+/**
+ * What (if anything) happens to a manually-declared resource's own source
+ * table when a user is deleted -- distinct from deletionStrategy, which
+ * governs Chameleon's own copy (pii_vault). A manually-declared resource is,
+ * by definition, a table the customer already owned before Chameleon ever
+ * touched it (see chameleon-data-pipelines' pii_vault_sync.py); crypto-
+ * shredding the key only ever cuts off Chameleon's encrypted copy and
+ * anything decrypted from it, never the original plaintext sitting in that
+ * source table. This field is how the person declaring the resource
+ * explicitly opts in to (or out of) Chameleon also acting on that source --
+ * never assumed, always chosen.
+ *
+ * - NONE (default): leave the source table exactly as-is. Zero write access
+ *   needed, zero risk of regressing anyone who doesn't opt in.
+ * - REDACT_IN_PLACE: on that user's deletion, null out the declared PII
+ *   columns directly in the source table (never delete rows, never touch
+ *   other columns). Requires a real, narrow write grant on that table.
+ * - SHADOW_COPY: never touch the source table; instead expose a separate
+ *   de-identified copy/view alongside it that mirrors the source but drops
+ *   a user's PII once their key is shredded.
+ *
+ * Only ever meaningful for manually-declared (ownerConnector === 'manual')
+ * resources -- automated-ingestion resources store only ciphertext at the
+ * source already, so there's nothing to redact there.
+ */
+export type SourceRedactionStrategy = 'NONE' | 'REDACT_IN_PLACE' | 'SHADOW_COPY';
+
 export type RegistryConfidence = 'DECLARED' | 'INFERRED_HIGH' | 'INFERRED_MEDIUM' | 'INFERRED_LOW';
 
 export type PiiResourceLayer = 'RAW' | 'STAGING' | 'INTERMEDIATE' | 'MART' | 'SAAS';
@@ -67,6 +94,8 @@ export interface PiiRegistryEntry {
   ownerConnector: string;
   lineageDestination: string;
   deletionStrategy: DeletionStrategy;
+  /** Defaults to 'NONE' for any existing entry that predates this field. */
+  sourceRedactionStrategy?: SourceRedactionStrategy;
   ghostDataScan: GhostDataScanPolicy;
   handlingPolicy: string;
   evidencePointers: string[];
@@ -104,6 +133,8 @@ export interface PiiRegistryDeclarationInput {
   userIdColumn?: string;
   piiFields: PiiFieldDeclarationInput[];
   deletionStrategy?: DeletionStrategy;
+  /** Only meaningful for manually-declared resources. Defaults to 'NONE'. */
+  sourceRedactionStrategy?: SourceRedactionStrategy;
   ghostDataScan?: Partial<GhostDataScanPolicy>;
   status?: RegistryEntryStatus;
   notes?: string;

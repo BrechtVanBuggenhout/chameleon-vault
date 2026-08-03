@@ -51,6 +51,50 @@ describe('buildManualEntry (validation)', () => {
     const { errors } = buildManualEntry(validInput, '');
     expect(errors.some((e) => e.includes('tenantId'))).toBe(true);
   });
+
+  it('defaults sourceRedactionStrategy to NONE when not supplied', () => {
+    const { entry, errors } = buildManualEntry(validInput, 'acme');
+    expect(errors).toEqual([]);
+    expect(entry?.sourceRedactionStrategy).toBe('NONE');
+  });
+
+  it('accepts an explicit sourceRedactionStrategy', () => {
+    const { entry, errors } = buildManualEntry(
+      { ...validInput, sourceRedactionStrategy: 'REDACT_IN_PLACE' },
+      'acme'
+    );
+    expect(errors).toEqual([]);
+    expect(entry?.sourceRedactionStrategy).toBe('REDACT_IN_PLACE');
+  });
+
+  it('rejects an invalid sourceRedactionStrategy', () => {
+    const { entry, errors } = buildManualEntry(
+      { ...validInput, sourceRedactionStrategy: 'DELETE_EVERYTHING' as never },
+      'acme'
+    );
+    expect(entry).toBeUndefined();
+    expect(errors.some((e) => e.includes('sourceRedactionStrategy'))).toBe(true);
+  });
+
+  it('requires userIdColumn when sourceRedactionStrategy is REDACT_IN_PLACE', () => {
+    const withoutUserIdColumn = { ...validInput, userIdColumn: undefined };
+    const { entry, errors } = buildManualEntry(
+      { ...withoutUserIdColumn, sourceRedactionStrategy: 'REDACT_IN_PLACE' },
+      'acme'
+    );
+    expect(entry).toBeUndefined();
+    expect(errors.some((e) => e.includes('userIdColumn is required'))).toBe(true);
+  });
+
+  it('requires userIdColumn when sourceRedactionStrategy is SHADOW_COPY', () => {
+    const withoutUserIdColumn = { ...validInput, userIdColumn: undefined };
+    const { entry, errors } = buildManualEntry(
+      { ...withoutUserIdColumn, sourceRedactionStrategy: 'SHADOW_COPY' },
+      'acme'
+    );
+    expect(entry).toBeUndefined();
+    expect(errors.some((e) => e.includes('userIdColumn is required'))).toBe(true);
+  });
 });
 
 describe('PiiRegistryService mutation + tenant scoping', () => {
