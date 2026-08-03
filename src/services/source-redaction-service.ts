@@ -2,19 +2,11 @@ import { BigQuery } from '@google-cloud/bigquery';
 import { parseBigQueryResourceId } from '../gcp/bigquery-schema-service.js';
 import { PiiRegistryService } from './pii-registry-service.js';
 import type { PiiRegistryEntry } from '../types/pii-registry.js';
+import { assertSafeIdentifiers } from './sql-identifier-safety.js';
+import { buildPiiVaultPivotColumns, escapeSqlStringLiteral } from './pii-vault-pivot-sql.js';
 import { createLogger } from '../logging/index.js';
 
 const logger = createLogger('source-redaction-service');
-
-// Real BigQuery column/table identifiers only -- never taken from anything
-// outside a stored PiiRegistryEntry, but validated anyway before use in a
-// generated SQL string. BigQuery has no way to parameterize an identifier
-// (only values), so this is the only guard between a malformed/malicious
-// declaration and a broken or dangerous UPDATE statement -- the same class
-// of bug already hit twice this week (unquoted hyphenated identifiers in
-// decrypted-view-service.ts) is genuinely worse here, since this runs a
-// real write against a customer's own table, not just a SELECT.
-const SAFE_IDENTIFIER = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
 export interface SourceRedactionResult {
   resourceId: string;
@@ -24,10 +16,25 @@ export interface SourceRedactionResult {
 }
 
 /**
- * Executes the REDACT_IN_PLACE source-redaction strategy: for every
- * manually-declared resource a tenant has opted into it for, nulls out
- * exactly the declared PII columns for one user's rows in that resource's
- * own source table -- never deletes rows, never touches any other column.
+ * Executes the two implemented source-redaction strategies for manually-
+ * declared resources -- what (if anything) happens to a customer's own
+ * source table when a user is deleted, distinct from crypto-shredding
+ * Chameleon's own copy (pii_vault).
+ *
+ * REDACT_IN_PLACE (redactUserInDeclaredSources): triggered per deletion, as
+ * part of the deletion cascade -- nulls out exactly the declared PII
+ * columns for one user's rows, never deletes rows, never touches any other
+ * column.
+ *
+ * SHADOW_COPY (ensureShadowCopy): NOT a cascade step. Unlike REDACT_IN_PLACE,
+ * a shadow copy is a live BigQuery view created once (at declare time) that
+ * joins the source table's own non-PII columns against pii_vault's live-
+ * decrypted fields -- reusing the exact same never-materializes-plaintext
+ * mechanism DecryptedViewService already ships. Once created, the view
+ * naturally reflects every future deletion on every query, forever, with no
+ * per-deletion action needed -- the underlying decrypt call simply starts
+ * failing (returning NULL) for a shredded user's rows, exactly like an
+ * ad-hoc decrypted view already does.
  *
  * Deliberately separate from JanitorService/ConnectorRegistry: those model
  * a fixed set of globally-registered SaaS destinations (one connector
@@ -36,10 +43,24 @@ export interface SourceRedactionResult {
  * column names taken from the registry entry itself.
  */
 export class SourceRedactionService {
+  private readonly piiVault?: { projectId: string; datasetId: string; tableId: string };
+
   constructor(
     private readonly registryService: PiiRegistryService,
-    private readonly bq: BigQuery
-  ) {}
+    private readonly bq: BigQuery,
+    // Same pii_vault + batch-decrypt function DecryptedViewService already
+    // uses -- SHADOW_COPY reuses that exact mechanism rather than inventing
+    // a second decrypt path. Both optional and independent of
+    // REDACT_IN_PLACE, which never touches pii_vault at all: a deployment
+    // can have decrypted views (and therefore SHADOW_COPY) disabled while
+    // still using REDACT_IN_PLACE, and vice versa.
+    piiVaultResourceId?: string,
+    private readonly batchDecryptFunctionRef?: string
+  ) {
+    this.piiVault = piiVaultResourceId ? parseBigQueryResourceId(piiVaultResourceId) : undefined;
+  }
+
+  // --- REDACT_IN_PLACE (deletion-cascade-triggered) ---
 
   /**
    * Cheap, side-effect-free lookup of which manually-declared resources this
@@ -100,14 +121,9 @@ export class SourceRedactionService {
       throw new Error('Resource has no declared piiFields to redact.');
     }
 
-    const identifiersToValidate = [resource.userIdColumn, resource.tenantIdColumn, ...fieldsToRedact].filter(
+    assertSafeIdentifiers([resource.userIdColumn, resource.tenantIdColumn, ...fieldsToRedact].filter(
       (v): v is string => v !== undefined
-    );
-    for (const identifier of identifiersToValidate) {
-      if (!SAFE_IDENTIFIER.test(identifier)) {
-        throw new Error(`Refusing to redact: "${identifier}" is not a safe column identifier.`);
-      }
-    }
+    ));
 
     const { projectId, datasetId, tableId } = parseBigQueryResourceId(resource.resourceId);
     const setClause = fieldsToRedact.map((field) => `${field} = NULL`).join(', ');
@@ -124,5 +140,105 @@ export class SourceRedactionService {
     await job.getQueryResults();
     const [metadata] = await job.getMetadata();
     return Number(metadata?.statistics?.query?.numDmlAffectedRows ?? 0);
+  }
+
+  // --- SHADOW_COPY (declare-time-triggered, not a cascade step) ---
+
+  private shadowViewId(tableId: string): string {
+    return `${tableId}_deidentified`;
+  }
+
+  /**
+   * Called whenever a manual resource is declared or updated (see
+   * routes/pii-registry.ts). If the resource is opted into SHADOW_COPY,
+   * (re)creates the deidentified view alongside the source table. If it
+   * isn't (including if it never was), drops any existing shadow view for
+   * it -- covers both "never had one" (a cheap no-op 404) and "just turned
+   * it off" (a real cleanup).
+   */
+  async ensureShadowCopy(resource: PiiRegistryEntry): Promise<void> {
+    if (resource.sourceRedactionStrategy !== 'SHADOW_COPY') {
+      await this.dropShadowCopyIfExists(resource);
+      return;
+    }
+    if (!this.piiVault || !this.batchDecryptFunctionRef) {
+      throw new Error(
+        'SHADOW_COPY requires decrypted views to be enabled on this deployment (pii_vault + batch-decrypt function not configured).'
+      );
+    }
+    if (resource.system !== 'bigquery') {
+      throw new Error(`sourceRedactionStrategy SHADOW_COPY is only implemented for bigquery resources, got "${resource.system}".`);
+    }
+    if (!resource.userIdColumn) {
+      throw new Error('Resource has no userIdColumn declared; refusing to build a shadow copy without a safe join key.');
+    }
+    if (!resource.tenantId) {
+      // Unreachable for a real manual entry (upsertEntry already requires
+      // this), but this generates a literal into SQL, so fail loudly.
+      throw new Error('Resource has no tenantId; refusing to build a shadow copy.');
+    }
+
+    const fields = resource.piiFields.map((f) => f.name);
+    if (fields.length === 0) {
+      throw new Error('Resource has no declared piiFields to shadow-copy.');
+    }
+
+    assertSafeIdentifiers([resource.userIdColumn, resource.tenantIdColumn, ...fields].filter(
+      (v): v is string => v !== undefined
+    ));
+
+    const { projectId, datasetId, tableId } = parseBigQueryResourceId(resource.resourceId);
+    const viewId = this.shadowViewId(tableId);
+    const pivotColumns = buildPiiVaultPivotColumns(fields, this.batchDecryptFunctionRef);
+    const exceptClause = fields.join(', ');
+    const decryptedColumns = fields.map((field) => `d.${field}`).join(', ');
+    const tenantLiteral = escapeSqlStringLiteral(resource.tenantId);
+    const tenantFilter = resource.tenantIdColumn ? `WHERE s.${resource.tenantIdColumn} = '${tenantLiteral}'` : '';
+
+    const viewSql = [
+      'WITH decrypted_pii AS (',
+      '  SELECT',
+      '    user_id,',
+      `    ${pivotColumns.join(',\n    ')}`,
+      `  FROM \`${this.piiVault.projectId}.${this.piiVault.datasetId}.${this.piiVault.tableId}\``,
+      `  WHERE tenant_id = '${tenantLiteral}'`,
+      '  GROUP BY user_id',
+      ')',
+      `SELECT s.* EXCEPT (${exceptClause}), ${decryptedColumns}`,
+      `FROM \`${projectId}.${datasetId}.${tableId}\` s`,
+      `LEFT JOIN decrypted_pii d ON s.${resource.userIdColumn} = d.user_id`,
+      tenantFilter,
+    ]
+      .filter((line) => line !== '')
+      .join('\n');
+
+    // Re-declaring an existing shadow view (e.g. after the customer adds a
+    // new PII field) needs replace, not insert-only, semantics -- delete-
+    // then-create is simpler and more clearly correct than juggling the
+    // BigQuery client's metadata-patch API, and matches the same
+    // idempotent-cleanup pattern revokeView() below already uses.
+    await this.dropShadowCopyIfExists(resource);
+    await this.bq.dataset(datasetId, { projectId }).createTable(viewId, { view: viewSql });
+
+    logger.info({ resourceId: resource.resourceId, viewId }, 'Shadow-copy deidentified view created');
+  }
+
+  async dropShadowCopyIfExists(resource: PiiRegistryEntry): Promise<void> {
+    if (resource.system !== 'bigquery') {
+      return;
+    }
+    const { projectId, datasetId, tableId } = parseBigQueryResourceId(resource.resourceId);
+    const viewId = this.shadowViewId(tableId);
+    try {
+      await this.bq.dataset(datasetId, { projectId }).table(viewId).delete();
+      logger.info({ resourceId: resource.resourceId, viewId }, 'Shadow-copy deidentified view dropped');
+    } catch (error) {
+      // Already gone (or never created) is fine; anything else is a real
+      // failure and shouldn't be swallowed.
+      if ((error as { code?: number })?.code !== 404) {
+        logger.error({ err: error, resourceId: resource.resourceId, viewId }, 'Failed to drop shadow-copy view');
+        throw error;
+      }
+    }
   }
 }

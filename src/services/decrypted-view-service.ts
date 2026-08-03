@@ -2,6 +2,7 @@ import { BigQuery, Table } from '@google-cloud/bigquery';
 import { parseBigQueryResourceId } from '../gcp/bigquery-schema-service.js';
 import { DecryptedViewsRepository } from '../gcp/decrypted-views-repository.js';
 import { DecryptedViewDeclaration } from '../types/decrypted-view.js';
+import { buildPiiVaultPivotColumns, escapeSqlStringLiteral } from './pii-vault-pivot-sql.js';
 import { createLogger } from '../logging/index.js';
 
 const logger = createLogger('decrypted-view-service');
@@ -142,16 +143,7 @@ export class DecryptedViewService {
    * view here would expose other tenants' rows.
    */
   private buildViewSql(input: DeclareViewInput): string {
-    const escapeLiteral = (value: string) => value.replace(/'/g, "''");
-
-    const pivotColumns = input.declaredFields.map((field) => {
-      const fieldLiteral = escapeLiteral(field);
-      return (
-        `ARRAY_AGG(IF(field_name = '${fieldLiteral}', ` +
-        `\`${this.batchDecryptFunctionRef}\`(CAST(encrypted_value AS STRING), user_id, tenant_id), NULL) ` +
-        `IGNORE NULLS ORDER BY synced_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS ${field}`
-      );
-    });
+    const pivotColumns = buildPiiVaultPivotColumns(input.declaredFields, this.batchDecryptFunctionRef);
 
     return [
       'SELECT',
@@ -159,7 +151,7 @@ export class DecryptedViewService {
       '  tenant_id,',
       `  ${pivotColumns.join(',\n  ')}`,
       `FROM \`${this.piiVaultProjectId}.${this.piiVaultDatasetId}.${this.piiVaultTableId}\``,
-      `WHERE tenant_id = '${escapeLiteral(input.tenantId)}'`,
+      `WHERE tenant_id = '${escapeSqlStringLiteral(input.tenantId)}'`,
       'GROUP BY user_id, tenant_id',
     ].join('\n');
   }

@@ -4,7 +4,7 @@ import { PiiRegistryService, RegistryMutationError } from '../services/pii-regis
 import { buildManualEntry } from '../services/pii-registry-validation.js';
 import { computeCoverage, toCoverageItems } from '../services/pii-coverage.js';
 import { InvalidResourceIdError, type DiscoveredColumn } from '../gcp/bigquery-schema-service.js';
-import type { PiiRegistryDeclarationInput } from '../types/pii-registry.js';
+import type { PiiRegistryDeclarationInput, PiiRegistryEntry } from '../types/pii-registry.js';
 import type { WarehouseDiscoveryFinding } from '../types/lineage.js';
 
 const logger = createLogger('pii-registry-routes');
@@ -31,6 +31,18 @@ export interface SyncTrigger {
   }>;
 }
 
+/**
+ * Narrow dependency: just the SHADOW_COPY maintenance hook (see
+ * SourceRedactionService), so tests don't need a real BigQuery client.
+ * Called after every successful declare/update/remove -- SHADOW_COPY is
+ * declare-time-maintained (a live view), not a deletion-cascade step like
+ * REDACT_IN_PLACE.
+ */
+export interface SourceRedactionHook {
+  ensureShadowCopy(resource: PiiRegistryEntry): Promise<void>;
+  dropShadowCopyIfExists(resource: PiiRegistryEntry): Promise<void>;
+}
+
 export interface PiiRegistryRoutesOptions {
   piiRegistryService: PiiRegistryService;
   /**
@@ -44,6 +56,8 @@ export interface PiiRegistryRoutesOptions {
   schemaSource?: SchemaSource;
   /** On-demand trigger for the pii_vault backfill/sync job. Undefined disables it gracefully. */
   syncTrigger?: SyncTrigger;
+  /** Maintains (or drops) a resource's SHADOW_COPY view on declare/update/remove. Undefined disables it gracefully. */
+  sourceRedactionHook?: SourceRedactionHook;
 }
 
 function tenantOf(request: FastifyRequest): string {
@@ -56,7 +70,7 @@ export async function piiRegistryRoutes(
   fastify: FastifyInstance,
   options: PiiRegistryRoutesOptions
 ): Promise<void> {
-  const { piiRegistryService, writeToken, discoverySource, schemaSource, syncTrigger } = options;
+  const { piiRegistryService, writeToken, discoverySource, schemaSource, syncTrigger, sourceRedactionHook } = options;
 
   // Gate every mutating route behind the shared-secret bearer token.
   const requireWriteAuth = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
@@ -236,10 +250,27 @@ export async function piiRegistryRoutes(
     try {
       const saved = await piiRegistryService.upsertEntry(entry);
       const created = resourceIdFromPath ? false : !existing;
+
+      // SHADOW_COPY is a live view maintained at declare-time, not a
+      // deletion-cascade step (see SourceRedactionService's own docstring
+      // for why) -- (re)create or drop it here, on every successful
+      // declare/update. The durable registry entry is the source of truth
+      // and has already been saved above; a failure here is surfaced to the
+      // caller (so a silently-broken shadow copy is never mistaken for a
+      // working one) without rolling back or failing the declaration itself.
+      let shadowCopyError: string | undefined;
+      try {
+        await sourceRedactionHook?.ensureShadowCopy(saved);
+      } catch (shadowError) {
+        shadowCopyError = shadowError instanceof Error ? shadowError.message : String(shadowError);
+        logger.error({ err: shadowError, resourceId: saved.resourceId }, 'Failed to maintain SHADOW_COPY view');
+      }
+
       return reply.status(created ? 201 : 200).send({
         resource: saved,
         policy: piiRegistryService.evaluateEntry(saved),
         timestamp: new Date().toISOString(),
+        ...(shadowCopyError ? { shadowCopyError } : {}),
       });
     } catch (error) {
       if (error instanceof RegistryMutationError) {
@@ -262,10 +293,18 @@ export async function piiRegistryRoutes(
   fastify.delete('/pii-registry/resources/:resourceId', { preHandler: requireWriteAuth }, async (request, reply) => {
     const { resourceId } = request.params as { resourceId: string };
     const tenantId = tenantOf(request);
+    // Fetched before removal -- removeEntry only returns a boolean, but
+    // dropping a SHADOW_COPY view needs the entry's own resourceId/system.
+    const existingBeforeRemoval = piiRegistryService.getEntry(decodeURIComponent(resourceId), tenantId);
     try {
       const removed = await piiRegistryService.removeEntry(decodeURIComponent(resourceId), tenantId);
       if (!removed) {
         return reply.status(404).send({ error: 'No manual declaration found for this tenant', statusCode: 404 });
+      }
+      if (existingBeforeRemoval) {
+        await sourceRedactionHook?.dropShadowCopyIfExists(existingBeforeRemoval).catch((shadowError) =>
+          logger.error({ err: shadowError, resourceId }, 'Failed to drop SHADOW_COPY view on resource removal')
+        );
       }
       return reply.status(200).send({ removed: true, resourceId: decodeURIComponent(resourceId), timestamp: new Date().toISOString() });
     } catch (error) {

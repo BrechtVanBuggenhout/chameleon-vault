@@ -8,9 +8,22 @@ const mockGetMetadata = jest.fn(async () => [queryMetadata]);
 const mockJob = { getQueryResults: mockGetQueryResults, getMetadata: mockGetMetadata };
 const mockCreateQueryJob = jest.fn(async () => [mockJob]);
 
+// Defaults to "already gone" (404) -- the common case, since
+// ensureShadowCopy always calls dropShadowCopyIfExists first as its
+// idempotent-replace step, and most tests aren't exercising that path.
+let deleteTableShouldFail: { code: number } | undefined = { code: 404 };
+const mockDeleteTable = jest.fn(async () => {
+  if (deleteTableShouldFail) throw deleteTableShouldFail;
+  return [{}];
+});
+const mockCreateTable = jest.fn(async () => [{}]);
+const mockTable = jest.fn(() => ({ delete: mockDeleteTable }));
+const mockDataset = jest.fn(() => ({ createTable: mockCreateTable, table: mockTable }));
+
 await jest.unstable_mockModule('@google-cloud/bigquery', () => ({
   BigQuery: class {
     createQueryJob = mockCreateQueryJob;
+    dataset = mockDataset;
   },
 }));
 
@@ -43,6 +56,7 @@ describe('SourceRedactionService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     queryMetadata = { statistics: { query: { numDmlAffectedRows: '1' } } };
+    deleteTableShouldFail = { code: 404 };
   });
 
   describe('planRedaction', () => {
@@ -155,7 +169,7 @@ describe('SourceRedactionService', () => {
       const results = await service.redactUserInDeclaredSources('user-1', 'acme');
 
       expect(results[0].success).toBe(false);
-      expect(results[0].error).toContain('is not a safe column identifier');
+      expect(results[0].error).toContain('not a safe column/table name');
       expect(mockCreateQueryJob).not.toHaveBeenCalled();
     });
 
@@ -168,8 +182,132 @@ describe('SourceRedactionService', () => {
       const results = await service.redactUserInDeclaredSources('user-1', 'acme');
 
       expect(results[0].success).toBe(false);
-      expect(results[0].error).toContain('is not a safe column identifier');
+      expect(results[0].error).toContain('not a safe column/table name');
       expect(mockCreateQueryJob).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('ensureShadowCopy / dropShadowCopyIfExists', () => {
+    const PII_VAULT_RESOURCE_ID = 'bigquery:chameleon-proj.chameleon_dev.pii_vault';
+    const BATCH_DECRYPT_FN = 'chameleon-proj.decrypted_views.chameleon_batch_decrypt';
+
+    it('drops any existing shadow view and does not create one when the strategy is not SHADOW_COPY', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(
+        registry, new BigQuery(), PII_VAULT_RESOURCE_ID, BATCH_DECRYPT_FN
+      );
+      const resource = makeManualEntry({ sourceRedactionStrategy: 'NONE' });
+
+      await service.ensureShadowCopy(resource);
+
+      expect(mockDataset).toHaveBeenCalledWith('crm', { projectId: 'acme-project' });
+      expect(mockTable).toHaveBeenCalledWith('contacts_deidentified');
+      expect(mockDeleteTable).toHaveBeenCalled();
+      expect(mockCreateTable).not.toHaveBeenCalled();
+    });
+
+    it('refuses SHADOW_COPY when pii_vault / batch-decrypt are not configured on this deployment', async () => {
+      const registry = new PiiRegistryService([]);
+      // No piiVaultResourceId/batchDecryptFunctionRef passed at all.
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({ sourceRedactionStrategy: 'SHADOW_COPY' });
+
+      await expect(service.ensureShadowCopy(resource)).rejects.toThrow(
+        'SHADOW_COPY requires decrypted views to be enabled'
+      );
+      expect(mockCreateTable).not.toHaveBeenCalled();
+    });
+
+    it('creates a view joining the source table against pii_vault, excepting the declared PII columns', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(
+        registry, new BigQuery(), PII_VAULT_RESOURCE_ID, BATCH_DECRYPT_FN
+      );
+      const resource = makeManualEntry({
+        resourceId: 'bigquery:acme-project.crm.contacts',
+        sourceRedactionStrategy: 'SHADOW_COPY',
+        piiFields: [
+          { name: 'email', classification: 'DIRECT_IDENTIFIER', handling: 'ENCRYPT', requiredInMart: false },
+          { name: 'phone', classification: 'CONTACT', handling: 'ENCRYPT', requiredInMart: false },
+        ],
+      });
+
+      await service.ensureShadowCopy(resource);
+
+      // Idempotent-replace: always deletes any prior view first.
+      expect(mockDataset).toHaveBeenCalledWith('crm', { projectId: 'acme-project' });
+      expect(mockDeleteTable).toHaveBeenCalled();
+
+      expect(mockCreateTable).toHaveBeenCalledWith(
+        'contacts_deidentified',
+        expect.objectContaining({
+          view: expect.stringMatching(
+            /WITH decrypted_pii AS \([\s\S]*FROM `chameleon-proj\.chameleon_dev\.pii_vault`[\s\S]*WHERE tenant_id = 'acme'/
+          ),
+        })
+      );
+      const [, { view: viewSql }] = mockCreateTable.mock.calls[mockCreateTable.mock.calls.length - 1] as [string, { view: string }];
+      expect(viewSql).toContain('SELECT s.* EXCEPT (email, phone), d.email, d.phone');
+      expect(viewSql).toContain('FROM `acme-project.crm.contacts` s');
+      expect(viewSql).toContain('LEFT JOIN decrypted_pii d ON s.user_id = d.user_id');
+      expect(viewSql).toContain("WHERE s.tenant_id = 'acme'");
+    });
+
+    it('omits the tenant filter when the resource has no tenantIdColumn declared', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(
+        registry, new BigQuery(), PII_VAULT_RESOURCE_ID, BATCH_DECRYPT_FN
+      );
+      const resource = makeManualEntry({ sourceRedactionStrategy: 'SHADOW_COPY', tenantIdColumn: undefined });
+
+      await service.ensureShadowCopy(resource);
+
+      const [, { view: viewSql }] = mockCreateTable.mock.calls[0] as [string, { view: string }];
+      expect(viewSql).not.toContain('WHERE s.');
+    });
+
+    it('refuses to build a shadow copy with an unsafe field identifier', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(
+        registry, new BigQuery(), PII_VAULT_RESOURCE_ID, BATCH_DECRYPT_FN
+      );
+      const resource = makeManualEntry({
+        sourceRedactionStrategy: 'SHADOW_COPY',
+        piiFields: [
+          { name: 'email); DROP TABLE users; --', classification: 'DIRECT_IDENTIFIER', handling: 'ENCRYPT', requiredInMart: false },
+        ],
+      });
+
+      await expect(service.ensureShadowCopy(resource)).rejects.toThrow('not a safe column/table name');
+      expect(mockCreateTable).not.toHaveBeenCalled();
+    });
+
+    it('dropShadowCopyIfExists treats a 404 as a no-op, not an error', async () => {
+      deleteTableShouldFail = { code: 404 };
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({ resourceId: 'bigquery:acme-project.crm.contacts' });
+
+      await expect(service.dropShadowCopyIfExists(resource)).resolves.toBeUndefined();
+    });
+
+    it('dropShadowCopyIfExists rethrows a real (non-404) failure', async () => {
+      deleteTableShouldFail = { code: 500 };
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({ resourceId: 'bigquery:acme-project.crm.contacts' });
+
+      await expect(service.dropShadowCopyIfExists(resource)).rejects.toEqual({ code: 500 });
+    });
+
+    it('is a no-op for a non-bigquery resource', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({ resourceId: 'salesforce:leads', system: 'salesforce' });
+
+      await service.dropShadowCopyIfExists(resource);
+
+      expect(mockDataset).not.toHaveBeenCalled();
     });
   });
 });

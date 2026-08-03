@@ -195,7 +195,19 @@ async function main() {
     );
   }
 
-  const sourceRedactionService = new SourceRedactionService(piiRegistryService, new BigQuery({ projectId }));
+  // PII_VAULT_RESOURCE_ID / DECRYPTED_VIEWS_BATCH_DECRYPT_FUNCTION_REF read
+  // directly (not getRequiredEnv) -- optional here, unlike inside the
+  // decrypted-views block above: REDACT_IN_PLACE (this service's other
+  // strategy) never touches pii_vault at all, so a deployment can use it
+  // with decrypted views disabled and these two unset entirely. Only
+  // SHADOW_COPY needs them, and fails closed with a clear error if missing
+  // rather than silently no-op-ing (see SourceRedactionService.ensureShadowCopy).
+  const sourceRedactionService = new SourceRedactionService(
+    piiRegistryService,
+    new BigQuery({ projectId }),
+    process.env.PII_VAULT_RESOURCE_ID,
+    process.env.DECRYPTED_VIEWS_BATCH_DECRYPT_FUNCTION_REF
+  );
 
   const deletionRequestService = new DeletionRequestService(
     deletionRequestRepo,
@@ -277,6 +289,7 @@ async function main() {
     discoverySource: lineageRepository,
     schemaSource: schemaService,
     syncTrigger,
+    sourceRedactionHook: sourceRedactionService,
   });
   await fastify.register(analystClaimsRoutes, { analystAccessService });
   if (decryptedViewService && decryptedViewsRepo) {

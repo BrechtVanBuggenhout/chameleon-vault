@@ -1,4 +1,4 @@
-import { describe, expect, it } from '@jest/globals';
+import { describe, expect, it, jest } from '@jest/globals';
 import Fastify from 'fastify';
 import { PiiRegistryService, type PiiDeclarationStore } from '../src/services/pii-registry-service.js';
 import { buildManualEntry } from '../src/services/pii-registry-validation.js';
@@ -185,6 +185,67 @@ describe('piiRegistryRoutes write API (auth + lifecycle)', () => {
     expect(del.statusCode).toBe(200);
     const listAfter = await app.inject({ method: 'GET', url: '/pii-registry/resources', headers: { 'x-tenant-id': 'acme' } });
     expect(JSON.parse(listAfter.body).count).toBe(0);
+
+    await app.close();
+  });
+
+  it('maintains the SHADOW_COPY view on declare and drops it on removal', async () => {
+    const ensureShadowCopy = jest.fn(async () => {});
+    const dropShadowCopyIfExists = jest.fn(async () => {});
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      sourceRedactionHook: { ensureShadowCopy, dropShadowCopyIfExists },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'SHADOW_COPY' },
+    });
+    expect(create.statusCode).toBe(201);
+    expect(ensureShadowCopy).toHaveBeenCalledWith(
+      expect.objectContaining({ resourceId: validInput.resourceId, sourceRedactionStrategy: 'SHADOW_COPY' })
+    );
+
+    const encoded = encodeURIComponent(validInput.resourceId);
+    const del = await app.inject({ method: 'DELETE', url: `/pii-registry/resources/${encoded}`, headers: auth });
+    expect(del.statusCode).toBe(200);
+    expect(dropShadowCopyIfExists).toHaveBeenCalledWith(
+      expect.objectContaining({ resourceId: validInput.resourceId })
+    );
+
+    await app.close();
+  });
+
+  it('surfaces a shadowCopyError without failing the declare when the hook throws', async () => {
+    const ensureShadowCopy = jest.fn(async () => {
+      throw new Error('permission denied creating view');
+    });
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      sourceRedactionHook: { ensureShadowCopy, dropShadowCopyIfExists: jest.fn(async () => {}) },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'SHADOW_COPY' },
+    });
+
+    // The declaration itself still succeeds -- the registry entry is the
+    // durable source of truth, and the shadow-copy view is best-effort but
+    // must never fail silently.
+    expect(create.statusCode).toBe(201);
+    expect(JSON.parse(create.body).resource.ownerConnector).toBe('manual');
+    expect(JSON.parse(create.body).shadowCopyError).toBe('permission denied creating view');
 
     await app.close();
   });
