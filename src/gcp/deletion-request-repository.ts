@@ -9,8 +9,12 @@ export class DeletionRequestRepository {
   private collectionName: string;
 
   constructor(projectId: string, collectionName: string, databaseId?: string) {
-    // databaseId is optional, so only pass if provided
-    this.db = new Firestore({ projectId, ...(databaseId && { databaseId }) });
+    // databaseId is optional, so only pass if provided. ignoreUndefinedProperties
+    // matches the precedent in pii-registry-declaration-repository.ts -- janitor
+    // wipe details (e.g. source-redaction results) only set a subset of fields
+    // depending on success/failure (rowsAffected vs error), and Firestore
+    // rejects literal `undefined` in an update() payload otherwise.
+    this.db = new Firestore({ projectId, ...(databaseId && { databaseId }), ignoreUndefinedProperties: true });
     this.collectionName = collectionName;
   }
 
