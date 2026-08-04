@@ -49,6 +49,14 @@ COPY --from=dependencies --chown=nodejs:nodejs /app/package*.json ./
 # Copy built application from builder stage
 COPY --from=builder --chown=nodejs:nodejs /build/dist ./dist
 
+# The runtime image starts the app directly via `node dist/main.js` (see CMD
+# below) -- it never shells out to npm/npx. node:22-alpine still ships both
+# with their own vendored node_modules (including a bundled ip-address,
+# flagged HIGH by the image scan -- CVE-2026-69192), which is pure unused
+# attack surface here. Stripping them is a real fix, not a scan workaround:
+# the vulnerable code genuinely isn't reachable in this image either way.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+
 # Set environment to production
 ENV NODE_ENV=production
 
