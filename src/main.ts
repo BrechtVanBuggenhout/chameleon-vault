@@ -46,6 +46,8 @@ import { piiRegistryRoutes } from './routes/pii-registry.js';
 import { analystClaimsRoutes } from './routes/analyst-claims.js';
 import { decryptedViewsRoutes } from './routes/decrypted-views.js';
 import { decryptedViewsDecryptRoutes } from './routes/decrypted-views-decrypt.js';
+import { piiVaultDecryptRoutes } from './routes/pii-vault-decrypt.js';
+import { PiiVaultLookupService } from './services/pii-vault-lookup.js';
 
 const logger = createLogger('main');
 
@@ -302,6 +304,24 @@ async function main() {
       dekKmsClient,
       allowedCallerUniqueId: process.env.DECRYPTED_VIEWS_CONNECTION_SA_UNIQUE_ID || '',
     });
+  }
+
+  // Ad-hoc single-value decrypt (the console's "Decrypt" page). Independent
+  // of decryptedViewsDataset above -- this route never touches the
+  // BigQuery connection/remote-function machinery decrypted views needs, it
+  // only needs to read pii_vault directly and decrypt server-side. Gated on
+  // PII_VAULT_RESOURCE_ID alone so an unconfigured deployment has zero
+  // surface area here, same "off by default" convention as decrypted views.
+  if (process.env.PII_VAULT_RESOURCE_ID) {
+    const piiVaultLookup = new PiiVaultLookupService(new BigQuery({ projectId }), process.env.PII_VAULT_RESOURCE_ID);
+    await fastify.register(piiVaultDecryptRoutes, {
+      piiVaultLookup,
+      firestoreRegistry,
+      dekKmsClient,
+      lineageRepository,
+    });
+  } else {
+    logger.info('PII_VAULT_RESOURCE_ID not set; ad-hoc decrypt is disabled');
   }
 
   const port = parseInt(process.env.PORT || '8080', 10);
