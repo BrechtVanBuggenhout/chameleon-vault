@@ -44,9 +44,12 @@ describe('PiiVaultSyncTrigger', () => {
     // The resolved URL, not the service name, becomes the OIDC audience --
     // that's what makes the minted token valid for this Cloud Run revision.
     expect(mockGetIdTokenClient).toHaveBeenCalledWith('https://pii-ingestor-worker-abc123.a.run.app');
+    // Always a full scan, never the daily job's incremental path -- see
+    // the trigger() docstring.
     expect(mockIdTokenRequest).toHaveBeenCalledWith({
       url: 'https://pii-ingestor-worker-abc123.a.run.app/api/v1/pii-vault-sync',
       method: 'POST',
+      data: { force_full_scan: true },
     });
     expect(result).toEqual({ status: 'ok', resources_queued: 1, chunks_queued: 3, errors: [] });
   });

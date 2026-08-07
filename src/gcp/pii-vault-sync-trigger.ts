@@ -63,6 +63,14 @@ export class PiiVaultSyncTrigger {
     const response = await idTokenClient.request<SyncTriggerResult>({
       url: `${workerUrl}/api/v1/pii-vault-sync`,
       method: 'POST',
+      // Always a full scan, never the daily job's incremental (watermark)
+      // path -- Sync Now is the customer's manual "did I miss something"
+      // lever (e.g. right after declaring a new field on an
+      // already-synced resource), which an incremental scan wouldn't
+      // catch since it has no concept of "field added, not row changed".
+      // The Cloud Scheduler-invoked daily run omits this entirely, which
+      // the worker treats as false.
+      data: { force_full_scan: true },
     });
     logger.info({ result: response.data }, 'On-demand PII vault sync triggered');
     return response.data;

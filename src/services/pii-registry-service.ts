@@ -15,6 +15,7 @@ import {
 export interface PiiDeclarationStore {
   upsert(entry: PiiRegistryEntry): Promise<void>;
   delete(tenantId: string, resourceId: string): Promise<void>;
+  advanceSyncWatermark(tenantId: string, resourceId: string, candidateIso: string): Promise<string | undefined>;
 }
 
 const GLOBAL_SCOPE = '*';
@@ -101,6 +102,34 @@ export class PiiRegistryService {
     await this.store?.delete(tenantId, resourceId);
     this.entries.delete(key);
     return true;
+  }
+
+  /**
+   * Advances a resource's sync watermark after chameleon-data-pipelines'
+   * daily/on-demand pii_vault sync successfully covers it. Persists through
+   * the store's compare-and-swap (see FirestorePiiDeclarationRepository.
+   * advanceSyncWatermark) first, then updates the in-memory hot-path copy to
+   * whatever the store says actually landed -- not blindly to candidateIso,
+   * since a concurrent, later-finishing run may have already advanced it
+   * further.
+   */
+  async markResourceSynced(
+    resourceId: string,
+    tenantId: string,
+    candidateIso: string
+  ): Promise<PiiRegistryEntry | undefined> {
+    const key = PiiRegistryService.keyOf(tenantId, resourceId);
+    const existing = this.entries.get(key);
+    if (!existing) {
+      return undefined;
+    }
+    if (existing.ownerConnector !== MANUAL_OWNER_CONNECTOR) {
+      throw new RegistryMutationError('Only manually declared entries can be marked synced.', 'IMMUTABLE_OWNER');
+    }
+    const stored = (await this.store?.advanceSyncWatermark(tenantId, resourceId, candidateIso)) ?? candidateIso;
+    const updated: PiiRegistryEntry = { ...existing, lastSyncedAt: stored };
+    this.entries.set(key, updated);
+    return updated;
   }
 
   evaluateAll(tenantId?: string): RegistryPolicyEvaluation[] {

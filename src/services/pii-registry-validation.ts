@@ -146,6 +146,7 @@ export function buildManualEntry(
     visibility: input.visibility ?? 'CUSTOMER_FACING',
     tenantIdColumn: input.tenantIdColumn,
     userIdColumn: input.userIdColumn,
+    updatedAtColumn: input.updatedAtColumn,
     piiFields,
     ownerConnector: MANUAL_OWNER_CONNECTOR,
     lineageDestination: input.resourceId,

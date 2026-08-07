@@ -90,6 +90,23 @@ export interface PiiRegistryEntry {
   visibility?: PiiResourceVisibility;
   tenantIdColumn?: string;
   userIdColumn?: string;
+  /**
+   * Which source-table column tracks last-modified, if the customer has
+   * declared one -- lets chameleon-data-pipelines' daily pii_vault sync scan
+   * only rows changed since lastSyncedAt instead of the whole table every
+   * day. Opt-in: only 'manual' resources with both this AND lastSyncedAt set
+   * get incremental treatment (see pii_vault_sync.py); absent, the resource
+   * keeps the original full-scan behavior unchanged.
+   */
+  updatedAtColumn?: string;
+  /**
+   * Server-managed watermark (ISO8601), advanced only via
+   * POST /pii-registry/resources/:resourceId/mark-synced -- never set
+   * directly through the declare/update API. Cleared (not left stale)
+   * whenever updatedAtColumn is cleared, so a resource can't be stuck
+   * thinking it's incremental-eligible after a customer turns it off.
+   */
+  lastSyncedAt?: string;
   piiFields: PiiFieldPolicy[];
   ownerConnector: string;
   lineageDestination: string;
@@ -131,6 +148,8 @@ export interface PiiRegistryDeclarationInput {
   visibility?: PiiResourceVisibility;
   tenantIdColumn?: string;
   userIdColumn?: string;
+  /** See PiiRegistryEntry.updatedAtColumn. Omit or send an empty string to clear it. */
+  updatedAtColumn?: string;
   piiFields: PiiFieldDeclarationInput[];
   deletionStrategy?: DeletionStrategy;
   /** Only meaningful for manually-declared resources. Defaults to 'NONE'. */

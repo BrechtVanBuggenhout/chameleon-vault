@@ -1,4 +1,4 @@
-import { Firestore } from '@google-cloud/firestore';
+import { FieldValue, Firestore } from '@google-cloud/firestore';
 import { createLogger } from '../logging/index.js';
 import type { PiiDeclarationStore } from '../services/pii-registry-service.js';
 import type { PiiRegistryEntry } from '../types/pii-registry.js';
@@ -51,10 +51,24 @@ export class FirestorePiiDeclarationRepository implements PiiDeclarationStore {
     if (!entry.tenantId) {
       throw new Error('Cannot persist a declaration without a tenantId.');
     }
+    // ignoreUndefinedProperties strips an undefined updatedAtColumn before
+    // the write, and .set(..., {merge:true}) then leaves whatever was
+    // already in Firestore untouched -- correct for lastSyncedAt (a normal
+    // declare/update that doesn't mention it should never wipe it), but
+    // wrong for updatedAtColumn itself: a customer clearing it in the
+    // console must actually delete it, not silently keep the old value.
+    // When it's being cleared, also delete lastSyncedAt, so a later
+    // re-declare of the same column starts with a clean watermark rather
+    // than resuming from a stale one.
+    const payload: Record<string, unknown> = { ...entry };
+    if (!entry.updatedAtColumn) {
+      payload.updatedAtColumn = FieldValue.delete();
+      payload.lastSyncedAt = FieldValue.delete();
+    }
     await this.db
       .collection(this.collectionName)
       .doc(this.docId(entry.tenantId, entry.resourceId))
-      .set(entry, { merge: true });
+      .set(payload, { merge: true });
     // Audit mirror is best-effort and must never block the durable write path.
     await this.auditMirror?.record(entry);
   }
@@ -62,5 +76,31 @@ export class FirestorePiiDeclarationRepository implements PiiDeclarationStore {
   async delete(tenantId: string, resourceId: string): Promise<void> {
     await this.db.collection(this.collectionName).doc(this.docId(tenantId, resourceId)).delete();
     await this.auditMirror?.recordDeletion(tenantId, resourceId);
+  }
+
+  /**
+   * Advances lastSyncedAt only if candidateIso is genuinely newer than
+   * what's already stored -- plain last-write-wins would let an
+   * overlapping daily-scheduler run and a manually-triggered Sync Now
+   * regress the watermark (not data-unsafe given pii_vault_sync.py's own
+   * per-user-per-field idempotency, but it would silently defeat the
+   * incremental optimization on a recurring basis). Returns the resulting
+   * stored value either way, so the caller's in-memory copy stays correct
+   * even when this call's candidate was rejected.
+   */
+  async advanceSyncWatermark(tenantId: string, resourceId: string, candidateIso: string): Promise<string | undefined> {
+    const docRef = this.db.collection(this.collectionName).doc(this.docId(tenantId, resourceId));
+    return this.db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(docRef);
+      if (!snapshot.exists) {
+        throw new Error(`No declaration found for ${resourceId} (tenant ${tenantId}) to mark synced.`);
+      }
+      const current = (snapshot.data() as PiiRegistryEntry).lastSyncedAt;
+      if (current && new Date(current).getTime() >= new Date(candidateIso).getTime()) {
+        return current;
+      }
+      transaction.set(docRef, { lastSyncedAt: candidateIso }, { merge: true });
+      return candidateIso;
+    });
   }
 }

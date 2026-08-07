@@ -19,11 +19,21 @@ const validInput: PiiRegistryDeclarationInput = {
 class FakeStore implements PiiDeclarationStore {
   public upserts: PiiRegistryEntry[] = [];
   public deletes: Array<{ tenantId: string; resourceId: string }> = [];
+  public watermarks = new Map<string, string>();
   async upsert(entry: PiiRegistryEntry): Promise<void> {
     this.upserts.push(entry);
   }
   async delete(tenantId: string, resourceId: string): Promise<void> {
     this.deletes.push({ tenantId, resourceId });
+  }
+  async advanceSyncWatermark(tenantId: string, resourceId: string, candidateIso: string): Promise<string> {
+    const key = `${tenantId}:${resourceId}`;
+    const current = this.watermarks.get(key);
+    if (!current || new Date(candidateIso).getTime() > new Date(current).getTime()) {
+      this.watermarks.set(key, candidateIso);
+      return candidateIso;
+    }
+    return current;
   }
 }
 
@@ -36,6 +46,16 @@ describe('buildManualEntry (validation)', () => {
     expect(entry?.tenantId).toBe('acme');
     expect(entry?.status).toBe('PENDING_REVIEW');
     expect(entry?.piiFields[0].confidence).toBe('DECLARED');
+  });
+
+  it('carries updatedAtColumn through from the input to the built entry', () => {
+    const { entry } = buildManualEntry({ ...validInput, updatedAtColumn: 'modified_at' }, 'acme');
+    expect(entry?.updatedAtColumn).toBe('modified_at');
+  });
+
+  it('leaves updatedAtColumn undefined when not supplied', () => {
+    const { entry } = buildManualEntry(validInput, 'acme');
+    expect(entry?.updatedAtColumn).toBeUndefined();
   });
 
   it('collects errors for bad enums and empty fields', () => {

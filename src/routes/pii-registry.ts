@@ -315,4 +315,39 @@ export async function piiRegistryRoutes(
       return reply.status(500).send({ error: 'Failed to remove declaration', statusCode: 500 });
     }
   });
+
+  // Called by chameleon-data-pipelines' PiiVaultSyncJob after a resource's
+  // enumerate_resource() succeeds, to advance the watermark incremental
+  // syncs filter on (see updatedAtColumn/lastSyncedAt on PiiRegistryEntry).
+  // Worker-only in practice, but gated the same way as sync-now/declare
+  // rather than a separate internal auth mechanism.
+  fastify.post(
+    '/pii-registry/resources/:resourceId/mark-synced',
+    { preHandler: requireWriteAuth },
+    async (request, reply) => {
+      const { resourceId } = request.params as { resourceId: string };
+      const { lastSyncedAt } = (request.body ?? {}) as { lastSyncedAt?: string };
+      if (!lastSyncedAt || Number.isNaN(new Date(lastSyncedAt).getTime())) {
+        return reply.status(400).send({ error: 'lastSyncedAt must be a valid ISO8601 timestamp', statusCode: 400 });
+      }
+
+      try {
+        const updated = await piiRegistryService.markResourceSynced(
+          decodeURIComponent(resourceId),
+          tenantOf(request),
+          lastSyncedAt
+        );
+        if (!updated) {
+          return reply.status(404).send({ error: 'No manual declaration found for this tenant', statusCode: 404 });
+        }
+        return reply.send({ resourceId: updated.resourceId, lastSyncedAt: updated.lastSyncedAt, timestamp: new Date().toISOString() });
+      } catch (error) {
+        if (error instanceof RegistryMutationError) {
+          return reply.status(409).send({ error: error.message, code: error.code, statusCode: 409 });
+        }
+        logger.error({ error }, 'Failed to advance PII vault sync watermark');
+        return reply.status(500).send({ error: 'Failed to advance sync watermark', statusCode: 500 });
+      }
+    }
+  );
 }
