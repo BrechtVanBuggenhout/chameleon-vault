@@ -8,6 +8,7 @@ import { CertificateLineageItem, DestructionCertificateClaims, KeyStatus } from 
 import { DeletionRequest } from '../types/deletion-request.js';
 import { createLogger } from '../logging/index.js';
 import { GCSClient } from '../gcp/gcs-client.js';
+import { connectorRegistry } from './registry.js';
 
 const logger = createLogger('certificate-service');
 
@@ -86,6 +87,12 @@ export class CertificateService {
 
     const keyDestructionStatus = (keyStatus.status === 'SHREDDED' || keyStatus.status === 'DELETED') ? 'COMPLETE' : 'PENDING';
 
+    // See assertCascadeComplete: reachable only once every attempted
+    // destination in janitor_wipes succeeded, so checked === succeeded here
+    // in practice -- both are stated so the claim is self-contained.
+    const destinationsChecked = deletionRequest.janitor_wipes?.length ?? 0;
+    const destinationsSucceeded = (deletionRequest.janitor_wipes || []).filter(w => w.status === 'SUCCEEDED').length;
+
     const claims: Omit<DestructionCertificateClaims, 'previousCertificateHash' | 'chainSequence'> = {
       iss: 'Chameleon Key Vault',
       sub: userId,
@@ -93,6 +100,7 @@ export class CertificateService {
       tenant_id: tenantId,
       user_id: userId, // Add snake_case alias for auditors
       keyDestructionStatus,
+      keyDestructionMethod: 'DEK_ERASURE',
       warehouseData: 'CRYPTOGRAPHICALLY UNREADABLE',
       iat: Math.floor(Date.now() / 1000),
       jti: `cert_${userId}_${Date.now()}`,
@@ -100,8 +108,14 @@ export class CertificateService {
       shred_date: keyStatus.shredAt ?? new Date().toISOString(), // Add snake_case alias for auditors
       keyFingerprint: await this.getKeyFingerprint(),
       lineageSummary,
+      lineageCoverage: {
+        destinationsChecked,
+        destinationsSucceeded,
+        knownDestinationTypes: connectorRegistry.getRegisteredConnectorNames(),
+      },
       ghostDataSummary,
       ghost_data_summary: ghostDataSummary,
+      ghostDataScanCoverage: 'NOT_TRACKED',
     };
 
     return claims;
@@ -172,6 +186,26 @@ export class CertificateService {
     const claims = await this.generateCertificateClaims(userId, tenantId, deletionRequest.deletion_request_id);
     const certificate = await this.signCertificate({ ...claims, previousCertificateHash: null, chainSequence: null });
     return { certificate, stored: false };
+  }
+
+  /**
+   * Looks up a previously-issued certificate by its own hash -- the backing
+   * lookup for chain-continuity verification (walking previousCertificateHash
+   * backward through a tenant's chain, see scripts/verify-cert.ts). Public by
+   * design: a hash is only known to someone who already holds a real chained
+   * certificate (it's the previousCertificateHash inside it), so this can't
+   * be used to enumerate a tenant's certificate history the way a
+   * by-sequence lookup could.
+   */
+  async getCertificateByHash(certificateHash: string): Promise<{ certificate: string } | null> {
+    const entry = await this.chainRepository.getEntryByHash(certificateHash);
+    if (!entry) return null;
+
+    const deletionRequest = await this.deletionRequestRepo.getDeletionRequest(entry.deletion_request_id);
+    if (!deletionRequest?.certificate_gcs_path) return null;
+
+    const stored = await this.gcsClient.downloadCertificate(deletionRequest.certificate_gcs_path);
+    return { certificate: stored.certificate };
   }
 
   // Base (unversioned) path of the signing CryptoKey -- static for the

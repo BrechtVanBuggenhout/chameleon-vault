@@ -18,6 +18,13 @@ export class ConnectorRegistry {
   getConnector(name: string): IWipeConnector | undefined {
     return this.connectors.get(name.toLowerCase());
   }
+
+  // The set of destination *types* this system knows how to wipe -- used by
+  // certificate claims to state coverage honestly (what we can check) rather
+  // than implying it's every system a user's data ever touched.
+  getRegisteredConnectorNames(): string[] {
+    return Array.from(this.connectors.keys());
+  }
 }
 
 export const connectorRegistry = new ConnectorRegistry();

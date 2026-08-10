@@ -10,6 +10,21 @@ export interface CertificateLineageItem {
   timestamp: string;
 }
 
+export interface CertificateLineageCoverage {
+  // Destinations the janitor actually attempted a wipe against for this
+  // deletion -- not "every system this user's data ever touched" (there is
+  // no source of truth for that). CASCADE_COMPLETE is only reachable once
+  // every attempted destination succeeds, so checked === succeeded in
+  // practice; both are stated so the claim doesn't need the reader to know
+  // that invariant.
+  destinationsChecked: number;
+  destinationsSucceeded: number;
+  // The connector types this system is capable of wiping at all -- states
+  // the scope of what "checked" can mean, so the claim can't be misread as
+  // exhaustive coverage of every system that might hold this user's data.
+  knownDestinationTypes: string[];
+}
+
 export interface CertificateGhostDataItem {
   scope: 'USER_LINKED' | 'RESOURCE_LEVEL';
   resourceId: string;
@@ -33,9 +48,22 @@ export interface DestructionCertificateClaims {
   shred_date?: string;   // snake_case alias for shredDate
   keyFingerprint: string;// Hash of destroyed key metadata
   lineageSummary: CertificateLineageItem[];
+  lineageCoverage: CertificateLineageCoverage;
   ghostDataSummary?: CertificateGhostDataItem[];
   ghost_data_summary?: CertificateGhostDataItem[];
+  // Ghost-data findings above are real when present, but an empty array is
+  // ambiguous on its own -- this makes explicit that no scanner in this
+  // system currently records *what was scanned*, only matches it happened to
+  // find, so absence of findings must not be read as "confirmed scanned, zero
+  // found." 'NOT_TRACKED' until a real scan-coverage source exists.
+  ghostDataScanCoverage: 'NOT_TRACKED';
   keyDestructionStatus?: string;
+  // What "destroyed" actually means here: the per-user DEK ciphertext was
+  // erased from Firestore (crypto-shred), a synchronous operation -- not a
+  // Cloud KMS CryptoKeyVersion.destroy() call, which has a mandatory ~24h
+  // scheduling window that doesn't apply to this design. Stated explicitly
+  // so keyDestructionStatus: COMPLETE can't be misread as a KMS-level claim.
+  keyDestructionMethod: 'DEK_ERASURE';
   warehouseData?: string;
   user_id?: string;      // snake_case alias for sub (userId)
   // Hash chain over this tenant's certificate log -- null on the very first

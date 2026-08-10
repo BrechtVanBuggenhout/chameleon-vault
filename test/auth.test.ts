@@ -31,6 +31,25 @@ describe('isExemptFromAuth', () => {
     expect(isExemptFromAuth('/decrypted-views')).toBe(false);
     expect(isExemptFromAuth('/decrypted-views/some-view')).toBe(false);
   });
+
+  it('exempts the public verification endpoints -- an outside auditor has no VAULT_API_KEY, and these carry no secret', () => {
+    expect(isExemptFromAuth('/public-key')).toBe(true);
+    expect(isExemptFromAuth('/.well-known/jwks.json')).toBe(true);
+  });
+
+  it('exempts certificate-chain-by-hash lookups for any hash -- only reachable by someone who already holds a real chained certificate', () => {
+    expect(isExemptFromAuth('/certificate-chain/by-hash/abc123')).toBe(true);
+    expect(isExemptFromAuth(`/certificate-chain/by-hash/${'f'.repeat(64)}`)).toBe(true);
+  });
+
+  it('does NOT exempt /certificate/:userId -- that is the internal lookup API, not the verification surface', () => {
+    expect(isExemptFromAuth('/certificate/user123')).toBe(false);
+  });
+
+  it('does NOT exempt the certificate-chain collection route (no hash segment)', () => {
+    expect(isExemptFromAuth('/certificate-chain/by-hash')).toBe(false);
+    expect(isExemptFromAuth('/certificate-chain/by-hash/')).toBe(false);
+  });
 });
 
 describe('resolveAuth', () => {

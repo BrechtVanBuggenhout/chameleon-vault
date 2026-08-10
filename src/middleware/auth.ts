@@ -24,8 +24,31 @@ const ANALYST_CREDENTIAL_ALLOWED_PATHS = new Set(['/encrypt', '/decrypt']);
 // since neither of those mechanisms fit a machine-to-machine BigQuery caller.
 const DECRYPTED_VIEWS_BATCH_DECRYPT_PATH = '/internal/decrypted-views/batch-decrypt';
 
+// The whole point of publishing these is zero-trust verification by someone
+// who has never had a relationship with Chameleon -- an outside auditor who
+// received a certificate JWT from a customer, with no VAULT_API_KEY of their
+// own. Gating them behind the shared key would make that impossible while
+// looking like it worked (verify-cert.ts would just 401 for exactly the
+// audience it's meant to serve). Neither endpoint returns anything secret --
+// a KMS asymmetric-sign public key and a JWKS document, by definition.
+const PUBLIC_VERIFICATION_PATHS = new Set(['/public-key', '/.well-known/jwks.json']);
+
+// Same reasoning as PUBLIC_VERIFICATION_PATHS above, for chain-continuity
+// lookups: a hash is only ever known to someone who already holds a real
+// chained certificate, so exposing this by-hash lookup unauthenticated
+// doesn't let anyone enumerate a tenant's certificate history -- see
+// CertificateChainEntry in types/certificate-chain.ts.
+const CHAIN_BY_HASH_ROUTE_PATTERN = /^\/certificate-chain\/by-hash\/[^/]+$/;
+
 export function isExemptFromAuth(path: string): boolean {
-  return path === '/health' || CLAIM_ROUTE_PATTERN.test(path) || path === DECRYPTED_VIEWS_BATCH_DECRYPT_PATH;
+  return (
+    path === '/health' ||
+    path === '/version' ||
+    CLAIM_ROUTE_PATTERN.test(path) ||
+    path === DECRYPTED_VIEWS_BATCH_DECRYPT_PATH ||
+    PUBLIC_VERIFICATION_PATHS.has(path) ||
+    CHAIN_BY_HASH_ROUTE_PATTERN.test(path)
+  );
 }
 
 export async function resolveAuth(

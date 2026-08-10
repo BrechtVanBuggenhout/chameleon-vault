@@ -171,9 +171,13 @@ await jest.unstable_mockModule('../src/gcp/gcs-client.js', () => ({
 // AnalystAccessRepository's equivalent transaction, tested the same way,
 // at the service level with the repository mocked away).
 const mockChainStore = new Map<string, { sequence: number; lastHash: string | null }>();
+// Mirrors the real certificate_chain_entries index -- keyed by the
+// certificate's own hash, written alongside the chain head. Backs the fake
+// getEntryByHash below, the same way mockGcsStore backs downloadCertificate.
+const mockChainEntriesStore = new Map<string, { tenant_id: string; sequence: number; previous_hash: string | null; deletion_request_id: string }>();
 const mockAppendToChain = jest.fn(async (
   tenantId: string,
-  _deletionRequestId: string,
+  deletionRequestId: string,
   sign: (previousHash: string | null, sequence: number) => Promise<{ certificate: string; certificateHash: string }>
 ) => {
   const current = mockChainStore.get(tenantId) ?? { sequence: 0, lastHash: null };
@@ -181,12 +185,20 @@ const mockAppendToChain = jest.fn(async (
   const sequence = current.sequence + 1;
   const result = await sign(previousHash, sequence);
   mockChainStore.set(tenantId, { sequence, lastHash: result.certificateHash });
+  mockChainEntriesStore.set(result.certificateHash, {
+    tenant_id: tenantId,
+    sequence,
+    previous_hash: previousHash,
+    deletion_request_id: deletionRequestId,
+  });
   return { ...result, previousHash, sequence };
 });
+const mockGetEntryByHash = jest.fn(async (hash: string) => mockChainEntriesStore.get(hash) ?? null);
 
 await jest.unstable_mockModule('../src/gcp/certificate-chain-repository.js', () => ({
   CertificateChainRepository: class {
     appendToChain = mockAppendToChain;
+    getEntryByHash = mockGetEntryByHash;
   }
 }));
 
@@ -228,6 +240,7 @@ describe('Certificate API Integration Tests', () => {
     mockDeletionRequestStore.clear();
     mockGcsStore.clear();
     mockChainStore.clear();
+    mockChainEntriesStore.clear();
     mockAsymmetricSign.mockClear();
     mockGetNewestEnabledVersion.mockClear();
     mockListEnabledVersions.mockClear();
@@ -236,6 +249,7 @@ describe('Certificate API Integration Tests', () => {
     mockUploadCertificate.mockClear();
     mockDownloadCertificate.mockClear();
     mockAppendToChain.mockClear();
+    mockGetEntryByHash.mockClear();
   });
 
   it('GET /public-key should return the PEM public key', async () => {
@@ -316,6 +330,22 @@ describe('Certificate API Integration Tests', () => {
       }),
     ]);
     expect(claims.ghost_data_summary).toEqual(claims.ghostDataSummary);
+
+    // Coverage is stated honestly: both destinations were actually checked
+    // (and both succeeded, per the CASCADE_COMPLETE invariant), scoped to
+    // the connector types this system can wipe -- not implied as exhaustive.
+    expect(claims.lineageCoverage).toEqual({
+      destinationsChecked: 2,
+      destinationsSucceeded: 2,
+      knownDestinationTypes: expect.arrayContaining(['hubspot', 'salesforce']),
+    });
+    // No scanner in this system records what was scanned, only matches it
+    // happened to find -- the findings above must not be read as "confirmed
+    // scanned, zero elsewhere found" without this flag alongside them.
+    expect(claims.ghostDataScanCoverage).toBe('NOT_TRACKED');
+    // States the actual mechanism (Firestore DEK erasure), not a Cloud KMS
+    // key-destroy call -- see certificate-service.ts / ARCHITECTURE.md.
+    expect(claims.keyDestructionMethod).toBe('DEK_ERASURE');
   });
 
   it('GET /certificate/:userId should never surface a FAILED wipe, even defensively', async () => {
@@ -462,6 +492,46 @@ describe('Certificate API Integration Tests', () => {
 
     expect(stored.chainSequence).toBe(1);
     expect(stored.previousCertificateHash).toBeNull();
+  });
+});
+
+describe('GET /certificate-chain/by-hash/:hash', () => {
+  function setupShreddedUser(userId: string): void {
+    mockRegistryStore.set(userId, { status: 'SHREDDED', shredAt: '2026-06-02T10:00:00Z' });
+    mockDeletionRequestStore.set(userId, { status: 'CASCADE_COMPLETE', janitor_wipes: [] });
+  }
+
+  it('returns the certificate whose hash matches, letting a verifier walk one chain link backward', async () => {
+    setupShreddedUser('by-hash-1a');
+    setupShreddedUser('by-hash-1b');
+
+    const first = await certificateService.issueAndStoreCertificate('by-hash-1a', 'del_by-hash-1a', 'tenant-by-hash');
+    // Mirrors what deletion-request-service.ts does once issuance succeeds --
+    // the by-hash lookup resolves through the deletion request's stored
+    // certificate_gcs_path, same as GET /certificate/:userId does.
+    mockDeletionRequestStore.set('by-hash-1a', { status: 'CERTIFICATE_ISSUED', janitor_wipes: [], certificate_gcs_path: first.gcsPath });
+
+    const second = await certificateService.issueAndStoreCertificate('by-hash-1b', 'del_by-hash-1b', 'tenant-by-hash');
+    const secondClaims = JSON.parse(Buffer.from(second.certificate.split('.')[1], 'base64url').toString());
+
+    // The link a verifier would actually follow: the second certificate's
+    // previousCertificateHash should resolve back to the exact first one.
+    const response = await app.inject({
+      method: 'GET',
+      url: `/certificate-chain/by-hash/${secondClaims.previousCertificateHash}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).certificate).toBe(first.certificate);
+  });
+
+  it('returns 404 for a hash no certificate was ever issued with', async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/certificate-chain/by-hash/not-a-real-hash',
+    });
+
+    expect(response.statusCode).toBe(404);
   });
 });
 

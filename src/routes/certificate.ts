@@ -46,6 +46,33 @@ export async function certificateRoutes(
   });
 
   /**
+   * GET /certificate-chain/by-hash/:hash
+   * Returns the certificate whose own hash matches :hash -- lets a verifier
+   * (see scripts/verify-cert.ts) walk previousCertificateHash backward
+   * through a tenant's chain one link at a time. Unauthenticated by design:
+   * see CertificateChainEntry / CertificateService.getCertificateByHash for
+   * why a hash-keyed lookup can't be used to enumerate a tenant's history.
+   */
+  fastify.get('/certificate-chain/by-hash/:hash', async (request, reply) => {
+    const { hash } = request.params as { hash: string };
+
+    try {
+      const result = await certificateService.getCertificateByHash(hash);
+      if (!result) {
+        return reply.status(404).send({
+          statusCode: 404,
+          error: 'Not found',
+          message: `No certificate found with hash ${hash}`,
+        });
+      }
+      return { ...result, timestamp: new Date().toISOString() };
+    } catch (error) {
+      logger.error({ error, hash }, 'Failed to look up certificate by hash');
+      throw error;
+    }
+  });
+
+  /**
    * GET /public-key
    * Returns the PEM-encoded public key used to verify certificates.
    */
