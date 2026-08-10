@@ -38,6 +38,7 @@ import type { PiiRegistryEntry } from './types/pii-registry.js';
 
 // Import Routes
 import { healthRoutes } from './routes/health.js';
+import { versionRoutes } from './routes/version.js';
 import { cryptoRoutes } from './routes/crypto.js';
 import { lineageRoutes } from './routes/lineage.js';
 import { deletionRequestRoutes } from './routes/deletion-requests.js';
@@ -281,6 +282,7 @@ async function main() {
 
   // 4. Register Routes with Injected Dependencies
   await fastify.register(healthRoutes); // Health routes don't have external dependencies
+  await fastify.register(versionRoutes);
   await fastify.register(cryptoRoutes, { kmsClient: dekKmsClient, firestoreRegistry, lineageRepository, deletionRequestService });
   await fastify.register(lineageRoutes, { lineageRepository, firestoreRegistry, janitorService });
   await fastify.register(deletionRequestRoutes, { deletionRequestService });
