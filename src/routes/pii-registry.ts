@@ -23,7 +23,7 @@ export interface SchemaSource {
 
 /** Narrow dependency: just the on-demand sync trigger, so tests don't need real GCP auth. */
 export interface SyncTrigger {
-  trigger(): Promise<{
+  trigger(resourceId?: string): Promise<{
     status: string;
     resources_queued: number;
     chunks_queued: number;
@@ -215,8 +215,11 @@ export async function piiRegistryRoutes(
     if (!syncTrigger) {
       return reply.status(503).send({ error: 'On-demand sync is not configured', statusCode: 503 });
     }
+    // Optional -- when present, scopes this run to just that one declared
+    // resource instead of every manually-declared resource for the tenant.
+    const { resourceId } = (request.body as { resourceId?: string } | undefined) ?? {};
     try {
-      const result = await syncTrigger.trigger();
+      const result = await syncTrigger.trigger(resourceId);
       return reply.send({ ...result, timestamp: new Date().toISOString() });
     } catch (error) {
       logger.error({ error }, 'Failed to trigger on-demand PII vault sync');

@@ -57,7 +57,12 @@ export class PiiVaultSyncTrigger {
     return uri;
   }
 
-  async trigger(): Promise<SyncTriggerResult> {
+  /**
+   * @param resourceId When given, scopes the sync to just this one
+   * manually-declared resource instead of every declared resource for the
+   * tenant -- the console's per-row "Sync now" action.
+   */
+  async trigger(resourceId?: string): Promise<SyncTriggerResult> {
     const workerUrl = await this.resolveWorkerUrl();
     const idTokenClient = await this.auth.getIdTokenClient(workerUrl);
     const response = await idTokenClient.request<SyncTriggerResult>({
@@ -70,9 +75,9 @@ export class PiiVaultSyncTrigger {
       // catch since it has no concept of "field added, not row changed".
       // The Cloud Scheduler-invoked daily run omits this entirely, which
       // the worker treats as false.
-      data: { force_full_scan: true },
+      data: { force_full_scan: true, ...(resourceId ? { resource_id: resourceId } : {}) },
     });
-    logger.info({ result: response.data }, 'On-demand PII vault sync triggered');
+    logger.info({ result: response.data, resourceId }, 'On-demand PII vault sync triggered');
     return response.data;
   }
 }
