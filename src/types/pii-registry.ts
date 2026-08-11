@@ -107,6 +107,19 @@ export interface PiiRegistryEntry {
    * thinking it's incremental-eligible after a customer turns it off.
    */
   lastSyncedAt?: string;
+  /**
+   * Server-managed (ISO8601), advanced via
+   * POST /pii-registry/resources/:resourceId/mark-sync-attempted after
+   * *every* successful sync run for this resource -- full scan or
+   * incremental, regardless of whether updatedAtColumn is set. Distinct
+   * from lastSyncedAt on purpose: lastSyncedAt is specifically the
+   * incremental watermark, which stays unset for a resource with no
+   * updatedAtColumn even though real full syncs have genuinely completed
+   * for it (a resource "never synced" and one that's synced many times via
+   * full scans looked identical from the registry UI before this existed).
+   * Console displays this for "last synced," not lastSyncedAt.
+   */
+  lastSyncAttemptAt?: string;
   piiFields: PiiFieldPolicy[];
   ownerConnector: string;
   lineageDestination: string;

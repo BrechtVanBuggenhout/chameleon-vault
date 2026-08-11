@@ -79,8 +79,21 @@ export class JanitorService {
           }
         }).catch(err => logger.error({ err }, 'Failed to record SaaS_WIPE_STARTED'));
 
-        const response = await connector.wipe(userId, tenantId);
-        
+        // Today's connectors always catch internally and return
+        // {success:false, error}, but that's an unenforced invariant, not a
+        // guarantee -- a future connector (or an unexpected error class,
+        // e.g. a DNS failure axios doesn't wrap the way we expect) could
+        // throw instead. Treat a throw identically to a failure response
+        // rather than letting it escape: an uncaught exception here would
+        // reject processCleanup's caller's Promise.all, silently stalling
+        // the whole deletion cascade at CASCADE_PENDING forever with no
+        // visible failure state (see deletion-request-service.ts).
+        const response = await connector.wipe(userId, tenantId).catch((err: unknown) => ({
+          success: false as const,
+          destination: task.destination,
+          error: err instanceof Error ? err.message : String(err),
+        }));
+
         if (response.success) {
           success = true;
           recordsFound = response.recordsFound;

@@ -225,6 +225,35 @@ describe('DeletionRequestService - cascade outcome gates certificate issuance', 
     expect(currentRequest.status).toBe('CERTIFICATE_ISSUED');
     expect(mockCertificateService.issueAndStoreCertificate).toHaveBeenCalledWith('user-1', 'del-1', 'default-tenant');
   });
+
+  it('force-recovers into CASCADE_PARTIAL_FAILURE, never a silent stall, when certificate issuance throws after CASCADE_COMPLETE', async () => {
+    // Every SaaS wipe succeeds, so the cascade reaches CASCADE_COMPLETE and
+    // recurses into CERTIFICATE_ISSUED for real -- but certificate issuance
+    // itself throws. Before this fix, that exception would only be logged,
+    // leaving the request sitting at CASCADE_COMPLETE forever with no
+    // visible error and no certificate.
+    mockJanitorService.processCleanup.mockResolvedValue([
+      { userId: 'user-1', destination: 'hubspot', status: 'COMPLETE', attempts: 1 },
+    ]);
+    mockCertificateService.issueAndStoreCertificate.mockRejectedValue(new Error('KMS signing key unavailable'));
+
+    await service.advanceRequest('del-1', 'CASCADE_PENDING', 'op-1');
+    await flushMicrotasks();
+
+    expect(currentRequest.status).toBe('CASCADE_PARTIAL_FAILURE');
+    // failedDestinations is recorded via the lineage event (existing
+    // behavior for this transition), not persisted onto the request
+    // document itself -- confirm the internal error made it into that trail
+    // rather than only a server log line.
+    expect(mockLineageRepository.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'CASCADE_PARTIAL_FAILURE',
+        context: {
+          failedDestinations: expect.arrayContaining([expect.stringContaining('KMS signing key unavailable')]),
+        },
+      })
+    );
+  });
 });
 
 describe('DeletionRequestService - source redaction integration', () => {

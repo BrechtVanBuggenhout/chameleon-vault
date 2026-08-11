@@ -353,4 +353,46 @@ export async function piiRegistryRoutes(
       }
     }
   );
+
+  // Called by chameleon-data-pipelines' PiiVaultSyncJob after *every*
+  // successful enumerate_resource() run, full scan or incremental --
+  // unlike mark-synced above, not gated on updatedAtColumn being set. See
+  // PiiRegistryEntry.lastSyncAttemptAt for why this is a separate signal:
+  // a resource with no updatedAtColumn genuinely syncs (real data lands)
+  // but never advances the incremental watermark, which made the registry
+  // UI permanently show "Never synced" for it regardless of how many
+  // times it actually ran.
+  fastify.post(
+    '/pii-registry/resources/:resourceId/mark-sync-attempted',
+    { preHandler: requireWriteAuth },
+    async (request, reply) => {
+      const { resourceId } = request.params as { resourceId: string };
+      const { lastSyncAttemptAt } = (request.body ?? {}) as { lastSyncAttemptAt?: string };
+      if (!lastSyncAttemptAt || Number.isNaN(new Date(lastSyncAttemptAt).getTime())) {
+        return reply.status(400).send({ error: 'lastSyncAttemptAt must be a valid ISO8601 timestamp', statusCode: 400 });
+      }
+
+      try {
+        const updated = await piiRegistryService.markResourceSyncAttempted(
+          decodeURIComponent(resourceId),
+          tenantOf(request),
+          lastSyncAttemptAt
+        );
+        if (!updated) {
+          return reply.status(404).send({ error: 'No manual declaration found for this tenant', statusCode: 404 });
+        }
+        return reply.send({
+          resourceId: updated.resourceId,
+          lastSyncAttemptAt: updated.lastSyncAttemptAt,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        if (error instanceof RegistryMutationError) {
+          return reply.status(409).send({ error: error.message, code: error.code, statusCode: 409 });
+        }
+        logger.error({ error }, 'Failed to record PII vault sync attempt');
+        return reply.status(500).send({ error: 'Failed to record sync attempt', statusCode: 500 });
+      }
+    }
+  );
 }

@@ -4,6 +4,13 @@ import { createLogger } from '../../logging/index.js';
 
 const logger = createLogger('hubspot-connector');
 
+// Without an explicit timeout, axios waits forever on a hung connection --
+// worse than an error, since the caller (janitor.ts's retry loop) never
+// even sees a failure to retry against. 30s is generous for a REST call
+// against HubSpot's API while still failing fast enough that a genuinely
+// stuck connection doesn't stall the whole deletion cascade indefinitely.
+const REQUEST_TIMEOUT_MS = 30_000;
+
 export class HubSpotConnector implements IWipeConnector {
   readonly name = 'hubspot';
   private apiToken?: string;
@@ -46,6 +53,7 @@ export class HubSpotConnector implements IWipeConnector {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
           },
+          timeout: REQUEST_TIMEOUT_MS,
         }
       );
 
@@ -60,6 +68,7 @@ export class HubSpotConnector implements IWipeConnector {
       for (const contact of contacts) {
         await axios.delete(`${this.baseUrl}/${contact.id}`, {
           headers: { Authorization: `Bearer ${token}` },
+          timeout: REQUEST_TIMEOUT_MS,
         });
         logger.info({ userId, tenantId, contactId: contact.id }, 'Successfully wiped contact from HubSpot');
       }

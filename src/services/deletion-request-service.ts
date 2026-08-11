@@ -148,9 +148,30 @@ export class DeletionRequestService {
             await this.advanceRequest(deletionRequestId, nextStatus, operationId, {
               failedDestinations: [...failedJanitor.map(r => r.destination), ...failedRedaction.map(r => r.resourceId)],
             });
-          }).catch(err =>
-            logger.error({ err, userId: request.user_id }, 'Janitor cleanup / source redaction loop failed')
-          );
+          }).catch(async (err) => {
+            logger.error({ err, userId: request.user_id }, 'Janitor cleanup / source redaction loop failed');
+            // This only fires for a throw *inside* the .then() above --
+            // janitorService.processCleanup and
+            // sourceRedactionService.redactUserInDeclaredSources both catch
+            // internally and never reject the Promise.all itself. The most
+            // likely case is CASCADE_COMPLETE's own recursive advanceRequest
+            // into CERTIFICATE_ISSUED throwing (e.g. certificate issuance
+            // failing) -- CASCADE_COMPLETE has already been persisted by
+            // then, so the request would otherwise sit there silently,
+            // looking "done" with no certificate and no visible error.
+            // Force a terminal, visible failure state instead of only
+            // logging, so this never becomes another silent stall.
+            try {
+              await this.advanceRequest(deletionRequestId, 'CASCADE_PARTIAL_FAILURE', operationId, {
+                failedDestinations: [`internal-error: ${err instanceof Error ? err.message : String(err)}`],
+              });
+            } catch (recoveryErr) {
+              logger.error(
+                { recoveryErr, deletionRequestId },
+                'Failed to force deletion request into a visible failure state after cascade error'
+              );
+            }
+          });
         };
 
         logger.info({ deletionRequestId, userId: request.user_id }, 'Janitor cascade triggered for user');

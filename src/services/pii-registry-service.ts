@@ -16,6 +16,8 @@ export interface PiiDeclarationStore {
   upsert(entry: PiiRegistryEntry): Promise<void>;
   delete(tenantId: string, resourceId: string): Promise<void>;
   advanceSyncWatermark(tenantId: string, resourceId: string, candidateIso: string): Promise<string | undefined>;
+  /** Optional: implementations without lastSyncAttemptAt tracking can omit this. */
+  advanceLastSyncAttempt?(tenantId: string, resourceId: string, candidateIso: string): Promise<string | undefined>;
 }
 
 const GLOBAL_SCOPE = '*';
@@ -128,6 +130,32 @@ export class PiiRegistryService {
     }
     const stored = (await this.store?.advanceSyncWatermark(tenantId, resourceId, candidateIso)) ?? candidateIso;
     const updated: PiiRegistryEntry = { ...existing, lastSyncedAt: stored };
+    this.entries.set(key, updated);
+    return updated;
+  }
+
+  /**
+   * Records that a sync run genuinely completed for this resource,
+   * regardless of whether it was eligible for the incremental watermark
+   * above -- see PiiRegistryEntry.lastSyncAttemptAt for why this exists as
+   * a separate field. Same manual-only restriction and store-then-reconcile
+   * pattern as markResourceSynced.
+   */
+  async markResourceSyncAttempted(
+    resourceId: string,
+    tenantId: string,
+    candidateIso: string
+  ): Promise<PiiRegistryEntry | undefined> {
+    const key = PiiRegistryService.keyOf(tenantId, resourceId);
+    const existing = this.entries.get(key);
+    if (!existing) {
+      return undefined;
+    }
+    if (existing.ownerConnector !== MANUAL_OWNER_CONNECTOR) {
+      throw new RegistryMutationError('Only manually declared entries can be marked synced.', 'IMMUTABLE_OWNER');
+    }
+    const stored = (await this.store?.advanceLastSyncAttempt?.(tenantId, resourceId, candidateIso)) ?? candidateIso;
+    const updated: PiiRegistryEntry = { ...existing, lastSyncAttemptAt: stored };
     this.entries.set(key, updated);
     return updated;
   }

@@ -4,6 +4,12 @@ import { createLogger } from '../../logging/index.js';
 
 const logger = createLogger('salesforce-connector');
 
+// See hubspot-connector.ts's identical constant for why this exists: axios
+// has no default timeout, so a hung connection would otherwise stall the
+// whole deletion cascade indefinitely instead of failing into the existing
+// retry/DLQ path.
+const REQUEST_TIMEOUT_MS = 30_000;
+
 export class SalesforceConnector implements IWipeConnector {
   readonly name = 'salesforce';
   private readonly baseUrl = process.env.SALESFORCE_INSTANCE_URL || 'https://login.salesforce.com';
@@ -31,7 +37,8 @@ export class SalesforceConnector implements IWipeConnector {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json'
-        }
+        },
+        timeout: REQUEST_TIMEOUT_MS,
       });
 
       const records = queryResponse.data.records || [];
@@ -50,7 +57,8 @@ export class SalesforceConnector implements IWipeConnector {
         await axios.delete(`${deleteUrl}/${record.Id}`, {
           headers: {
             Authorization: `Bearer ${apiKey}`
-          }
+          },
+          timeout: REQUEST_TIMEOUT_MS,
         });
       }
 

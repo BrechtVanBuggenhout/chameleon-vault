@@ -103,4 +103,26 @@ export class FirestorePiiDeclarationRepository implements PiiDeclarationStore {
       return candidateIso;
     });
   }
+
+  /**
+   * Same monotonic-advance shape as advanceSyncWatermark, for the separate
+   * lastSyncAttemptAt field -- advanced after *every* successful sync run
+   * (full or incremental), unlike lastSyncedAt which only ever moves for a
+   * resource with updatedAtColumn set. See PiiRegistryEntry.lastSyncAttemptAt.
+   */
+  async advanceLastSyncAttempt(tenantId: string, resourceId: string, candidateIso: string): Promise<string | undefined> {
+    const docRef = this.db.collection(this.collectionName).doc(this.docId(tenantId, resourceId));
+    return this.db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(docRef);
+      if (!snapshot.exists) {
+        throw new Error(`No declaration found for ${resourceId} (tenant ${tenantId}) to mark sync-attempted.`);
+      }
+      const current = (snapshot.data() as PiiRegistryEntry).lastSyncAttemptAt;
+      if (current && new Date(current).getTime() >= new Date(candidateIso).getTime()) {
+        return current;
+      }
+      transaction.set(docRef, { lastSyncAttemptAt: candidateIso }, { merge: true });
+      return candidateIso;
+    });
+  }
 }

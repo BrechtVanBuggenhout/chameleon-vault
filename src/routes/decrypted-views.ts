@@ -72,7 +72,22 @@ export async function decryptedViewsRoutes(
     const tenantId = (request.headers['x-tenant-id'] as string) || 'default-tenant';
     try {
       const fields = await decryptedViewService.getAvailableFields(tenantId);
-      return { fields };
+      if (fields.length > 0) {
+        return { fields };
+      }
+      // Nothing found for this tenant -- before implying "never synced,"
+      // check whether data actually landed under a different tenant_id
+      // (a real, confirmed failure mode -- see getDistinctSyncedTenantIds'
+      // own docstring). Best-effort: a failure here shouldn't turn an
+      // already-legitimate empty result into a 500.
+      let otherTenantIdsWithData: string[] | undefined;
+      try {
+        const others = (await decryptedViewService.getDistinctSyncedTenantIds()).filter((t) => t !== tenantId);
+        if (others.length > 0) otherTenantIdsWithData = others;
+      } catch (diagnosticError) {
+        logger.warn({ diagnosticError, tenantId }, 'Failed to check for a tenant_id mismatch (non-fatal)');
+      }
+      return { fields, ...(otherTenantIdsWithData ? { otherTenantIdsWithData } : {}) };
     } catch (error) {
       logger.error({ error, tenantId }, 'Failed to list available pii_vault fields');
       return reply.status(500).send({

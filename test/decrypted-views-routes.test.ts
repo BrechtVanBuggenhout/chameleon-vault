@@ -7,13 +7,15 @@ function makeFakes() {
   const declareView = jest.fn();
   const revokeView = jest.fn();
   const getAvailableFields = jest.fn();
+  const getDistinctSyncedTenantIds = jest.fn().mockResolvedValue([]);
   const listByTenant = jest.fn();
   return {
-    decryptedViewService: { declareView, revokeView, getAvailableFields } as any,
+    decryptedViewService: { declareView, revokeView, getAvailableFields, getDistinctSyncedTenantIds } as any,
     decryptedViewsRepository: { listByTenant } as any,
     declareView,
     revokeView,
     getAvailableFields,
+    getDistinctSyncedTenantIds,
     listByTenant,
   };
 }
@@ -116,5 +118,58 @@ describe('Decrypted Views management routes', () => {
 
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).message).toContain('BigQuery unavailable');
+  });
+
+  it('GET /decrypted-views/available-fields does not check for a tenant mismatch when fields were actually found', async () => {
+    fakes.getAvailableFields.mockResolvedValue(['email']);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/decrypted-views/available-fields',
+      headers: { 'x-tenant-id': 't1' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fakes.getDistinctSyncedTenantIds).not.toHaveBeenCalled();
+  });
+
+  it('GET /decrypted-views/available-fields surfaces other tenant_ids with real data when this tenant has none', async () => {
+    fakes.getAvailableFields.mockResolvedValue([]);
+    fakes.getDistinctSyncedTenantIds.mockResolvedValue(['immoscoop-prod', 'default-tenant']);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/decrypted-views/available-fields',
+      headers: { 'x-tenant-id': 'default-tenant' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.fields).toEqual([]);
+    // Own tenant filtered out even though the fake returned it -- only a
+    // genuinely different tenant_id is a useful diagnostic.
+    expect(body.otherTenantIdsWithData).toEqual(['immoscoop-prod']);
+  });
+
+  it('GET /decrypted-views/available-fields omits otherTenantIdsWithData entirely when nothing has synced anywhere', async () => {
+    fakes.getAvailableFields.mockResolvedValue([]);
+    fakes.getDistinctSyncedTenantIds.mockResolvedValue([]);
+
+    const response = await app.inject({ method: 'GET', url: '/decrypted-views/available-fields' });
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.fields).toEqual([]);
+    expect(body).not.toHaveProperty('otherTenantIdsWithData');
+  });
+
+  it('GET /decrypted-views/available-fields still returns 200 with an empty result if the diagnostic query itself fails', async () => {
+    fakes.getAvailableFields.mockResolvedValue([]);
+    fakes.getDistinctSyncedTenantIds.mockRejectedValue(new Error('BigQuery unavailable'));
+
+    const response = await app.inject({ method: 'GET', url: '/decrypted-views/available-fields' });
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).fields).toEqual([]);
   });
 });

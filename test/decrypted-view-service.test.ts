@@ -183,4 +183,23 @@ describe('DecryptedViewService', () => {
     expect(result).toBeNull();
     expect(mockDeleteTable).not.toHaveBeenCalled();
   });
+
+  describe('getDistinctSyncedTenantIds', () => {
+    it('returns the distinct tenant_id values actually present in pii_vault', async () => {
+      mockQuery.mockResolvedValueOnce([[{ tenant_id: 'immoscoop-prod' }, { tenant_id: 'acme' }]] as any);
+
+      const tenantIds = await service.getDistinctSyncedTenantIds();
+
+      expect(tenantIds).toEqual(['immoscoop-prod', 'acme']);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.objectContaining({ params: { limit: 5 } })
+      );
+    });
+
+    it('respects a custom limit', async () => {
+      mockQuery.mockResolvedValueOnce([[{ tenant_id: 'a' }]] as any);
+      await service.getDistinctSyncedTenantIds(1);
+      expect(mockQuery).toHaveBeenCalledWith(expect.objectContaining({ params: { limit: 1 } }));
+    });
+  });
 });

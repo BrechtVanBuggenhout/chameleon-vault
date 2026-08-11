@@ -128,6 +128,25 @@ export class DecryptedViewService {
   }
 
   /**
+   * Diagnostic only, never used to widen access -- when getAvailableFields
+   * comes back empty for the caller's tenantId, this is what tells the
+   * difference between "genuinely nothing has synced yet" and "something
+   * synced, but under a different tenant_id than the one being queried"
+   * (confirmed real: a mismatch between how the console resolves its
+   * session tenant and how chameleon-data-pipelines resolves its own
+   * static/per-row tenant_id at write time looks identical to "never
+   * synced" without this). Capped at a handful of values -- this is a
+   * troubleshooting hint for an operator, not a tenant enumeration API.
+   */
+  async getDistinctSyncedTenantIds(limit = 5): Promise<string[]> {
+    const [rows] = await this.bq.query({
+      query: `SELECT DISTINCT tenant_id FROM \`${this.piiVaultProjectId}.${this.piiVaultDatasetId}.${this.piiVaultTableId}\` ORDER BY tenant_id LIMIT @limit`,
+      params: { limit },
+    });
+    return (rows as { tenant_id: string }[]).map((row) => row.tenant_id);
+  }
+
+  /**
    * pii_vault is long/flattened (one row per user+resource+field:
    * tenant_id, user_id, resource_id, field_name, key_id, token,
    * encrypted_value, synced_at), not one named column per PII field. Each

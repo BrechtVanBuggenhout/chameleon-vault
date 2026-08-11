@@ -145,4 +145,32 @@ describe('JanitorService Integration Tests', () => {
     // MAX_RETRIES is set to 2 in beforeEach for each task
     expect(mockWipe).toHaveBeenCalledTimes(4);
   }, 10000);
+
+  it('treats a connector that throws (instead of returning success:false) as a retryable failure, never escaping processCleanup', async () => {
+    // A hung connection with no axios timeout, a DNS failure, or any other
+    // unexpected error class would surface this way -- processCleanup must
+    // convert it into a normal failed-attempt result, not let it reject and
+    // take down the caller's Promise.all (see deletion-request-service.ts).
+    mockWipe.mockRejectedValue(new Error('connect ETIMEDOUT'));
+
+    const results = await janitor.processCleanup('user123');
+
+    expect(results).toHaveLength(2);
+    expect(results.every((r: any) => r.status === 'FAILED')).toBe(true);
+    // Still retried like any other failure -- MAX_RETRIES is 2 in beforeEach.
+    expect(mockWipe).toHaveBeenCalledTimes(4);
+  }, 10000);
+
+  it('treats a connector that throws on only one attempt then succeeds the same as a normal transient failure', async () => {
+    mockWipe
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockResolvedValueOnce({ success: true })
+      .mockResolvedValueOnce({ success: true });
+
+    const results = await janitor.processCleanup('user123');
+
+    const hubspotResult = results.find((r: any) => r.destination === 'hubspot');
+    expect(hubspotResult.status).toBe('COMPLETE');
+    expect(hubspotResult.attempts).toBe(2);
+  });
 });
