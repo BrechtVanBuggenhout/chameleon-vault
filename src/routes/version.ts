@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
+import { SourceStalenessChecker } from '../gcp/source-staleness-checker.js';
 import { createLogger } from '../logging/index.js';
 
 const logger = createLogger('version');
@@ -8,7 +9,12 @@ const logger = createLogger('version');
 // secret -- see chameleon-infra-gcp/scripts/build-own-images.sh.
 const SOURCE_SHAS_KEY = 'key-vault';
 
-export async function versionRoutes(fastify: FastifyInstance): Promise<void> {
+export async function versionRoutes(
+  fastify: FastifyInstance,
+  options: { sourceStalenessChecker?: SourceStalenessChecker } = {}
+): Promise<void> {
+  const { sourceStalenessChecker } = options;
+
   fastify.get('/version', async (request, reply) => {
     const projectId = process.env.GCP_PROJECT_ID;
     let sources: Record<string, string> | null = null;
@@ -38,5 +44,25 @@ export async function versionRoutes(fastify: FastifyInstance): Promise<void> {
       // own Secret Manager IAM grant -- see chameleon-console's /api/version.
       sources,
     });
+  });
+
+  // GET /version/source-staleness -- proxies the PII Ingestor Worker's own
+  // staleness check (compares this BYOC install's build-own-images.sh
+  // source SHAs against the public repos' current HEAD). Proxied rather
+  // than called directly by the console for the same reason Sync Now is:
+  // the worker only grants roles/run.invoker to Pub/Sub and Key Vault, not
+  // console, so this reuses that existing trust path instead of adding a
+  // new one.
+  fastify.get('/version/source-staleness', async (request, reply) => {
+    if (!sourceStalenessChecker) {
+      return reply.send({ status: 'not_applicable', reason: 'PII Ingestor Worker not configured' });
+    }
+    try {
+      const result = await sourceStalenessChecker.check();
+      return reply.send(result);
+    } catch (error) {
+      logger.error({ error }, 'Source staleness check failed');
+      return reply.code(502).send({ status: 'error', reason: 'Failed to reach the PII Ingestor Worker' });
+    }
   });
 }

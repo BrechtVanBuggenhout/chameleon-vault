@@ -127,4 +127,71 @@ describe('resolveAuth', () => {
     );
     expect(result).toEqual({ authorized: false });
   });
+
+  it('accepts a valid analyst/console-session credential on POST /pii-registry/resources (declare)', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+    const result = await resolveAuth(
+      '/pii-registry/resources',
+      'analyst-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService
+    );
+    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com' });
+  });
+
+  it('accepts a valid credential on PUT/DELETE /pii-registry/resources/:resourceId', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+    const result = await resolveAuth(
+      '/pii-registry/resources/bigquery%3Aproj.ds.table',
+      'analyst-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService
+    );
+    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com' });
+  });
+
+  it('rejects a credential on the mark-synced sub-route -- machine-to-machine only, not an individual declare action', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+    const result = await resolveAuth(
+      '/pii-registry/resources/some-resource/mark-synced',
+      'analyst-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService
+    );
+    expect(result).toEqual({ authorized: false });
+    expect(mockAnalystAccessService.resolveCredential).not.toHaveBeenCalled();
+  });
+
+  it('rejects a credential on /pii-registry/sync-now -- machine-triggered, not an individual declare action', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+    const result = await resolveAuth(
+      '/pii-registry/sync-now',
+      'analyst-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService
+    );
+    expect(result).toEqual({ authorized: false });
+  });
+
+  it('accepts a valid credential on POST /deletion-requests', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+    const result = await resolveAuth(
+      '/deletion-requests',
+      'analyst-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService
+    );
+    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com' });
+  });
+
+  it('rejects a credential on /admin/session-credentials -- only the console (shared key) mints these, never an analyst credential', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+    const result = await resolveAuth(
+      '/admin/session-credentials',
+      'analyst-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService
+    );
+    expect(result).toEqual({ authorized: false });
+  });
 });

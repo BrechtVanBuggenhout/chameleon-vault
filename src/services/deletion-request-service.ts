@@ -25,7 +25,12 @@ export class DeletionRequestService {
     private readonly sourceRedactionService?: SourceRedactionService
   ) {}
 
-  async createRequest(userId: string, operationId: string, tenantId: string = 'default-tenant'): Promise<DeletionRequest> {
+  async createRequest(
+    userId: string,
+    operationId: string,
+    tenantId: string = 'default-tenant',
+    requestedBy?: string
+  ): Promise<DeletionRequest> {
     // Check for existing active deletion request for the user
     const existingRequest = await this.deletionRequestRepo.getActiveDeletionRequestForUser(userId, tenantId);
     if (existingRequest) {
@@ -33,7 +38,7 @@ export class DeletionRequestService {
       return existingRequest; // Return existing request for idempotency
     }
 
-    const deletionRequest = await this.deletionRequestRepo.createDeletionRequest(userId, operationId, tenantId);
+    const deletionRequest = await this.deletionRequestRepo.createDeletionRequest(userId, operationId, tenantId, requestedBy);
     // RECOMMENDATION: Move to Cloud Logging Sinks. 
     // Instead of calling BQ API, log a structured JSON object to stdout.
     // GCP Log Sinks will then transport this to BigQuery asynchronously without impacting app latency.

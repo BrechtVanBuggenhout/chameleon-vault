@@ -139,6 +139,17 @@ export interface PiiRegistryEntry {
   status?: RegistryEntryStatus;
   createdAt?: string;
   updatedAt?: string;
+  /**
+   * Email of whoever first declared this resource, set once and never
+   * overwritten by later updates. Only populated when the request that
+   * created it carried a real, resolvable per-analyst or console-session
+   * credential (see middleware/auth.ts) -- absent for entries declared with
+   * the shared write token (no individual to attribute) or platform-seeded
+   * connector entries, never a guessed or invented identity.
+   */
+  declaredBy?: string;
+  /** Email of whoever most recently declared/updated this resource. Same attribution caveat as declaredBy. */
+  lastModifiedBy?: string;
 }
 
 /** A single PII field as supplied by a user declaring a resource. */

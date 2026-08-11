@@ -9,6 +9,12 @@ const logger = createLogger('analyst-access-service');
 // link isn't a standing credential-in-waiting.
 const CLAIM_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Console-session credentials are re-minted per console session rather than
+// handed out standing -- an hour is long enough to cover a normal working
+// session's worth of registry/deletion-request calls without needing a
+// refresh mid-task, short enough that a leaked value has a small window.
+const SESSION_CREDENTIAL_TTL_MS = 60 * 60 * 1000;
+
 function generateSecret(): string {
   return randomBytes(32).toString('base64url');
 }
@@ -83,6 +89,28 @@ export class AnalystAccessService {
     if (!record || record.revoked_at) {
       return null;
     }
+    // Only console-session credentials carry this -- a claim-link-issued
+    // API key is durable until revoked, by design.
+    if (record.credential_expires_at && toMillis(record.credential_expires_at) < Date.now()) {
+      return null;
+    }
     return { tenantId: record.tenant_id, analystEmail: record.analyst_email };
+  }
+
+  /**
+   * Mints a short-lived credential on behalf of a person the console has
+   * already authenticated (a real per-person session, not the static
+   * shared-password fallback) -- no claim-link step, since there's no
+   * external analyst to email a link to here. Reuses the exact same
+   * resolution path as a claim-link credential (resolveCredential above),
+   * so every route that already accepts an analyst credential accepts this
+   * too with no further changes.
+   */
+  async mintSessionCredential(tenantId: string, analystEmail: string): Promise<{ credential: string; expiresAt: Date }> {
+    const credential = generateSecret();
+    const expiresAt = new Date(Date.now() + SESSION_CREDENTIAL_TTL_MS);
+    await this.repo.createSessionCredential(tenantId, analystEmail, hash(credential), expiresAt);
+    logger.info({ tenantId, analystEmail }, 'Minted console-session credential');
+    return { credential, expiresAt };
   }
 }

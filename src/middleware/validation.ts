@@ -185,6 +185,10 @@ export const claimAnalystTokenSchema = Joi.object({
   token: claimTokenSchema,
 }).required();
 
+export const mintSessionCredentialSchema = Joi.object({
+  email: Joi.string().email().required(),
+}).required();
+
 export async function validateRequest(schema: Joi.ObjectSchema, payload: unknown): Promise<any> {
   const { error, value } = schema.validate(payload, {
     abortEarly: false,

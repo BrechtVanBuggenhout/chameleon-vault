@@ -28,4 +28,12 @@ export interface DeletionRequest {
   // GET /certificate/:userId return the exact certificate that was actually
   // issued (and chained) instead of re-signing a fresh one on every call.
   certificate_gcs_path?: string;
+  /**
+   * Email of whoever requested this deletion, when the creating call
+   * carried a real, resolvable per-analyst or console-session credential
+   * (see middleware/auth.ts). Absent for requests created with the shared
+   * write token -- no individual to attribute -- or a machine caller
+   * (e.g. a customer's own API integration), never a guessed identity.
+   */
+  requested_by?: string;
 }

@@ -65,6 +65,14 @@ export class FirestorePiiDeclarationRepository implements PiiDeclarationStore {
       payload.updatedAtColumn = FieldValue.delete();
       payload.lastSyncedAt = FieldValue.delete();
     }
+    // Same gotcha as updatedAtColumn above: ignoreUndefinedProperties strips
+    // an undefined lastModifiedBy before the write, and merge:true then
+    // leaves whatever's already stored untouched -- which would silently
+    // keep attributing this write to whoever last had a real credential,
+    // even when this call has none. Force it to actually clear.
+    if (!entry.lastModifiedBy) {
+      payload.lastModifiedBy = FieldValue.delete();
+    }
     await this.db
       .collection(this.collectionName)
       .doc(this.docId(entry.tenantId, entry.resourceId))

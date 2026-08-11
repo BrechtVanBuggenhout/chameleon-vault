@@ -22,7 +22,12 @@ export class DeletionRequestRepository {
     return this.db.collection(this.collectionName);
   }
 
-  async createDeletionRequest(userId: string, operationId: string, tenantId: string = 'default-tenant'): Promise<DeletionRequest> {
+  async createDeletionRequest(
+    userId: string,
+    operationId: string,
+    tenantId: string = 'default-tenant',
+    requestedBy?: string
+  ): Promise<DeletionRequest> {
     const docRef = this.collection.doc(operationId);
 
     return await this.db.runTransaction(async (transaction) => {
@@ -41,12 +46,36 @@ export class DeletionRequestRepository {
         created_at: now.toDate(),
         status_history: [{ status: 'SHRED_REQUESTED' as DeletionRequestStatus, timestamp: now.toDate() }],
         janitor_wipes: [],
+        requested_by: requestedBy,
       };
 
       transaction.set(docRef, newRequest);
-      logger.info({ userId, tenantId, operationId, status: newRequest.status }, 'Created new deletion request');
+      logger.info({ userId, tenantId, operationId, status: newRequest.status, requestedBy }, 'Created new deletion request');
       return newRequest;
     });
+  }
+
+  /**
+   * Used by GET /audit/actor/:email -- every deletion request a given
+   * person's credential requested, newest first. Paginated via a
+   * created_at cursor rather than offset, so a growing collection doesn't
+   * make later pages progressively more expensive to skip to.
+   */
+  async listByRequestedBy(
+    email: string,
+    tenantId: string = 'default-tenant',
+    limit: number = 50,
+    beforeCreatedAt?: Date
+  ): Promise<DeletionRequest[]> {
+    let query = this.collection
+      .where('requested_by', '==', email)
+      .where('tenant_id', '==', tenantId)
+      .orderBy('created_at', 'desc');
+    if (beforeCreatedAt) {
+      query = query.startAfter(Timestamp.fromDate(beforeCreatedAt));
+    }
+    const snapshot = await query.limit(limit).get();
+    return snapshot.docs.map((doc) => doc.data() as DeletionRequest);
   }
 
   async getDeletionRequest(deletionRequestId: string): Promise<DeletionRequest | null> {

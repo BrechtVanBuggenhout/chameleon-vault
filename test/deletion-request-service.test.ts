@@ -107,6 +107,51 @@ describe('DeletionRequestService - State Transition Matrix', () => {
   });
 });
 
+describe('DeletionRequestService - createRequest actor attribution', () => {
+  let service: DeletionRequestService;
+  let mockDeletionRequestRepo: jest.Mocked<DeletionRequestRepository>;
+  let mockFirestoreRegistry: jest.Mocked<FirestoreRegistry>;
+  let mockLineageRepository: jest.Mocked<BigQueryLineageRepository>;
+  let mockJanitorService: jest.Mocked<JanitorService>;
+  let mockDekKmsClient: jest.Mocked<CloudKMSClient>;
+  let mockCertificateService: jest.Mocked<CertificateService>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockDeletionRequestRepo = new (DeletionRequestRepository as jest.Mock)();
+    mockFirestoreRegistry = new (FirestoreRegistry as jest.Mock)();
+    mockLineageRepository = new (BigQueryLineageRepository as jest.Mock)();
+    mockJanitorService = new (JanitorService as jest.Mock)();
+    mockDekKmsClient = new (CloudKMSClient as jest.Mock)();
+    mockCertificateService = new (CertificateService as jest.Mock)();
+    mockDeletionRequestRepo.getActiveDeletionRequestForUser = jest.fn().mockResolvedValue(null) as never;
+    mockDeletionRequestRepo.createDeletionRequest = jest.fn().mockResolvedValue({
+      deletion_request_id: 'op-1',
+      tenant_id: 'acme',
+      user_id: 'user-1',
+      status: 'SHRED_REQUESTED',
+      created_at: new Date(),
+      status_history: [],
+      janitor_wipes: [],
+    }) as never;
+    mockLineageRepository.recordEvent = jest.fn().mockResolvedValue(undefined) as never;
+
+    service = new DeletionRequestService(
+      mockDeletionRequestRepo, mockFirestoreRegistry, mockLineageRepository, mockJanitorService, mockDekKmsClient, mockCertificateService
+    );
+  });
+
+  it('passes the resolved actor email through to the repository', async () => {
+    await service.createRequest('user-1', 'op-1', 'acme', 'analyst@example.com');
+    expect(mockDeletionRequestRepo.createDeletionRequest).toHaveBeenCalledWith('user-1', 'op-1', 'acme', 'analyst@example.com');
+  });
+
+  it('passes undefined through when no actor was resolved (shared-key caller)', async () => {
+    await service.createRequest('user-1', 'op-1', 'acme');
+    expect(mockDeletionRequestRepo.createDeletionRequest).toHaveBeenCalledWith('user-1', 'op-1', 'acme', undefined);
+  });
+});
+
 describe('DeletionRequestService - cascade outcome gates certificate issuance', () => {
   // NOTE: this suite builds plain jest.fn() mocks directly rather than
   // relying on jest.mock(...) automocking of the real classes. Under

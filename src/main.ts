@@ -29,10 +29,12 @@ import { AnalystAccessService } from './services/analyst-access-service.js';
 import { DecryptedViewService } from './services/decrypted-view-service.js';
 import { devPiiRegistry } from './data/pii-registry.js';
 import { FirestorePiiDeclarationRepository } from './gcp/pii-registry-declaration-repository.js';
+import { SyncRunRepository } from './gcp/sync-run-repository.js';
 import { BigQueryPiiRegistryAuditMirror } from './gcp/pii-registry-audit-mirror.js';
 import { BigQueryPiiRegistryRepository, composePiiRegistry } from './gcp/pii-registry-repository.js';
 import { BigQuerySchemaService } from './gcp/bigquery-schema-service.js';
 import { PiiVaultSyncTrigger } from './gcp/pii-vault-sync-trigger.js';
+import { SourceStalenessChecker } from './gcp/source-staleness-checker.js';
 import { SnowflakePiiRegistryRepository } from './snowflake/pii-registry-repository.js';
 import type { PiiRegistryEntry } from './types/pii-registry.js';
 
@@ -44,7 +46,10 @@ import { lineageRoutes } from './routes/lineage.js';
 import { deletionRequestRoutes } from './routes/deletion-requests.js';
 import { certificateRoutes } from './routes/certificate.js';
 import { piiRegistryRoutes } from './routes/pii-registry.js';
+import { syncRunsRoutes } from './routes/sync-runs.js';
 import { analystClaimsRoutes } from './routes/analyst-claims.js';
+import { adminSessionCredentialsRoutes } from './routes/admin-session-credentials.js';
+import { auditRoutes } from './routes/audit.js';
 import { decryptedViewsRoutes } from './routes/decrypted-views.js';
 import { decryptedViewsDecryptRoutes } from './routes/decrypted-views-decrypt.js';
 import { piiVaultDecryptRoutes } from './routes/pii-vault-decrypt.js';
@@ -186,6 +191,9 @@ async function main() {
   }
   const schemaService = new BigQuerySchemaService(projectId);
 
+  const syncRunCollection = process.env.FIRESTORE_SYNC_RUN_COLLECTION || 'sync_runs';
+  const syncRunRepository = new SyncRunRepository(projectId, syncRunCollection, firestoreDatabaseId);
+
   const piiIngestorWorkerServiceName = process.env.PII_INGESTOR_WORKER_SERVICE_NAME;
   const piiIngestorWorkerRegion = process.env.PII_INGESTOR_WORKER_REGION;
   const syncTrigger =
@@ -197,6 +205,10 @@ async function main() {
       'PII_INGESTOR_WORKER_SERVICE_NAME/_REGION not set; on-demand PII vault sync (/pii-registry/sync-now) is disabled'
     );
   }
+  const sourceStalenessChecker =
+    piiIngestorWorkerServiceName && piiIngestorWorkerRegion
+      ? new SourceStalenessChecker(projectId, piiIngestorWorkerRegion, piiIngestorWorkerServiceName)
+      : undefined;
 
   // PII_VAULT_RESOURCE_ID / DECRYPTED_VIEWS_BATCH_DECRYPT_FUNCTION_REF read
   // directly (not getRequiredEnv) -- optional here, unlike inside the
@@ -282,7 +294,7 @@ async function main() {
 
   // 4. Register Routes with Injected Dependencies
   await fastify.register(healthRoutes); // Health routes don't have external dependencies
-  await fastify.register(versionRoutes);
+  await fastify.register(versionRoutes, { sourceStalenessChecker });
   await fastify.register(cryptoRoutes, { kmsClient: dekKmsClient, firestoreRegistry, lineageRepository, deletionRequestService });
   await fastify.register(lineageRoutes, { lineageRepository, firestoreRegistry, janitorService });
   await fastify.register(deletionRequestRoutes, { deletionRequestService });
@@ -295,7 +307,10 @@ async function main() {
     syncTrigger,
     sourceRedactionHook: sourceRedactionService,
   });
+  await fastify.register(syncRunsRoutes, { syncRunRepository, writeToken: registryWriteToken });
   await fastify.register(analystClaimsRoutes, { analystAccessService });
+  await fastify.register(adminSessionCredentialsRoutes, { analystAccessService });
+  await fastify.register(auditRoutes, { piiRegistryService, deletionRequestRepo });
   if (decryptedViewService && decryptedViewsRepo) {
     await fastify.register(decryptedViewsRoutes, {
       decryptedViewService,

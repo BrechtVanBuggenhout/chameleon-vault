@@ -18,6 +18,7 @@ describe('AnalystAccessService', () => {
       getClaimByTokenHash: jest.fn(),
       claimAndIssueCredential: jest.fn(),
       resolveCredential: jest.fn(),
+      createSessionCredential: jest.fn().mockResolvedValue(undefined),
     } as any;
     service = new AnalystAccessService(mockRepo as unknown as AnalystAccessRepository);
   });
@@ -144,6 +145,75 @@ describe('AnalystAccessService', () => {
 
       expect(result).toEqual({ tenantId: 'tenant-a', analystEmail: 'analyst@example.com' });
       expect(mockRepo.resolveCredential).toHaveBeenCalledWith(hash('some-api-key'));
+    });
+
+    it('returns null when a console-session credential has passed its credential_expires_at', async () => {
+      mockRepo.resolveCredential.mockResolvedValue({
+        claim_token_hash: hash('some-api-key'),
+        credential_key_hash: hash('some-api-key'),
+        tenant_id: 'tenant-a',
+        analyst_email: 'analyst@example.com',
+        created_at: new Date(),
+        expires_at: new Date(),
+        claimed_at: new Date(),
+        source: 'console_session',
+        credential_expires_at: new Date(Date.now() - 1000),
+      });
+
+      const result = await service.resolveCredential('some-api-key');
+      expect(result).toBeNull();
+    });
+
+    it('resolves a console-session credential that has not yet expired', async () => {
+      mockRepo.resolveCredential.mockResolvedValue({
+        claim_token_hash: hash('some-api-key'),
+        credential_key_hash: hash('some-api-key'),
+        tenant_id: 'tenant-a',
+        analyst_email: 'analyst@example.com',
+        created_at: new Date(),
+        expires_at: new Date(),
+        claimed_at: new Date(),
+        source: 'console_session',
+        credential_expires_at: new Date(Date.now() + 60_000),
+      });
+
+      const result = await service.resolveCredential('some-api-key');
+      expect(result).toEqual({ tenantId: 'tenant-a', analystEmail: 'analyst@example.com' });
+    });
+
+    it('handles a Firestore Timestamp-shaped credential_expires_at (toMillis), not just a native Date', async () => {
+      mockRepo.resolveCredential.mockResolvedValue({
+        claim_token_hash: hash('some-api-key'),
+        credential_key_hash: hash('some-api-key'),
+        tenant_id: 'tenant-a',
+        analyst_email: 'analyst@example.com',
+        created_at: new Date(),
+        expires_at: new Date(),
+        claimed_at: new Date(),
+        source: 'console_session',
+        credential_expires_at: { toMillis: () => Date.now() - 1000 } as any,
+      });
+
+      const result = await service.resolveCredential('some-api-key');
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('mintSessionCredential', () => {
+    it('generates a random credential, stores only its hash with an expiry, and returns the raw credential', async () => {
+      const { credential, expiresAt } = await service.mintSessionCredential('tenant-a', 'person@example.com');
+
+      expect(typeof credential).toBe('string');
+      expect(credential.length).toBeGreaterThan(20);
+      expect(expiresAt.getTime()).toBeGreaterThan(Date.now());
+
+      expect(mockRepo.createSessionCredential).toHaveBeenCalledTimes(1);
+      const [tenantId, analystEmail, storedHash, storedExpiresAt] = mockRepo.createSessionCredential.mock.calls[0];
+      expect(tenantId).toBe('tenant-a');
+      expect(analystEmail).toBe('person@example.com');
+      expect(storedHash).toBe(hash(credential));
+      expect(storedHash).not.toBe(credential);
+      expect(storedExpiresAt).toBe(expiresAt);
     });
   });
 });

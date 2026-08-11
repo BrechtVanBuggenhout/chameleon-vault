@@ -37,7 +37,7 @@ export async function deletionRequestRoutes(fastify: FastifyInstance, options: D
         context.userId = userId;
         context.operationId = operationId;
 
-        const deletionRequest = await deletionRequestService.createRequest(userId, operationId, tenantId);
+        const deletionRequest = await deletionRequestService.createRequest(userId, operationId, tenantId, context.analystEmail);
 
         logger.info({ correlationId: context.correlationId, userId, deletionRequestId: deletionRequest.deletion_request_id, status: deletionRequest.status }, 'Deletion request created/retrieved');
         

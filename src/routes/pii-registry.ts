@@ -1,5 +1,6 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createLogger } from '../logging/index.js';
+import { getRequestContext } from '../middleware/request-logging.js';
 import { PiiRegistryService, RegistryMutationError } from '../services/pii-registry-service.js';
 import { buildManualEntry } from '../services/pii-registry-validation.js';
 import { computeCoverage, toCoverageItems } from '../services/pii-coverage.js';
@@ -28,6 +29,7 @@ export interface SyncTrigger {
     resources_queued: number;
     chunks_queued: number;
     errors: Array<{ resourceId: string; error: string }>;
+    runId?: string | null;
   }>;
 }
 
@@ -72,8 +74,17 @@ export async function piiRegistryRoutes(
 ): Promise<void> {
   const { piiRegistryService, writeToken, discoverySource, schemaSource, syncTrigger, sourceRedactionHook } = options;
 
-  // Gate every mutating route behind the shared-secret bearer token.
+  // Gate every mutating route behind the shared-secret bearer token -- or,
+  // for the two routes an analyst credential is allowed on (see
+  // middleware/auth.ts's ANALYST_CREDENTIAL_RESOURCE_PATTERN), the identity
+  // the global auth hook already resolved. That hook runs before this
+  // preHandler and only sets analystEmail once it has independently
+  // verified a real, non-revoked, non-expired credential, so there's
+  // nothing further to check here -- just honor what it already decided.
   const requireWriteAuth = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    if (getRequestContext(request).analystEmail) {
+      return;
+    }
     if (!writeToken) {
       reply.status(503).send({ error: 'Registry write API is not enabled', statusCode: 503 });
       return;
@@ -245,7 +256,8 @@ export async function piiRegistryRoutes(
       return reply.status(409).send({ error: 'This resource is platform-managed and cannot be edited', statusCode: 409 });
     }
 
-    const { entry, errors } = buildManualEntry(input, tenantId, new Date(), existing);
+    const actorEmail = getRequestContext(request).analystEmail;
+    const { entry, errors } = buildManualEntry(input, tenantId, new Date(), existing, actorEmail);
     if (!entry) {
       return reply.status(400).send({ error: 'Invalid declaration', issues: errors, statusCode: 400 });
     }

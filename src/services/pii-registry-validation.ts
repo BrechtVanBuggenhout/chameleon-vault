@@ -50,7 +50,9 @@ export function buildManualEntry(
   input: PiiRegistryDeclarationInput,
   tenantId: string,
   now: Date = new Date(),
-  existing?: PiiRegistryEntry
+  existing?: PiiRegistryEntry,
+  /** The resolved analyst/console-session identity that made this call, if any -- see PiiRegistryEntry.declaredBy. */
+  actorEmail?: string
 ): ValidationResult {
   const errors: string[] = [];
 
@@ -160,6 +162,12 @@ export function buildManualEntry(
     status: input.status ?? 'PENDING_REVIEW',
     createdAt: existing?.createdAt ?? nowIso,
     updatedAt: nowIso,
+    declaredBy: existing?.declaredBy ?? actorEmail,
+    // Reflects who made *this* write, honestly -- left unset (not carried
+    // forward from a previous update) when this call has no resolvable
+    // individual identity, e.g. the shared write token, rather than
+    // misattributing this change to whoever last had a real credential.
+    lastModifiedBy: actorEmail,
   };
 
   return { entry, errors: [] };

@@ -3,6 +3,7 @@ import Fastify from 'fastify';
 import { PiiRegistryService, type PiiDeclarationStore } from '../src/services/pii-registry-service.js';
 import { buildManualEntry } from '../src/services/pii-registry-validation.js';
 import { piiRegistryRoutes } from '../src/routes/pii-registry.js';
+import { getRequestContext } from '../src/middleware/request-logging.js';
 import type { PiiRegistryDeclarationInput, PiiRegistryEntry } from '../src/types/pii-registry.js';
 
 const WRITE_TOKEN = 'test-write-token';
@@ -114,6 +115,32 @@ describe('buildManualEntry (validation)', () => {
     );
     expect(entry).toBeUndefined();
     expect(errors.some((e) => e.includes('userIdColumn is required'))).toBe(true);
+  });
+
+  it('stamps declaredBy and lastModifiedBy on first declare when an actor is resolved', () => {
+    const { entry } = buildManualEntry(validInput, 'acme', new Date(), undefined, 'analyst@example.com');
+    expect(entry?.declaredBy).toBe('analyst@example.com');
+    expect(entry?.lastModifiedBy).toBe('analyst@example.com');
+  });
+
+  it('leaves declaredBy/lastModifiedBy unset when no actor is resolved (shared write token)', () => {
+    const { entry } = buildManualEntry(validInput, 'acme');
+    expect(entry?.declaredBy).toBeUndefined();
+    expect(entry?.lastModifiedBy).toBeUndefined();
+  });
+
+  it('preserves the original declaredBy across an update by a different actor, but updates lastModifiedBy', () => {
+    const declared = buildManualEntry(validInput, 'acme', new Date(), undefined, 'first@example.com').entry!;
+    const updated = buildManualEntry(validInput, 'acme', new Date(), declared, 'second@example.com').entry!;
+    expect(updated.declaredBy).toBe('first@example.com');
+    expect(updated.lastModifiedBy).toBe('second@example.com');
+  });
+
+  it('clears lastModifiedBy (does not carry it forward) when an update has no resolvable actor', () => {
+    const declared = buildManualEntry(validInput, 'acme', new Date(), undefined, 'first@example.com').entry!;
+    const updated = buildManualEntry(validInput, 'acme', new Date(), declared).entry!;
+    expect(updated.declaredBy).toBe('first@example.com');
+    expect(updated.lastModifiedBy).toBeUndefined();
   });
 });
 
@@ -311,6 +338,39 @@ describe('piiRegistryRoutes write API (auth + lifecycle)', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).issues.length).toBeGreaterThan(0);
+    await app.close();
+  });
+
+  it('accepts a write with no bearer token when an analyst identity was already resolved upstream, and stamps declaredBy/lastModifiedBy', async () => {
+    // Simulates what main.ts's global onRequest auth hook does when it
+    // resolves a valid analyst/console-session credential on an
+    // ANALYST_CREDENTIAL_*-allowed path -- this test registers piiRegistryRoutes
+    // in isolation, so it reproduces that upstream effect directly rather
+    // than exercising the full app + real credential resolution.
+    const app = Fastify({ logger: false });
+    app.addHook('onRequest', async (request) => {
+      if (request.headers['x-simulated-analyst-email']) {
+        getRequestContext(request).analystEmail = request.headers['x-simulated-analyst-email'] as string;
+      }
+    });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      // No Authorization header at all -- only the simulated upstream identity.
+      headers: { 'x-tenant-id': 'acme', 'x-simulated-analyst-email': 'analyst@example.com' },
+      payload: validInput,
+    });
+
+    expect(res.statusCode).toBe(201);
+    const resource = JSON.parse(res.body).resource;
+    expect(resource.declaredBy).toBe('analyst@example.com');
+    expect(resource.lastModifiedBy).toBe('analyst@example.com');
+
     await app.close();
   });
 });

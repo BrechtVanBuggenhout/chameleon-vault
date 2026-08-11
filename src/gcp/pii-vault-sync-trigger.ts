@@ -8,6 +8,8 @@ export interface SyncTriggerResult {
   resources_queued: number;
   chunks_queued: number;
   errors: Array<{ resourceId: string; error: string }>;
+  /** sync_runs id for the console to poll for progress; null if creating the run itself failed. */
+  runId?: string | null;
 }
 
 /**

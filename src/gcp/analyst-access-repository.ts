@@ -67,6 +67,34 @@ export class AnalystAccessRepository {
     });
   }
 
+  // Console-session credentials skip the claim step entirely -- there's no
+  // separate token to hand out and later consume, so the record is created
+  // already "claimed", keyed by the credential's own hash rather than a
+  // claim_token_hash (reused here as the doc id since nothing else reads
+  // claim_token_hash as a semantic field -- it's only ever used as a
+  // Firestore key, same as in createClaim above).
+  async createSessionCredential(
+    tenantId: string,
+    analystEmail: string,
+    credentialKeyHash: string,
+    credentialExpiresAt: Date
+  ): Promise<void> {
+    const now = Timestamp.now().toDate();
+    const record: AnalystAccess = {
+      claim_token_hash: credentialKeyHash,
+      credential_key_hash: credentialKeyHash,
+      tenant_id: tenantId,
+      analyst_email: analystEmail,
+      created_at: now,
+      expires_at: credentialExpiresAt,
+      claimed_at: now,
+      source: 'console_session',
+      credential_expires_at: credentialExpiresAt,
+    };
+    await this.collection.doc(credentialKeyHash).set(record);
+    logger.info({ tenantId, analystEmail }, 'Minted console-session analyst credential');
+  }
+
   async resolveCredential(credentialKeyHash: string): Promise<AnalystAccess | null> {
     const snapshot = await this.collection
       .where('credential_key_hash', '==', credentialKeyHash)

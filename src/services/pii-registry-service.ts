@@ -45,13 +45,26 @@ export class PiiRegistryService {
   }
 
   listEntries(
-    filters: { tenantId?: string; system?: string; ownerConnector?: string; scanEnabled?: boolean } = {}
+    filters: {
+      tenantId?: string;
+      system?: string;
+      ownerConnector?: string;
+      scanEnabled?: boolean;
+      /** Matches entries this person either declared or last modified -- see routes/audit.ts. */
+      actorEmail?: string;
+    } = {}
   ): PiiRegistryEntry[] {
     return this.getEntries()
       .filter((entry) => PiiRegistryService.visibleTo(entry, filters.tenantId))
       .filter((entry) => !filters.system || entry.system === filters.system)
       .filter((entry) => !filters.ownerConnector || entry.ownerConnector === filters.ownerConnector)
-      .filter((entry) => filters.scanEnabled === undefined || entry.ghostDataScan.enabled === filters.scanEnabled);
+      .filter((entry) => filters.scanEnabled === undefined || entry.ghostDataScan.enabled === filters.scanEnabled)
+      .filter(
+        (entry) =>
+          !filters.actorEmail ||
+          entry.declaredBy === filters.actorEmail ||
+          entry.lastModifiedBy === filters.actorEmail
+      );
   }
 
   getEntry(resourceId: string, tenantId?: string): PiiRegistryEntry | undefined {
