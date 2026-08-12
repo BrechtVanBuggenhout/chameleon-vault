@@ -297,6 +297,108 @@ describe('piiRegistryRoutes write API (auth + lifecycle)', () => {
     await app.close();
   });
 
+  it('rejects REDACT_IN_PLACE declared against a confirmed BigQuery VIEW', async () => {
+    const getColumns = jest.fn(async () => []);
+    const getTableType = jest.fn(async () => 'VIEW');
+    const store = new FakeStore();
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], store),
+      writeToken: WRITE_TOKEN,
+      schemaSource: { getColumns, getTableType },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'REDACT_IN_PLACE' },
+    });
+
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toContain('is a view');
+    expect(getTableType).toHaveBeenCalledWith(validInput.resourceId);
+    // Never even reached the store -- rejected before persisting.
+    expect(store.upserts).toHaveLength(0);
+
+    await app.close();
+  });
+
+  it('allows REDACT_IN_PLACE against a confirmed real BASE TABLE', async () => {
+    const getColumns = jest.fn(async () => []);
+    const getTableType = jest.fn(async () => 'BASE TABLE');
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      schemaSource: { getColumns, getTableType },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'REDACT_IN_PLACE' },
+    });
+
+    expect(create.statusCode).toBe(201);
+    expect(JSON.parse(create.body).resource.sourceRedactionStrategy).toBe('REDACT_IN_PLACE');
+
+    await app.close();
+  });
+
+  it('fails open (declare still succeeds) when the table-type check itself errors', async () => {
+    const getColumns = jest.fn(async () => []);
+    const getTableType = jest.fn(async () => {
+      throw new Error('BigQuery unavailable');
+    });
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      schemaSource: { getColumns, getTableType },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'REDACT_IN_PLACE' },
+    });
+
+    // A schema-check hiccup must never block an otherwise-valid declare --
+    // this is a guard against one specific known failure mode, not a
+    // general existence/permissions gate.
+    expect(create.statusCode).toBe(201);
+
+    await app.close();
+  });
+
+  it('skips the table-type check entirely when schemaSource has no getTableType (older/unconfigured deployments)', async () => {
+    const getColumns = jest.fn(async () => []);
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      schemaSource: { getColumns },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'REDACT_IN_PLACE' },
+    });
+
+    expect(create.statusCode).toBe(201);
+
+    await app.close();
+  });
+
   it('lists discovery findings and hides ones already declared', async () => {
     const service = new PiiRegistryService([], new FakeStore());
     const finding = {

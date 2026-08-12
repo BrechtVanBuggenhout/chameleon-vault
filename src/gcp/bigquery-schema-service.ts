@@ -63,4 +63,33 @@ ORDER BY ordinal_position
       throw error;
     }
   }
+
+  /**
+   * BigQuery's table_type from INFORMATION_SCHEMA.TABLES -- 'BASE TABLE',
+   * 'VIEW', 'MATERIALIZED VIEW', or 'EXTERNAL'. Used to reject
+   * REDACT_IN_PLACE against anything that isn't a real, writable table:
+   * BigQuery's UPDATE DML flatly refuses to run against a VIEW (confirmed
+   * live: "... is not allowed for this operation because it currently has
+   * type VIEW"), which a customer would otherwise only discover the first
+   * time a real deletion actually tries to redact it. Returns null if the
+   * table/view can't be found at all, distinct from a real type string.
+   */
+  async getTableType(resourceId: string): Promise<string | null> {
+    const { projectId, datasetId, tableId } = parseBigQueryResourceId(resourceId);
+
+    const query = `
+SELECT table_type
+FROM \`${projectId}.${datasetId}\`.INFORMATION_SCHEMA.TABLES
+WHERE table_name = @tableId
+`;
+
+    try {
+      const [rows] = await this.bq.query({ query, params: { tableId } });
+      const row = (rows as Record<string, unknown>[])[0];
+      return row ? String(row.table_type) : null;
+    } catch (error) {
+      logger.error({ error, resourceId }, 'Failed to read BigQuery table type');
+      throw error;
+    }
+  }
 }

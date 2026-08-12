@@ -20,6 +20,8 @@ export interface DiscoveryFindingsSource {
 /** Narrow dependency: just the schema reader, so tests don't need a real BigQuery client. */
 export interface SchemaSource {
   getColumns(resourceId: string): Promise<DiscoveredColumn[]>;
+  /** Optional: only needed to validate REDACT_IN_PLACE isn't declared against a BigQuery VIEW. */
+  getTableType?(resourceId: string): Promise<string | null>;
 }
 
 /** Narrow dependency: just the on-demand sync trigger, so tests don't need real GCP auth. */
@@ -260,6 +262,28 @@ export async function piiRegistryRoutes(
     const { entry, errors } = buildManualEntry(input, tenantId, new Date(), existing, actorEmail);
     if (!entry) {
       return reply.status(400).send({ error: 'Invalid declaration', issues: errors, statusCode: 400 });
+    }
+
+    // REDACT_IN_PLACE issues a real BigQuery UPDATE against the source table
+    // on every deletion -- BigQuery flatly refuses to run UPDATE against a
+    // VIEW, so declaring this strategy against one is always going to fail,
+    // just not until the first real deletion actually hits it. Catch it
+    // here instead. Only ever blocks on a *confirmed* VIEW/MATERIALIZED
+    // VIEW -- "not found" or a schema-check failure fails open (logged, not
+    // blocking), since this check is a guard against one specific known
+    // failure mode, not a general existence/permissions gate.
+    if (entry.sourceRedactionStrategy === 'REDACT_IN_PLACE' && entry.system === 'bigquery' && schemaSource?.getTableType) {
+      try {
+        const tableType = await schemaSource.getTableType(entry.resourceId);
+        if (tableType === 'VIEW' || tableType === 'MATERIALIZED VIEW') {
+          return reply.status(400).send({
+            error: `sourceRedactionStrategy REDACT_IN_PLACE requires a real BigQuery table, but "${entry.resourceId}" is a ${tableType.toLowerCase()} -- BigQuery does not allow UPDATE against a view. Use SHADOW_COPY instead, or redact-in-place against the view's own underlying base table.`,
+            statusCode: 400,
+          });
+        }
+      } catch (schemaError) {
+        logger.warn({ error: schemaError, resourceId: entry.resourceId }, 'Could not verify table type for REDACT_IN_PLACE; allowing declaration to proceed');
+      }
     }
 
     try {
