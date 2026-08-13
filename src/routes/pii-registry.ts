@@ -286,6 +286,41 @@ export async function piiRegistryRoutes(
       }
     }
 
+    // Both REDACT_IN_PLACE (an UPDATE ... SET <fields> WHERE <userIdColumn>)
+    // and SHADOW_COPY (a JOIN ... ON s.<userIdColumn> = ...) generate real
+    // SQL that references userIdColumn, tenantIdColumn, and every declared
+    // piiField name as literal column identifiers -- confirmed live: a
+    // resource declared with userIdColumn "user_id" against a table that
+    // has no such column (a PII-scan metadata table, not per-user data)
+    // produced "Unrecognized name: user_id" at deletion time, and because
+    // the cascade evaluates every REDACT_IN_PLACE resource for every
+    // tenant's deletion regardless of that resource's own users, this
+    // single bad declaration blocked deletions tenant-wide. Catch the
+    // mismatch here instead. Only blocks on a *confirmed* set of real
+    // columns that doesn't include the referenced name(s) -- an empty
+    // result (table not found, or a schema-check failure) fails open, same
+    // as the VIEW check above.
+    if (entry.sourceRedactionStrategy !== 'NONE' && entry.system === 'bigquery' && schemaSource?.getColumns) {
+      try {
+        const columns = await schemaSource.getColumns(entry.resourceId);
+        if (columns.length > 0) {
+          const realNames = new Set(columns.map((c) => c.name));
+          const referenced = [entry.userIdColumn, entry.tenantIdColumn, ...entry.piiFields.map((f) => f.name)].filter(
+            (v): v is string => v !== undefined
+          );
+          const missing = [...new Set(referenced.filter((name) => !realNames.has(name)))];
+          if (missing.length > 0) {
+            return reply.status(400).send({
+              error: `sourceRedactionStrategy ${entry.sourceRedactionStrategy} references column(s) that don't exist on "${entry.resourceId}": ${missing.join(', ')}. This resource's real columns are: ${[...realNames].join(', ')}.`,
+              statusCode: 400,
+            });
+          }
+        }
+      } catch (schemaError) {
+        logger.warn({ error: schemaError, resourceId: entry.resourceId }, 'Could not verify column names for source redaction; allowing declaration to proceed');
+      }
+    }
+
     try {
       const saved = await piiRegistryService.upsertEntry(entry);
       const created = resourceIdFromPath ? false : !existing;

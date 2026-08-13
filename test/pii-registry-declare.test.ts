@@ -399,6 +399,170 @@ describe('piiRegistryRoutes write API (auth + lifecycle)', () => {
     await app.close();
   });
 
+  it('rejects REDACT_IN_PLACE when userIdColumn does not exist on the real table', async () => {
+    // Reproduces a real live bug: a resource declared with userIdColumn
+    // "user_id" against a table that has no such column at all (a PII-scan
+    // metadata table, not per-user data) -- BigQuery rejected the deletion-
+    // time UPDATE with "Unrecognized name: user_id", and because the
+    // cascade evaluates every REDACT_IN_PLACE resource on every deletion
+    // regardless of that resource's own users, this single bad declaration
+    // blocked deletions tenant-wide.
+    const getColumns = jest.fn(async () => [
+      { name: 'resource_id', dataType: 'STRING', nullable: false, ordinalPosition: 1 },
+      { name: 'tenant_id', dataType: 'STRING', nullable: false, ordinalPosition: 2 },
+      { name: 'email', dataType: 'STRING', nullable: true, ordinalPosition: 3 },
+    ]);
+    const store = new FakeStore();
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], store),
+      writeToken: WRITE_TOKEN,
+      schemaSource: { getColumns },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'REDACT_IN_PLACE' },
+    });
+
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toContain("don't exist");
+    expect(JSON.parse(create.body).error).toContain('user_id');
+    expect(store.upserts).toHaveLength(0);
+
+    await app.close();
+  });
+
+  it('lists every missing column, not just the first, and reports the real columns available', async () => {
+    const getColumns = jest.fn(async () => [{ name: 'resource_id', dataType: 'STRING', nullable: false, ordinalPosition: 1 }]);
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      schemaSource: { getColumns },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'SHADOW_COPY' },
+    });
+
+    expect(create.statusCode).toBe(400);
+    const error = JSON.parse(create.body).error as string;
+    // userIdColumn, tenantIdColumn, and the declared "email" field are all
+    // missing from the real (single-column) schema.
+    expect(error).toContain('user_id');
+    expect(error).toContain('tenant_id');
+    expect(error).toContain('email');
+    expect(error).toContain('resource_id'); // the one real column, listed for context
+
+    await app.close();
+  });
+
+  it('allows REDACT_IN_PLACE when every referenced column genuinely exists', async () => {
+    const getColumns = jest.fn(async () => [
+      { name: 'user_id', dataType: 'STRING', nullable: false, ordinalPosition: 1 },
+      { name: 'tenant_id', dataType: 'STRING', nullable: false, ordinalPosition: 2 },
+      { name: 'email', dataType: 'STRING', nullable: true, ordinalPosition: 3 },
+    ]);
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      schemaSource: { getColumns },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'REDACT_IN_PLACE' },
+    });
+
+    expect(create.statusCode).toBe(201);
+
+    await app.close();
+  });
+
+  it('skips the column-existence check for sourceRedactionStrategy NONE', async () => {
+    // NONE never generates SQL referencing these columns, so a resource
+    // without a real userIdColumn (e.g. a system/metadata table) must still
+    // be declarable with the default strategy.
+    const getColumns = jest.fn(async () => [{ name: 'resource_id', dataType: 'STRING', nullable: false, ordinalPosition: 1 }]);
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      schemaSource: { getColumns },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'NONE' },
+    });
+
+    expect(create.statusCode).toBe(201);
+    expect(getColumns).not.toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  it('fails open on the column-existence check when getColumns returns empty (table not found, or schema-check failure)', async () => {
+    const getColumns = jest.fn(async () => []);
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      schemaSource: { getColumns },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'REDACT_IN_PLACE' },
+    });
+
+    expect(create.statusCode).toBe(201);
+
+    await app.close();
+  });
+
+  it('fails open on the column-existence check when getColumns itself throws', async () => {
+    const getColumns = jest.fn(async () => {
+      throw new Error('BigQuery unavailable');
+    });
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      schemaSource: { getColumns },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategy: 'REDACT_IN_PLACE' },
+    });
+
+    expect(create.statusCode).toBe(201);
+
+    await app.close();
+  });
+
   it('lists discovery findings and hides ones already declared', async () => {
     const service = new PiiRegistryService([], new FakeStore());
     const finding = {
