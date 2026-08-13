@@ -253,6 +253,56 @@ describe('SourceRedactionService', () => {
       expect(viewSql).toContain("WHERE s.tenant_id = 'acme'");
     });
 
+    it('excludes non-ENCRYPT fields from the pivot, since only ENCRYPT fields are ever synced into pii_vault', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(
+        registry, new BigQuery(), PII_VAULT_RESOURCE_ID, BATCH_DECRYPT_FN
+      );
+      // Reproduces a real live bug: a declared field literally named
+      // "user_id" with handling HASH_SURROGATE (not ENCRYPT) collided with
+      // the CTE's own `user_id` column and made BigQuery reject the whole
+      // view as an ambiguous GROUP BY. Even setting the crash aside, a
+      // HASH_SURROGATE/SYSTEM_IDENTIFIER field is never written to
+      // pii_vault as a field_name row, so pivoting it always resolves to
+      // NULL -- silently overwriting a real system column with NULL had
+      // this not crashed first.
+      const resource = makeManualEntry({
+        resourceId: 'bigquery:acme-project.crm.contacts',
+        sourceRedactionStrategy: 'SHADOW_COPY',
+        piiFields: [
+          { name: 'user_id', classification: 'SYSTEM_IDENTIFIER', handling: 'HASH_SURROGATE', requiredInMart: false },
+          { name: 'email', classification: 'DIRECT_IDENTIFIER', handling: 'ENCRYPT', requiredInMart: false },
+        ],
+      });
+
+      await service.ensureShadowCopy(resource);
+
+      const [, { view: viewSql }] = mockCreateTable.mock.calls[0] as [string, { view: string }];
+      expect(viewSql).toContain('SELECT s.* EXCEPT (email), d.email');
+      // The join condition's `d.user_id` legitimately references the CTE's
+      // own raw `user_id` column -- what must NOT appear is a second,
+      // pivoted `AS user_id` alias (that duplicate is what made the real
+      // bug's GROUP BY ambiguous).
+      expect(viewSql).not.toContain('AS user_id');
+      expect(viewSql).toContain('LEFT JOIN decrypted_pii d ON s.user_id = d.user_id');
+    });
+
+    it('refuses SHADOW_COPY when no declared field has ENCRYPT handling', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(
+        registry, new BigQuery(), PII_VAULT_RESOURCE_ID, BATCH_DECRYPT_FN
+      );
+      const resource = makeManualEntry({
+        sourceRedactionStrategy: 'SHADOW_COPY',
+        piiFields: [
+          { name: 'user_id', classification: 'SYSTEM_IDENTIFIER', handling: 'HASH_SURROGATE', requiredInMart: false },
+        ],
+      });
+
+      await expect(service.ensureShadowCopy(resource)).rejects.toThrow('only ENCRYPT fields are ever synced into pii_vault');
+      expect(mockCreateTable).not.toHaveBeenCalled();
+    });
+
     it('omits the tenant filter when the resource has no tenantIdColumn declared', async () => {
       const registry = new PiiRegistryService([]);
       const service = new SourceRedactionService(

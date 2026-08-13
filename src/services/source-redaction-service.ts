@@ -178,9 +178,18 @@ export class SourceRedactionService {
       throw new Error('Resource has no tenantId; refusing to build a shadow copy.');
     }
 
-    const fields = resource.piiFields.map((f) => f.name);
+    // Only ENCRYPT-handling fields are ever actually synced into pii_vault
+    // as field_name rows (see chameleon-data-pipelines' pii_vault_sync.py) --
+    // e.g. a HASH_SURROGATE field never appears there. Pivoting a
+    // non-ENCRYPT field would always resolve to NULL, and worse, if a
+    // customer happens to name one identically to a column this view
+    // already selects (confirmed live: a declared field literally named
+    // "user_id"), it collides with the CTE's own `user_id` column and
+    // BigQuery rejects the whole view with an ambiguous-GROUP-BY error
+    // before it can silently NULL that column out instead.
+    const fields = resource.piiFields.filter((f) => f.handling === 'ENCRYPT').map((f) => f.name);
     if (fields.length === 0) {
-      throw new Error('Resource has no declared piiFields to shadow-copy.');
+      throw new Error('Resource has no ENCRYPT-handling piiFields to shadow-copy (only ENCRYPT fields are ever synced into pii_vault).');
     }
 
     assertSafeIdentifiers([resource.userIdColumn, resource.tenantIdColumn, ...fields].filter(
