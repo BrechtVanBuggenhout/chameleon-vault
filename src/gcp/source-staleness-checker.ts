@@ -3,9 +3,19 @@ import { createLogger } from '../logging/index.js';
 
 const logger = createLogger('source-staleness-checker');
 
+/** Pre-built-image path's update check -- orthogonal to `results` below, which is the self-build path's. */
+export interface PlatformVersionStatus {
+  status: 'stale' | 'current' | 'unknown';
+  currentVersion?: string;
+  latestVersion?: string;
+  reason?: string;
+}
+
 export interface SourceStalenessResult {
   status: 'ok' | 'not_applicable';
   results?: Record<string, { status: 'stale' | 'current' | 'unknown'; builtSha?: string; latestSha?: string; reason?: string }>;
+  /** Present on every response regardless of `status` above -- see chameleon-data-pipelines' source_staleness.py. */
+  platformVersion?: PlatformVersionStatus;
 }
 
 /**

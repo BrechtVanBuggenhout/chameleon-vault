@@ -46,6 +46,25 @@ describe('SourceStalenessChecker', () => {
     expect(result).toEqual({ status: 'ok', results: { 'key-vault': { status: 'current', builtSha: 'a', latestSha: 'a' } } });
   });
 
+  it('passes through platformVersion untouched, regardless of the self-build results shape', async () => {
+    mockRequest.mockResolvedValueOnce({ data: { uri: 'https://pii-ingestor-worker-abc123.a.run.app' } });
+    mockIdTokenRequest.mockResolvedValueOnce({
+      data: {
+        status: 'not_applicable',
+        platformVersion: { status: 'stale', currentVersion: 'v2026.08.10', latestVersion: 'v2026.08.20' },
+      },
+    });
+    const checker = new SourceStalenessChecker('proj', 'us-central1', 'worker');
+
+    const result = await checker.check();
+
+    expect(result.platformVersion).toEqual({
+      status: 'stale',
+      currentVersion: 'v2026.08.10',
+      latestVersion: 'v2026.08.20',
+    });
+  });
+
   it('caches the resolved URL instead of re-querying the Admin API on every check', async () => {
     mockRequest.mockResolvedValueOnce({ data: { uri: 'https://pii-ingestor-worker-abc123.a.run.app' } });
     mockIdTokenRequest.mockResolvedValue({ data: { status: 'ok', results: {} } });
