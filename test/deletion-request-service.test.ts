@@ -142,13 +142,34 @@ describe('DeletionRequestService - createRequest actor attribution', () => {
   });
 
   it('passes the resolved actor email through to the repository', async () => {
-    await service.createRequest('user-1', 'op-1', 'acme', 'analyst@example.com');
+    const result = await service.createRequest('user-1', 'op-1', 'acme', 'analyst@example.com');
     expect(mockDeletionRequestRepo.createDeletionRequest).toHaveBeenCalledWith('user-1', 'op-1', 'acme', 'analyst@example.com');
+    expect(result.alreadyExisted).toBe(false);
   });
 
   it('passes undefined through when no actor was resolved (shared-key caller)', async () => {
-    await service.createRequest('user-1', 'op-1', 'acme');
+    const result = await service.createRequest('user-1', 'op-1', 'acme');
     expect(mockDeletionRequestRepo.createDeletionRequest).toHaveBeenCalledWith('user-1', 'op-1', 'acme', undefined);
+    expect(result.alreadyExisted).toBe(false);
+  });
+
+  it('flags alreadyExisted and skips creating a new request when one is already active', async () => {
+    const existing: DeletionRequest = {
+      deletion_request_id: 'del-existing',
+      tenant_id: 'acme',
+      user_id: 'user-1',
+      status: 'CASCADE_PARTIAL_FAILURE',
+      created_at: new Date(),
+      status_history: [],
+      janitor_wipes: [],
+    };
+    mockDeletionRequestRepo.getActiveDeletionRequestForUser = jest.fn().mockResolvedValue(existing) as never;
+
+    const result = await service.createRequest('user-1', 'op-2', 'acme');
+
+    expect(result.alreadyExisted).toBe(true);
+    expect(result.request).toEqual(existing);
+    expect(mockDeletionRequestRepo.createDeletionRequest).not.toHaveBeenCalled();
   });
 });
 
@@ -297,6 +318,121 @@ describe('DeletionRequestService - cascade outcome gates certificate issuance', 
           failedDestinations: expect.arrayContaining([expect.stringContaining('KMS signing key unavailable')]),
         },
       })
+    );
+  });
+});
+
+describe('DeletionRequestService - CASCADE_IN_PROGRESS retries a stuck CASCADE_PARTIAL_FAILURE', () => {
+  // Same manual-mock-class pattern as the suite above (automock doesn't
+  // wrap async prototype methods under this project's ts-jest ESM preset).
+  let service: DeletionRequestService;
+  let mockDeletionRequestRepo: { [K in keyof DeletionRequestRepository]: jest.Mock };
+  let mockFirestoreRegistry: { [K in keyof FirestoreRegistry]: jest.Mock };
+  let mockLineageRepository: { [K in keyof BigQueryLineageRepository]: jest.Mock };
+  let mockJanitorService: { [K in keyof JanitorService]: jest.Mock };
+  let mockDekKmsClient: { [K in keyof CloudKMSClient]: jest.Mock };
+  let mockCertificateService: { [K in keyof CertificateService]: jest.Mock };
+  let currentRequest: DeletionRequest;
+
+  beforeEach(() => {
+    currentRequest = {
+      deletion_request_id: 'del-1',
+      tenant_id: 'default-tenant',
+      user_id: 'user-1',
+      status: 'CASCADE_PARTIAL_FAILURE', // starting point for the retry
+      created_at: new Date(),
+      status_history: [],
+      janitor_wipes: [
+        { destination: 'hubspot', status: 'SUCCEEDED', updated_at: new Date() },
+        { destination: 'salesforce', status: 'FAILED', updated_at: new Date(), details: { error: 'timeout' } },
+      ],
+    };
+
+    mockDeletionRequestRepo = {
+      createDeletionRequest: jest.fn(),
+      getActiveDeletionRequestForUser: jest.fn(),
+      updateJanitorWipeStatus: jest.fn().mockResolvedValue(undefined),
+      getDeletionRequest: jest.fn(async () => ({ ...currentRequest })),
+      updateDeletionRequestStatus: jest.fn(async (_id: string, newStatus: DeletionRequestStatus, updateFields: any) => {
+        currentRequest = { ...currentRequest, ...updateFields, status: newStatus };
+      }),
+    } as any;
+    mockFirestoreRegistry = { shredKeyForUser: jest.fn().mockResolvedValue(undefined) } as any;
+    mockLineageRepository = { recordEvent: jest.fn().mockResolvedValue(undefined) } as any;
+    mockJanitorService = {
+      createCleanupPlan: jest.fn().mockResolvedValue([
+        { userId: 'user-1', destination: 'hubspot', status: 'PENDING', attempts: 0 },
+        { userId: 'user-1', destination: 'salesforce', status: 'PENDING', attempts: 0 },
+      ]),
+      processCleanup: jest.fn(),
+    } as any;
+    mockDekKmsClient = {} as any;
+    mockCertificateService = {
+      issueAndStoreCertificate: jest.fn().mockResolvedValue({ gcsPath: 'gs://certs/del-1.json' }),
+    } as any;
+
+    service = new DeletionRequestService(
+      mockDeletionRequestRepo as unknown as DeletionRequestRepository,
+      mockFirestoreRegistry as unknown as FirestoreRegistry,
+      mockLineageRepository as unknown as BigQueryLineageRepository,
+      mockJanitorService as unknown as JanitorService,
+      mockDekKmsClient as unknown as CloudKMSClient,
+      mockCertificateService as unknown as CertificateService,
+    );
+  });
+
+  async function flushMicrotasks(times = 15): Promise<void> {
+    for (let i = 0; i < times; i++) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  }
+
+  it('re-runs the cleanup loop and reaches CERTIFICATE_ISSUED when the retry succeeds', async () => {
+    mockJanitorService.processCleanup.mockResolvedValue([
+      { userId: 'user-1', destination: 'hubspot', status: 'COMPLETE', attempts: 1 },
+      { userId: 'user-1', destination: 'salesforce', status: 'COMPLETE', attempts: 2 },
+    ]);
+
+    await service.advanceRequest('del-1', 'CASCADE_IN_PROGRESS', 'op-2');
+    await flushMicrotasks();
+
+    expect(mockJanitorService.processCleanup).toHaveBeenCalledWith('user-1', 'default-tenant');
+    expect(mockDeletionRequestRepo.updateJanitorWipeStatus).toHaveBeenCalledWith(
+      'del-1', 'salesforce', 'SUCCEEDED', { attempts: 2, recordsFound: undefined }
+    );
+    expect(currentRequest.status).toBe('CERTIFICATE_ISSUED');
+    expect(mockCertificateService.issueAndStoreCertificate).toHaveBeenCalledWith('user-1', 'del-1', 'default-tenant');
+  });
+
+  it('lands back on CASCADE_PARTIAL_FAILURE, not stuck at CASCADE_IN_PROGRESS, when the retry fails again', async () => {
+    mockJanitorService.processCleanup.mockResolvedValue([
+      { userId: 'user-1', destination: 'hubspot', status: 'COMPLETE', attempts: 1 },
+      { userId: 'user-1', destination: 'salesforce', status: 'FAILED', attempts: 5 },
+    ]);
+
+    await service.advanceRequest('del-1', 'CASCADE_IN_PROGRESS', 'op-2');
+    await flushMicrotasks();
+
+    expect(currentRequest.status).toBe('CASCADE_PARTIAL_FAILURE');
+    expect(mockCertificateService.issueAndStoreCertificate).not.toHaveBeenCalled();
+  });
+
+  it('is a genuinely valid transition, not silently rejected, from CASCADE_PARTIAL_FAILURE', async () => {
+    mockJanitorService.processCleanup.mockResolvedValue([
+      { userId: 'user-1', destination: 'hubspot', status: 'COMPLETE', attempts: 1 },
+      { userId: 'user-1', destination: 'salesforce', status: 'COMPLETE', attempts: 1 },
+    ]);
+
+    // Before this fix, CASCADE_IN_PROGRESS had no case in the switch at all
+    // -- the status field would flip with zero real retry behavior. This
+    // asserts the retry actually did something, not just that the call
+    // didn't throw.
+    await service.advanceRequest('del-1', 'CASCADE_IN_PROGRESS', 'op-2');
+    await flushMicrotasks();
+
+    expect(mockJanitorService.createCleanupPlan).toHaveBeenCalledWith('user-1', 'default-tenant');
+    expect(mockLineageRepository.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ eventType: 'CASCADE_RETRY_TRIGGERED' })
     );
   });
 });

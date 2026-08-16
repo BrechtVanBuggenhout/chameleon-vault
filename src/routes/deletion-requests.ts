@@ -37,16 +37,23 @@ export async function deletionRequestRoutes(fastify: FastifyInstance, options: D
         context.userId = userId;
         context.operationId = operationId;
 
-        const deletionRequest = await deletionRequestService.createRequest(userId, operationId, tenantId, context.analystEmail);
+        const { request: deletionRequest, alreadyExisted } = await deletionRequestService.createRequest(userId, operationId, tenantId, context.analystEmail);
 
-        logger.info({ correlationId: context.correlationId, userId, deletionRequestId: deletionRequest.deletion_request_id, status: deletionRequest.status }, 'Deletion request created/retrieved');
-        
-        return reply.status(201).send({
+        logger.info({ correlationId: context.correlationId, userId, deletionRequestId: deletionRequest.deletion_request_id, status: deletionRequest.status, alreadyExisted }, 'Deletion request created/retrieved');
+
+        // 200 (not 201) when handing back a pre-existing request -- callers
+        // (the console) need this to tell "brand new, safe to advance
+        // straight to KEY_DESTROYED" from "already progressed, advancing
+        // blindly will hit an invalid state transition." alreadyExisted is
+        // included in the body too so a caller can branch without relying
+        // on the status code alone.
+        return reply.status(alreadyExisted ? 200 : 201).send({
           ...deletionRequest,
           // Explicitly add camelCase aliases for consistency in API responses
           // The underlying DeletionRequest object uses snake_case
           userId: deletionRequest.user_id,
           deletionRequestId: deletionRequest.deletion_request_id,
+          alreadyExisted,
         });
       } catch (error: unknown) {
         logger.error({ correlationId: context.correlationId, error, userId: (request.body as any)?.userId || (request.body as any)?.user_id }, 'Failed to create deletion request');

@@ -30,16 +30,21 @@ export class DeletionRequestService {
     operationId: string,
     tenantId: string = 'default-tenant',
     requestedBy?: string
-  ): Promise<DeletionRequest> {
+  ): Promise<{ request: DeletionRequest; alreadyExisted: boolean }> {
     // Check for existing active deletion request for the user
     const existingRequest = await this.deletionRequestRepo.getActiveDeletionRequestForUser(userId, tenantId);
     if (existingRequest) {
       logger.warn({ userId, existingRequestId: existingRequest.deletion_request_id }, 'Active deletion request already exists for user');
-      return existingRequest; // Return existing request for idempotency
+      // Idempotency: hand back the existing request rather than erroring --
+      // but callers MUST check alreadyExisted before blindly advancing it
+      // (e.g. straight to KEY_DESTROYED), since it may already be well past
+      // that point, or stuck in CASCADE_PARTIAL_FAILURE needing a real retry
+      // (CASCADE_IN_PROGRESS) rather than a from-scratch advance.
+      return { request: existingRequest, alreadyExisted: true };
     }
 
     const deletionRequest = await this.deletionRequestRepo.createDeletionRequest(userId, operationId, tenantId, requestedBy);
-    // RECOMMENDATION: Move to Cloud Logging Sinks. 
+    // RECOMMENDATION: Move to Cloud Logging Sinks.
     // Instead of calling BQ API, log a structured JSON object to stdout.
     // GCP Log Sinks will then transport this to BigQuery asynchronously without impacting app latency.
     await this.lineageRepo.recordEvent({
@@ -52,7 +57,7 @@ export class DeletionRequestService {
       destination: 'deletion-request-log',
       context: { status: 'SHRED_REQUESTED' },
     }).catch(err => logger.error({ err, userId }, 'Background lineage logging failed (SHRED_REQUESTED)'));
-    return deletionRequest;
+    return { request: deletionRequest, alreadyExisted: false };
   }
 
   async getRequest(deletionRequestId: string): Promise<DeletionRequest | null> {
@@ -98,87 +103,15 @@ export class DeletionRequestService {
           context: { status: 'KEY_SHREDDED', deletion_request_id: deletionRequestId, user_id: request.user_id },
         }).catch(err => logger.error({ err, userId: request.user_id }, 'Background lineage logging failed (KEY_DESTROYED)'));
         break;
-      case 'CASCADE_PENDING':
-        const tasks = await this.janitorService.createCleanupPlan(request.user_id, tenantId);
-        const redactionResources = this.sourceRedactionService?.planRedaction(tenantId) ?? [];
-
-        if (tasks.length === 0 && redactionResources.length === 0) {
+      case 'CASCADE_PENDING': {
+        const plan = await this.prepareCascadeTrigger(deletionRequestId, request, tenantId, operationId);
+        if (plan.shortcutToComplete) {
           logger.info({ userId: request.user_id }, 'No SaaS tasks or source redactions found, advancing to complete');
           // If no SaaS cleanup or source redaction is needed, move straight to COMPLETE
           return this.advanceRequest(deletionRequestId, 'CASCADE_COMPLETE', operationId);
         }
 
-        // Trigger the cleanup loop (SaaS wipes + declared-resource source
-        // redaction) after the CASCADE_PENDING state is persisted, otherwise
-        // fast connectors can race the state machine into an invalid
-        // transition.
-        afterStatusPersisted = () => {
-          Promise.all([
-            this.janitorService.processCleanup(request.user_id, tenantId),
-            redactionResources.length > 0 && this.sourceRedactionService
-              ? this.sourceRedactionService.redactUserInDeclaredSources(request.user_id, tenantId)
-              : Promise.resolve([]),
-          ]).then(async ([janitorResults, redactionResults]) => {
-            // Record each destination's real outcome on the request itself
-            // (janitor_wipes), not just as a lineage event -- this is what
-            // the next step actually gates on. processCleanup() already
-            // retries and DLQs permanent failures; the point here is to
-            // stop pretending nothing failed once it returns.
-            for (const result of janitorResults) {
-              await this.updateJanitorWipeStatus(
-                deletionRequestId,
-                result.destination,
-                result.status === 'COMPLETE' ? 'SUCCEEDED' : 'FAILED',
-                { attempts: result.attempts, recordsFound: result.recordsFound }
-              ).catch(err => logger.error({ err, destination: result.destination }, 'Failed to record janitor wipe status'));
-            }
-            // Source-redaction resources are tracked the same way, using
-            // the resource id as the destination label -- a redaction
-            // failure withholds the certificate exactly like a SaaS wipe
-            // failure already does, since both mean the user's data
-            // demonstrably still exists somewhere Chameleon knows about.
-            for (const result of redactionResults) {
-              await this.updateJanitorWipeStatus(
-                deletionRequestId,
-                result.resourceId,
-                result.success ? 'SUCCEEDED' : 'FAILED',
-                { rowsAffected: result.rowsAffected, error: result.error }
-              ).catch(err => logger.error({ err, destination: result.resourceId }, 'Failed to record source redaction status'));
-            }
-
-            const failedJanitor = janitorResults.filter(r => r.status !== 'COMPLETE');
-            const failedRedaction = redactionResults.filter(r => !r.success);
-            const nextStatus: DeletionRequestStatus =
-              failedJanitor.length > 0 || failedRedaction.length > 0 ? 'CASCADE_PARTIAL_FAILURE' : 'CASCADE_COMPLETE';
-            await this.advanceRequest(deletionRequestId, nextStatus, operationId, {
-              failedDestinations: [...failedJanitor.map(r => r.destination), ...failedRedaction.map(r => r.resourceId)],
-            });
-          }).catch(async (err) => {
-            logger.error({ err, userId: request.user_id }, 'Janitor cleanup / source redaction loop failed');
-            // This only fires for a throw *inside* the .then() above --
-            // janitorService.processCleanup and
-            // sourceRedactionService.redactUserInDeclaredSources both catch
-            // internally and never reject the Promise.all itself. The most
-            // likely case is CASCADE_COMPLETE's own recursive advanceRequest
-            // into CERTIFICATE_ISSUED throwing (e.g. certificate issuance
-            // failing) -- CASCADE_COMPLETE has already been persisted by
-            // then, so the request would otherwise sit there silently,
-            // looking "done" with no certificate and no visible error.
-            // Force a terminal, visible failure state instead of only
-            // logging, so this never becomes another silent stall.
-            try {
-              await this.advanceRequest(deletionRequestId, 'CASCADE_PARTIAL_FAILURE', operationId, {
-                failedDestinations: [`internal-error: ${err instanceof Error ? err.message : String(err)}`],
-              });
-            } catch (recoveryErr) {
-              logger.error(
-                { recoveryErr, deletionRequestId },
-                'Failed to force deletion request into a visible failure state after cascade error'
-              );
-            }
-          });
-        };
-
+        afterStatusPersisted = plan.afterStatusPersisted;
         logger.info({ deletionRequestId, userId: request.user_id }, 'Janitor cascade triggered for user');
 
         updateFields.cascade_initiated_at = new Date();
@@ -190,9 +123,43 @@ export class DeletionRequestService {
           eventType: 'JANITOR_TRIGGERED',
           source: 'key-vault',
           destination: 'janitor-service',
-          context: { destinations: tasks.map(t => t.destination) },
+          context: { destinations: plan.taskDestinations },
         }).catch(err => logger.error({ err, userId: request.user_id }, 'Background lineage logging failed (JANITOR_TRIGGERED)'));
         break;
+      }
+      case 'CASCADE_IN_PROGRESS': {
+        // Retry path from CASCADE_PARTIAL_FAILURE. Before this, the
+        // transition table advertised this as valid but nothing here ever
+        // handled it -- advancing into CASCADE_IN_PROGRESS just flipped the
+        // status field with no real retry, leaving the request permanently
+        // stuck with no certificate and no way to actually fix it (found via
+        // a real customer report 2026-08-16). Re-runs the exact same
+        // cleanup loop CASCADE_PENDING triggers -- simple and correct: wipe
+        // operations are idempotent, so re-attempting an already-succeeded
+        // destination is harmless, and this reuses one code path instead of
+        // maintaining "retry failed-only" logic that isn't needed yet.
+        const plan = await this.prepareCascadeTrigger(deletionRequestId, request, tenantId, operationId);
+        if (plan.shortcutToComplete) {
+          logger.info({ userId: request.user_id }, 'Cascade retry found nothing left to wipe, advancing to complete');
+          return this.advanceRequest(deletionRequestId, 'CASCADE_COMPLETE', operationId);
+        }
+
+        afterStatusPersisted = plan.afterStatusPersisted;
+        logger.info({ deletionRequestId, userId: request.user_id }, 'Cascade retry triggered for user');
+
+        updateFields.cascade_initiated_at = new Date();
+        await this.lineageRepo.recordEvent({
+          operationId,
+          deletionRequestId,
+          userId: request.user_id,
+          tenantId,
+          eventType: 'CASCADE_RETRY_TRIGGERED',
+          source: 'key-vault',
+          destination: 'janitor-service',
+          context: { destinations: plan.taskDestinations },
+        }).catch(err => logger.error({ err, userId: request.user_id }, 'Background lineage logging failed (CASCADE_RETRY_TRIGGERED)'));
+        break;
+      }
       case 'CASCADE_COMPLETE':
         // When cascade is done, automatically move to certificate issuance
         await this.deletionRequestRepo.updateDeletionRequestStatus(deletionRequestId, newStatus, updateFields);
@@ -244,6 +211,96 @@ export class DeletionRequestService {
     await this.deletionRequestRepo.updateDeletionRequestStatus(deletionRequestId, newStatus, updateFields);
     afterStatusPersisted?.();
     return { ...request, ...updateFields, status: newStatus };
+  }
+
+  /**
+   * Shared by CASCADE_PENDING (first attempt) and CASCADE_IN_PROGRESS
+   * (retry after CASCADE_PARTIAL_FAILURE) -- builds the cleanup plan and, if
+   * there's real work to do, the closure that runs the janitor + source
+   * redaction loop and records each destination's outcome. Kept as one path
+   * so a retry can never drift from what a first attempt actually does.
+   */
+  private async prepareCascadeTrigger(
+    deletionRequestId: string,
+    request: DeletionRequest,
+    tenantId: string,
+    operationId: string
+  ): Promise<{ shortcutToComplete: true } | { shortcutToComplete: false; afterStatusPersisted: () => void; taskDestinations: string[] }> {
+    const tasks = await this.janitorService.createCleanupPlan(request.user_id, tenantId);
+    const redactionResources = this.sourceRedactionService?.planRedaction(tenantId) ?? [];
+
+    if (tasks.length === 0 && redactionResources.length === 0) {
+      return { shortcutToComplete: true };
+    }
+
+    const afterStatusPersisted = () => {
+      Promise.all([
+        this.janitorService.processCleanup(request.user_id, tenantId),
+        redactionResources.length > 0 && this.sourceRedactionService
+          ? this.sourceRedactionService.redactUserInDeclaredSources(request.user_id, tenantId)
+          : Promise.resolve([]),
+      ]).then(async ([janitorResults, redactionResults]) => {
+        // Record each destination's real outcome on the request itself
+        // (janitor_wipes), not just as a lineage event -- this is what
+        // the next step actually gates on. processCleanup() already
+        // retries and DLQs permanent failures; the point here is to
+        // stop pretending nothing failed once it returns.
+        for (const result of janitorResults) {
+          await this.updateJanitorWipeStatus(
+            deletionRequestId,
+            result.destination,
+            result.status === 'COMPLETE' ? 'SUCCEEDED' : 'FAILED',
+            { attempts: result.attempts, recordsFound: result.recordsFound }
+          ).catch(err => logger.error({ err, destination: result.destination }, 'Failed to record janitor wipe status'));
+        }
+        // Source-redaction resources are tracked the same way, using
+        // the resource id as the destination label -- a redaction
+        // failure withholds the certificate exactly like a SaaS wipe
+        // failure already does, since both mean the user's data
+        // demonstrably still exists somewhere Chameleon knows about.
+        for (const result of redactionResults) {
+          await this.updateJanitorWipeStatus(
+            deletionRequestId,
+            result.resourceId,
+            result.success ? 'SUCCEEDED' : 'FAILED',
+            { rowsAffected: result.rowsAffected, error: result.error }
+          ).catch(err => logger.error({ err, destination: result.resourceId }, 'Failed to record source redaction status'));
+        }
+
+        const failedJanitor = janitorResults.filter(r => r.status !== 'COMPLETE');
+        const failedRedaction = redactionResults.filter(r => !r.success);
+        const nextStatus: DeletionRequestStatus =
+          failedJanitor.length > 0 || failedRedaction.length > 0 ? 'CASCADE_PARTIAL_FAILURE' : 'CASCADE_COMPLETE';
+        await this.advanceRequest(deletionRequestId, nextStatus, operationId, {
+          failedDestinations: [...failedJanitor.map(r => r.destination), ...failedRedaction.map(r => r.resourceId)],
+        });
+      }).catch(async (err) => {
+        logger.error({ err, userId: request.user_id }, 'Janitor cleanup / source redaction loop failed');
+        // This only fires for a throw *inside* the .then() above --
+        // janitorService.processCleanup and
+        // sourceRedactionService.redactUserInDeclaredSources both catch
+        // internally and never reject the Promise.all itself. The most
+        // likely case is CASCADE_COMPLETE's own recursive advanceRequest
+        // into CERTIFICATE_ISSUED throwing (e.g. certificate issuance
+        // failing) -- CASCADE_COMPLETE has already been persisted by
+        // then, so the request would otherwise sit there silently,
+        // looking "done" with no certificate and no visible error.
+        // Force a terminal, visible failure state instead of only
+        // logging, so this never becomes another silent stall.
+        try {
+          await this.advanceRequest(deletionRequestId, 'CASCADE_PARTIAL_FAILURE', operationId, {
+            failedDestinations: [`internal-error: ${err instanceof Error ? err.message : String(err)}`],
+          });
+        } catch (recoveryErr) {
+          logger.error(
+            { recoveryErr, deletionRequestId },
+            'Failed to force deletion request into a visible failure state after cascade error'
+          );
+        }
+      });
+    };
+
+    return { shortcutToComplete: false, afterStatusPersisted, taskDestinations: tasks.map(t => t.destination) };
   }
 
   async updateJanitorWipeStatus(

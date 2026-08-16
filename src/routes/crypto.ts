@@ -591,11 +591,35 @@ export async function cryptoRoutes(
       }
 
       // Initiate the deletion request state machine
-      let deletionRequest = await deletionRequestService.createRequest(userId, operationId, tenantId);
-      
+      const created = await deletionRequestService.createRequest(userId, operationId, tenantId);
+      let deletionRequest = created.request;
+
+      if (created.alreadyExisted) {
+        // A request for this user is already past SHRED_REQUESTED (possibly
+        // stuck in CASCADE_PARTIAL_FAILURE) -- advancing straight to
+        // KEY_DESTROYED here would hit an invalid state transition, exactly
+        // the bug this route shared with POST /deletion-requests. Report its
+        // real current status instead of blindly advancing it; retrying a
+        // stuck cascade goes through POST /deletion-requests/:id/advance
+        // with newStatus=CASCADE_IN_PROGRESS.
+        logger.info(
+          { correlationId: context.correlationId, userId, deletionRequestId: deletionRequest.deletion_request_id, status: deletionRequest.status },
+          'Deletion request already exists for user, returning its current status instead of re-advancing'
+        );
+        return reply.status(200).send({
+          status: deletionRequest.status,
+          userId,
+          user_id: userId,
+          deletionRequestId: deletionRequest.deletion_request_id,
+          deletion_request_id: deletionRequest.deletion_request_id,
+          timestamp: new Date().toISOString(),
+          message: 'Deletion process is already in progress or completed.',
+        });
+      }
+
       // Immediately advance to KEY_DESTROYED (this will trigger actual DEK removal)
       deletionRequest = await deletionRequestService.advanceRequest(deletionRequest.deletion_request_id, 'KEY_DESTROYED', operationId);
-      
+
       // Then advance to CASCADE_PENDING (this will trigger Janitor dispatch)
       deletionRequest = await deletionRequestService.advanceRequest(deletionRequest.deletion_request_id, 'CASCADE_PENDING', operationId);
 
