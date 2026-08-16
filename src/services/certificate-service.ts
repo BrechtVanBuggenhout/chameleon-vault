@@ -12,6 +12,22 @@ import { connectorRegistry } from './registry.js';
 
 const logger = createLogger('certificate-service');
 
+// Firestore's Node SDK reads timestamp fields back as its own Timestamp
+// class, not a native Date -- `instanceof Date` fails on it, and it has no
+// toString() override, so String(timestampInstance) silently produces the
+// literal string "[object Object]" instead of throwing. Found live in a
+// real issued certificate's lineageSummary (Immoscoop, 2026-08-17). Duck-
+// types via toDate() rather than importing Timestamp, since a plain Date
+// also needs to work here (e.g. in tests that construct janitor_wipes by
+// hand) and only one of the two ever has that method.
+function timestampToIso(value: unknown): string {
+  if (value instanceof Date) return value.toISOString();
+  if (value && typeof (value as { toDate?: unknown }).toDate === 'function') {
+    return (value as { toDate: () => Date }).toDate().toISOString();
+  }
+  return String(value);
+}
+
 export class CertificateService {
   constructor(
     private readonly firestoreRegistry: FirestoreRegistry,
@@ -79,8 +95,18 @@ export class CertificateService {
       .filter(wipe => wipe.status === 'SUCCEEDED')
       .map(wipe => ({
         system: wipe.destination,
-        status: wipe.details?.recordsFound === 0 ? ('CONFIRMED_ABSENT' as const) : ('ERASED' as const),
-        timestamp: wipe.updated_at instanceof Date ? wipe.updated_at.toISOString() : String(wipe.updated_at),
+        // recordsFound === 0 is the janitor/SaaS connectors' "nothing here"
+        // signal; rowsAffected === 0 is source-redaction's equivalent (see
+        // source-redaction-service.ts's redactOne, which returns
+        // numDmlAffectedRows). Before this fix only recordsFound was
+        // checked, so a REDACT_IN_PLACE UPDATE matching zero rows -- e.g. a
+        // WHERE clause that can never match, found live on Immoscoop
+        // 2026-08-17 -- got unconditionally labeled ERASED with no
+        // indication nothing was actually redacted.
+        status: (wipe.details?.recordsFound === 0 || wipe.details?.rowsAffected === 0)
+          ? ('CONFIRMED_ABSENT' as const)
+          : ('ERASED' as const),
+        timestamp: timestampToIso(wipe.updated_at),
       }));
 
     const ghostDataSummary = await this.lineageRepo.getGhostDataFindings(userId, tenantId);
