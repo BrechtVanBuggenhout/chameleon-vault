@@ -117,6 +117,38 @@ describe('buildManualEntry (validation)', () => {
     expect(errors.some((e) => e.includes('userIdColumn is required'))).toBe(true);
   });
 
+  // Real bug, confirmed twice against live customer data (agencyAndOfficeMigration,
+  // then federated_user): declaring the same column as both userIdColumn and
+  // tenantIdColumn silently breaks tenant-scoped reads for every row synced
+  // under it. See pii-registry-validation.ts's comment on this check.
+  it('rejects tenantIdColumn being the same column as userIdColumn', () => {
+    const { entry, errors } = buildManualEntry(
+      { ...validInput, userIdColumn: 'office_ref', tenantIdColumn: 'office_ref' },
+      'acme'
+    );
+    expect(entry).toBeUndefined();
+    expect(errors.some((e) => e.includes('cannot be the same column'))).toBe(true);
+  });
+
+  it('allows userIdColumn and tenantIdColumn to differ', () => {
+    const { entry, errors } = buildManualEntry(
+      { ...validInput, userIdColumn: 'user_id', tenantIdColumn: 'tenant_id' },
+      'acme'
+    );
+    expect(errors).toEqual([]);
+    expect(entry?.userIdColumn).toBe('user_id');
+    expect(entry?.tenantIdColumn).toBe('tenant_id');
+  });
+
+  it('allows tenantIdColumn to be entirely unset (the correct single-tenant declaration)', () => {
+    const { entry, errors } = buildManualEntry(
+      { ...validInput, userIdColumn: 'user_id', tenantIdColumn: undefined },
+      'acme'
+    );
+    expect(errors).toEqual([]);
+    expect(entry?.tenantIdColumn).toBeUndefined();
+  });
+
   it('stamps declaredBy and lastModifiedBy on first declare when an actor is resolved', () => {
     const { entry } = buildManualEntry(validInput, 'acme', new Date(), undefined, 'analyst@example.com');
     expect(entry?.declaredBy).toBe('analyst@example.com');

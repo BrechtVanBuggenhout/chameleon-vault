@@ -96,6 +96,24 @@ export function buildManualEntry(
   ) {
     errors.push('userIdColumn is required when sourceRedactionStrategy is REDACT_IN_PLACE or SHADOW_COPY.');
   }
+  // A real, twice-confirmed mistake (agencyAndOfficeMigration, then
+  // federated_user): declaring the same column as both userIdColumn and
+  // tenantIdColumn. For REDACT_IN_PLACE this produces a WHERE clause
+  // (col = @userId AND col = @tenantId) that can never match any row --
+  // silent no-op redaction, later certified as ERASED regardless. For
+  // pii_vault sync (pii_vault_sync.py's _sync_chunk) it's worse and
+  // doesn't require REDACT_IN_PLACE to trigger: every synced row's
+  // tenant_id becomes a per-user value instead of the real tenant, making
+  // every tenant-scoped read (decrypt-on-demand, decrypted views) come up
+  // empty for data that's genuinely there. Reject outright rather than
+  // warn -- there's no legitimate reason for these to be the same column.
+  if (
+    isNonEmptyString(input.userIdColumn) &&
+    isNonEmptyString(input.tenantIdColumn) &&
+    input.userIdColumn === input.tenantIdColumn
+  ) {
+    errors.push('userIdColumn and tenantIdColumn cannot be the same column -- this makes every row\'s tenant_id a per-user value instead of a real tenant identifier, and (with REDACT_IN_PLACE/SHADOW_COPY) an unsatisfiable WHERE clause. Leave tenantIdColumn unset for a single-tenant source.');
+  }
   if (input.status !== undefined && !STATUSES.includes(input.status)) {
     errors.push(`status must be one of: ${STATUSES.join(', ')}.`);
   }
