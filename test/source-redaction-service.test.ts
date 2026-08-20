@@ -360,4 +360,269 @@ describe('SourceRedactionService', () => {
       expect(mockDataset).not.toHaveBeenCalled();
     });
   });
+
+  describe('planEncryptedCopyDeletion / deleteUserFromEncryptedCopies', () => {
+    it('finds only manual, ENCRYPTED_COPY-opted-in resources for the tenant, via the array field', () => {
+      const registry = new PiiRegistryService([
+        makeManualEntry({
+          resourceId: 'bigquery:acme.crm.contacts',
+          sourceRedactionStrategy: 'NONE',
+          sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+        }),
+        makeManualEntry({ resourceId: 'bigquery:acme.crm.leads', sourceRedactionStrategy: 'REDACT_IN_PLACE' }),
+        makeManualEntry({
+          resourceId: 'bigquery:acme.crm.other_tenant',
+          tenantId: 'other-tenant',
+          sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+        }),
+      ]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+
+      const plan = service.planEncryptedCopyDeletion('acme');
+
+      expect(plan.map((e) => e.resourceId)).toEqual(['bigquery:acme.crm.contacts']);
+    });
+
+    it('a resource combining REDACT_IN_PLACE and ENCRYPTED_COPY is found by both plan methods', () => {
+      const registry = new PiiRegistryService([
+        makeManualEntry({
+          resourceId: 'bigquery:acme.crm.contacts',
+          sourceRedactionStrategy: 'NONE',
+          sourceRedactionStrategies: ['REDACT_IN_PLACE', 'ENCRYPTED_COPY'],
+        }),
+      ]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+
+      expect(service.planRedaction('acme').map((e) => e.resourceId)).toEqual(['bigquery:acme.crm.contacts']);
+      expect(service.planEncryptedCopyDeletion('acme').map((e) => e.resourceId)).toEqual(['bigquery:acme.crm.contacts']);
+    });
+
+    it('returns an empty result when no resources are opted in', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+
+      const results = await service.deleteUserFromEncryptedCopies('user-1', 'acme');
+
+      expect(results).toEqual([]);
+      expect(mockCreateQueryJob).not.toHaveBeenCalled();
+    });
+
+    it('builds a correctly-scoped DELETE against the raw table and returns rowsAffected on success', async () => {
+      const registry = new PiiRegistryService([
+        makeManualEntry({
+          resourceId: 'bigquery:acme-project.crm.contacts',
+          sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+        }),
+      ]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      queryMetadata = { statistics: { query: { numDmlAffectedRows: '2' } } };
+
+      const results = await service.deleteUserFromEncryptedCopies('user-1', 'acme');
+
+      expect(mockCreateQueryJob).toHaveBeenCalledWith({
+        query: 'DELETE FROM `acme-project.crm.contacts_encrypted_raw` WHERE user_id = @userId AND tenant_id = @tenantId',
+        params: { userId: 'user-1', tenantId: 'acme' },
+      });
+      expect(results).toEqual([
+        { resourceId: 'bigquery:acme-project.crm.contacts', success: true, rowsAffected: 2 },
+      ]);
+    });
+
+    it('omits the tenant clause when the resource has no tenantIdColumn declared', async () => {
+      const registry = new PiiRegistryService([
+        makeManualEntry({
+          resourceId: 'bigquery:acme-project.crm.contacts',
+          sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+          tenantIdColumn: undefined,
+        }),
+      ]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+
+      await service.deleteUserFromEncryptedCopies('user-1', 'acme');
+
+      expect(mockCreateQueryJob).toHaveBeenCalledWith({
+        query: 'DELETE FROM `acme-project.crm.contacts_encrypted_raw` WHERE user_id = @userId',
+        params: { userId: 'user-1' },
+      });
+    });
+
+    it('fails one resource without aborting the others', async () => {
+      const registry = new PiiRegistryService([
+        makeManualEntry({
+          resourceId: 'bigquery:acme-project.crm.contacts',
+          sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+        }),
+        makeManualEntry({
+          resourceId: 'salesforce:leads',
+          system: 'salesforce',
+          sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+        }),
+      ]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+
+      const results = await service.deleteUserFromEncryptedCopies('user-1', 'acme');
+
+      expect(results).toEqual([
+        { resourceId: 'bigquery:acme-project.crm.contacts', success: true, rowsAffected: 1 },
+        {
+          resourceId: 'salesforce:leads',
+          success: false,
+          error: 'sourceRedactionStrategy ENCRYPTED_COPY is only implemented for bigquery resources, got "salesforce".',
+        },
+      ]);
+    });
+
+    it('refuses to run a deletion with an unsafe userIdColumn identifier, without ever attempting the query', async () => {
+      const registry = new PiiRegistryService([
+        makeManualEntry({
+          sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+          userIdColumn: 'user-id; DROP TABLE users; --',
+        }),
+      ]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+
+      const results = await service.deleteUserFromEncryptedCopies('user-1', 'acme');
+
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toContain('not a safe column/table name');
+      expect(mockCreateQueryJob).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('ensureEncryptedCopyTable', () => {
+    it('is a no-op when the resource is not opted into ENCRYPTED_COPY', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({ sourceRedactionStrategy: 'REDACT_IN_PLACE' });
+
+      await service.ensureEncryptedCopyTable(resource);
+
+      expect(mockCreateQueryJob).not.toHaveBeenCalled();
+      expect(mockCreateTable).not.toHaveBeenCalled();
+    });
+
+    it('refuses ENCRYPTED_COPY for a non-bigquery resource', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({
+        resourceId: 'salesforce:leads',
+        system: 'salesforce',
+        sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+      });
+
+      await expect(service.ensureEncryptedCopyTable(resource)).rejects.toThrow(
+        'sourceRedactionStrategy ENCRYPTED_COPY is only implemented for bigquery resources, got "salesforce".'
+      );
+    });
+
+    it('refuses ENCRYPTED_COPY when no userIdColumn is declared', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({
+        sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+        userIdColumn: undefined,
+      });
+
+      await expect(service.ensureEncryptedCopyTable(resource)).rejects.toThrow(
+        'Resource has no userIdColumn declared'
+      );
+    });
+
+    it('refuses ENCRYPTED_COPY when no declared field has ENCRYPT handling', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({
+        sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+        piiFields: [
+          { name: 'user_id', classification: 'SYSTEM_IDENTIFIER', handling: 'HASH_SURROGATE', requiredInMart: false },
+        ],
+      });
+
+      await expect(service.ensureEncryptedCopyTable(resource)).rejects.toThrow(
+        'only ENCRYPT fields are ever synced into pii_vault'
+      );
+    });
+
+    it('creates the raw table, adds any missing PII columns, and creates the dedup view', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({
+        resourceId: 'bigquery:acme-project.crm.contacts',
+        sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+        piiFields: [
+          { name: 'email', classification: 'DIRECT_IDENTIFIER', handling: 'ENCRYPT', requiredInMart: false },
+          { name: 'phone', classification: 'CONTACT', handling: 'ENCRYPT', requiredInMart: false },
+        ],
+      });
+
+      await service.ensureEncryptedCopyTable(resource);
+
+      expect(mockCreateQueryJob).toHaveBeenNthCalledWith(1, {
+        query:
+          'CREATE TABLE IF NOT EXISTS `acme-project.crm.contacts_encrypted_raw` AS\n' +
+          'SELECT\n' +
+          '    s.* EXCEPT (email, phone),\n' +
+          '    CAST(NULL AS STRING) AS email,\n' +
+          '    CAST(NULL AS STRING) AS phone,\n' +
+          '    CAST(NULL AS TIMESTAMP) AS synced_at\n' +
+          'FROM `acme-project.crm.contacts` s\n' +
+          'WHERE FALSE',
+      });
+      expect(mockCreateQueryJob).toHaveBeenNthCalledWith(2, {
+        query:
+          'ALTER TABLE `acme-project.crm.contacts_encrypted_raw`\n' +
+          '  ADD COLUMN IF NOT EXISTS email STRING,\n' +
+          '  ADD COLUMN IF NOT EXISTS phone STRING',
+      });
+      expect(mockDataset).toHaveBeenCalledWith('crm', { projectId: 'acme-project' });
+      expect(mockCreateTable).toHaveBeenCalledWith('contacts_encrypted', {
+        view:
+          'SELECT * FROM `acme-project.crm.contacts_encrypted_raw`\n' +
+          'QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY synced_at DESC) = 1',
+      });
+    });
+
+    it('falls back to CREATE OR REPLACE VIEW when the view already exists (redeclare)', async () => {
+      mockCreateTable.mockRejectedValueOnce({ code: 409 });
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({
+        resourceId: 'bigquery:acme-project.crm.contacts',
+        sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+      });
+
+      await service.ensureEncryptedCopyTable(resource);
+
+      expect(mockCreateTable).toHaveBeenCalledTimes(1);
+      expect(mockCreateQueryJob).toHaveBeenNthCalledWith(3, {
+        query:
+          'CREATE OR REPLACE VIEW `acme-project.crm.contacts_encrypted` AS\n' +
+          'SELECT * FROM `acme-project.crm.contacts_encrypted_raw`\n' +
+          'QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY synced_at DESC) = 1',
+      });
+    });
+
+    it('rethrows a real (non-409) view-creation failure', async () => {
+      mockCreateTable.mockRejectedValueOnce({ code: 500 });
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({ sourceRedactionStrategies: ['ENCRYPTED_COPY'] });
+
+      await expect(service.ensureEncryptedCopyTable(resource)).rejects.toEqual({ code: 500 });
+    });
+
+    it('refuses to build an encrypted copy with an unsafe field identifier, without ever attempting a query', async () => {
+      const registry = new PiiRegistryService([]);
+      const service = new SourceRedactionService(registry, new BigQuery());
+      const resource = makeManualEntry({
+        sourceRedactionStrategies: ['ENCRYPTED_COPY'],
+        piiFields: [
+          { name: 'email); DROP TABLE users; --', classification: 'DIRECT_IDENTIFIER', handling: 'ENCRYPT', requiredInMart: false },
+        ],
+      });
+
+      await expect(service.ensureEncryptedCopyTable(resource)).rejects.toThrow('not a safe column/table name');
+      expect(mockCreateQueryJob).not.toHaveBeenCalled();
+    });
+  });
 });

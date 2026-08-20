@@ -13,6 +13,7 @@ import {
   type RegistryEntryStatus,
   type SourceRedactionStrategy,
 } from '../types/pii-registry.js';
+import { resolveSourceRedactionStrategies } from './source-redaction-strategies.js';
 
 const SYSTEMS: PiiSystem[] = ['bigquery', 'gcs', 'firestore', 'log', 'hubspot', 'salesforce', 'external'];
 const CLASSIFICATIONS: PiiClassification[] = [
@@ -25,7 +26,11 @@ const CLASSIFICATIONS: PiiClassification[] = [
 ];
 const HANDLINGS: PiiHandling[] = ['ENCRYPT', 'TOKENIZE', 'REDACT', 'HASH_SURROGATE', 'ALLOW_AGGREGATE_ONLY', 'MANUAL_REVIEW'];
 const DELETION_STRATEGIES: DeletionStrategy[] = ['CRYPTO_SHRED', 'DELETE_ROWS', 'REDACT_FIELDS', 'EXTERNAL_WIPE', 'MANUAL_REVIEW'];
-const SOURCE_REDACTION_STRATEGIES: SourceRedactionStrategy[] = ['NONE', 'REDACT_IN_PLACE', 'SHADOW_COPY'];
+const SOURCE_REDACTION_STRATEGIES: SourceRedactionStrategy[] = ['NONE', 'REDACT_IN_PLACE', 'SHADOW_COPY', 'ENCRYPTED_COPY'];
+// The array field's members -- deliberately excludes 'NONE', which is only
+// ever the legacy singular field's "nothing" value (an empty array is the
+// array field's equivalent).
+const SOURCE_REDACTION_ARRAY_STRATEGIES: SourceRedactionStrategy[] = ['REDACT_IN_PLACE', 'SHADOW_COPY', 'ENCRYPTED_COPY'];
 const LAYERS: PiiResourceLayer[] = ['RAW', 'STAGING', 'INTERMEDIATE', 'MART', 'SAAS'];
 const VISIBILITIES: PiiResourceVisibility[] = ['CUSTOMER_FACING', 'INTERNAL'];
 const STATUSES: RegistryEntryStatus[] = ['APPROVED', 'PENDING_REVIEW', 'DEPRECATED', 'DISABLED'];
@@ -85,16 +90,34 @@ export function buildManualEntry(
   ) {
     errors.push(`sourceRedactionStrategy must be one of: ${SOURCE_REDACTION_STRATEGIES.join(', ')}.`);
   }
+  if (input.sourceRedactionStrategies !== undefined) {
+    if (!Array.isArray(input.sourceRedactionStrategies)) {
+      errors.push('sourceRedactionStrategies must be an array.');
+    } else {
+      input.sourceRedactionStrategies.forEach((strategy, index) => {
+        if (!SOURCE_REDACTION_ARRAY_STRATEGIES.includes(strategy)) {
+          errors.push(
+            `sourceRedactionStrategies[${index}] must be one of: ${SOURCE_REDACTION_ARRAY_STRATEGIES.join(', ')} ('NONE' is not valid inside the array -- send an empty array for none).`
+          );
+        }
+      });
+    }
+  }
   // REDACT_IN_PLACE generates a real UPDATE against the customer's own table,
-  // scoped by userIdColumn -- without one there is no safe WHERE clause, and
-  // this is real destructive-write functionality, not just descriptive
-  // metadata like the rest of this schema. Fail closed rather than silently
-  // accepting a declaration that could later redact an entire table.
-  if (
-    (input.sourceRedactionStrategy === 'REDACT_IN_PLACE' || input.sourceRedactionStrategy === 'SHADOW_COPY') &&
-    !isNonEmptyString(input.userIdColumn)
-  ) {
-    errors.push('userIdColumn is required when sourceRedactionStrategy is REDACT_IN_PLACE or SHADOW_COPY.');
+  // SHADOW_COPY and ENCRYPTED_COPY both key their table/view off the same
+  // column -- all three need a real userIdColumn, and this is real
+  // destructive/stateful functionality, not just descriptive metadata like
+  // the rest of this schema. Fail closed rather than silently accepting a
+  // declaration that could later redact or copy an entire table keyed on
+  // nothing. Checks the resolved set (array if present, else the legacy
+  // singular field) so this applies uniformly regardless of which the
+  // caller sent.
+  const requestedSourceRedactionStrategies = resolveSourceRedactionStrategies({
+    sourceRedactionStrategy: input.sourceRedactionStrategy,
+    sourceRedactionStrategies: input.sourceRedactionStrategies,
+  });
+  if (requestedSourceRedactionStrategies.length > 0 && !isNonEmptyString(input.userIdColumn)) {
+    errors.push('userIdColumn is required when sourceRedactionStrategies is non-empty (REDACT_IN_PLACE, SHADOW_COPY, and ENCRYPTED_COPY all need it).');
   }
   // A real, twice-confirmed mistake (agencyAndOfficeMigration, then
   // federated_user): declaring the same column as both userIdColumn and
@@ -171,7 +194,12 @@ export function buildManualEntry(
     ownerConnector: MANUAL_OWNER_CONNECTOR,
     lineageDestination: input.resourceId,
     deletionStrategy: input.deletionStrategy ?? 'CRYPTO_SHRED',
+    // Legacy singular field kept for read-compat with pre-array documents
+    // (see its @deprecated doc comment) -- never read back directly by new
+    // code, but still written so anything not yet migrated to
+    // resolveSourceRedactionStrategies() keeps working.
     sourceRedactionStrategy: input.sourceRedactionStrategy ?? 'NONE',
+    sourceRedactionStrategies: requestedSourceRedactionStrategies,
     ghostDataScan,
     handlingPolicy: 'manual_declaration',
     evidencePointers: ['console:manual-declaration'],

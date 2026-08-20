@@ -4,6 +4,7 @@ import { getRequestContext } from '../middleware/request-logging.js';
 import { PiiRegistryService, RegistryMutationError } from '../services/pii-registry-service.js';
 import { buildManualEntry } from '../services/pii-registry-validation.js';
 import { computeCoverage, toCoverageItems } from '../services/pii-coverage.js';
+import { resolveSourceRedactionStrategies } from '../services/source-redaction-strategies.js';
 import { InvalidResourceIdError, type DiscoveredColumn } from '../gcp/bigquery-schema-service.js';
 import type { PiiRegistryDeclarationInput, PiiRegistryEntry } from '../types/pii-registry.js';
 import type { WarehouseDiscoveryFinding } from '../types/lineage.js';
@@ -36,15 +37,16 @@ export interface SyncTrigger {
 }
 
 /**
- * Narrow dependency: just the SHADOW_COPY maintenance hook (see
+ * Narrow dependency: just the declare-time-maintained-strategy hooks (see
  * SourceRedactionService), so tests don't need a real BigQuery client.
- * Called after every successful declare/update/remove -- SHADOW_COPY is
- * declare-time-maintained (a live view), not a deletion-cascade step like
- * REDACT_IN_PLACE.
+ * Called after every successful declare/update/remove -- SHADOW_COPY and
+ * ENCRYPTED_COPY are both declare-time-maintained (a view; a raw table +
+ * view), not a deletion-cascade step like REDACT_IN_PLACE.
  */
 export interface SourceRedactionHook {
   ensureShadowCopy(resource: PiiRegistryEntry): Promise<void>;
   dropShadowCopyIfExists(resource: PiiRegistryEntry): Promise<void>;
+  ensureEncryptedCopyTable(resource: PiiRegistryEntry): Promise<void>;
 }
 
 export interface PiiRegistryRoutesOptions {
@@ -300,7 +302,8 @@ export async function piiRegistryRoutes(
     // columns that doesn't include the referenced name(s) -- an empty
     // result (table not found, or a schema-check failure) fails open, same
     // as the VIEW check above.
-    if (entry.sourceRedactionStrategy !== 'NONE' && entry.system === 'bigquery' && schemaSource?.getColumns) {
+    const declaredSourceRedactionStrategies = resolveSourceRedactionStrategies(entry);
+    if (declaredSourceRedactionStrategies.length > 0 && entry.system === 'bigquery' && schemaSource?.getColumns) {
       try {
         const columns = await schemaSource.getColumns(entry.resourceId);
         if (columns.length > 0) {
@@ -311,7 +314,7 @@ export async function piiRegistryRoutes(
           const missing = [...new Set(referenced.filter((name) => !realNames.has(name)))];
           if (missing.length > 0) {
             return reply.status(400).send({
-              error: `sourceRedactionStrategy ${entry.sourceRedactionStrategy} references column(s) that don't exist on "${entry.resourceId}": ${missing.join(', ')}. This resource's real columns are: ${[...realNames].join(', ')}.`,
+              error: `sourceRedactionStrategies (${declaredSourceRedactionStrategies.join(', ')}) reference column(s) that don't exist on "${entry.resourceId}": ${missing.join(', ')}. This resource's real columns are: ${[...realNames].join(', ')}.`,
               statusCode: 400,
             });
           }
@@ -325,13 +328,14 @@ export async function piiRegistryRoutes(
       const saved = await piiRegistryService.upsertEntry(entry);
       const created = resourceIdFromPath ? false : !existing;
 
-      // SHADOW_COPY is a live view maintained at declare-time, not a
-      // deletion-cascade step (see SourceRedactionService's own docstring
-      // for why) -- (re)create or drop it here, on every successful
-      // declare/update. The durable registry entry is the source of truth
-      // and has already been saved above; a failure here is surfaced to the
-      // caller (so a silently-broken shadow copy is never mistaken for a
-      // working one) without rolling back or failing the declaration itself.
+      // SHADOW_COPY and ENCRYPTED_COPY are both maintained at declare-time,
+      // not a deletion-cascade step like REDACT_IN_PLACE (see
+      // SourceRedactionService's own docstring for why) -- (re)create or
+      // drop/leave-intact them here, on every successful declare/update.
+      // The durable registry entry is the source of truth and has already
+      // been saved above; a failure here is surfaced to the caller (so a
+      // silently-broken copy is never mistaken for a working one) without
+      // rolling back or failing the declaration itself.
       let shadowCopyError: string | undefined;
       try {
         await sourceRedactionHook?.ensureShadowCopy(saved);
@@ -340,11 +344,20 @@ export async function piiRegistryRoutes(
         logger.error({ err: shadowError, resourceId: saved.resourceId }, 'Failed to maintain SHADOW_COPY view');
       }
 
+      let encryptedCopyError: string | undefined;
+      try {
+        await sourceRedactionHook?.ensureEncryptedCopyTable(saved);
+      } catch (encryptedCopyErr) {
+        encryptedCopyError = encryptedCopyErr instanceof Error ? encryptedCopyErr.message : String(encryptedCopyErr);
+        logger.error({ err: encryptedCopyErr, resourceId: saved.resourceId }, 'Failed to maintain ENCRYPTED_COPY table');
+      }
+
       return reply.status(created ? 201 : 200).send({
         resource: saved,
         policy: piiRegistryService.evaluateEntry(saved),
         timestamp: new Date().toISOString(),
         ...(shadowCopyError ? { shadowCopyError } : {}),
+        ...(encryptedCopyError ? { encryptedCopyError } : {}),
       });
     } catch (error) {
       if (error instanceof RegistryMutationError) {

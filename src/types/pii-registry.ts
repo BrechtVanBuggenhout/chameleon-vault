@@ -51,12 +51,24 @@ export type DeletionStrategy =
  * - SHADOW_COPY: never touch the source table; instead expose a separate
  *   de-identified copy/view alongside it that mirrors the source but drops
  *   a user's PII once their key is shredded.
+ * - ENCRYPTED_COPY: never touch the source table; instead maintain a
+ *   physical `{table}_encrypted` view (backed by an append-only
+ *   `{table}_encrypted_raw` table) mirroring the source but with declared
+ *   PII columns holding ciphertext instead of plaintext -- for downstream
+ *   consumers (e.g. dbt) that need a stable table shape without ever
+ *   touching raw PII. On deletion, the user's row is actually removed from
+ *   the raw table (unlike SHADOW_COPY's view, which just stops decrypting).
  *
  * Only ever meaningful for manually-declared (ownerConnector === 'manual')
  * resources -- automated-ingestion resources store only ciphertext at the
  * source already, so there's nothing to redact there.
+ *
+ * REDACT_IN_PLACE, SHADOW_COPY, and ENCRYPTED_COPY are independently
+ * combinable on the same resource (see sourceRedactionStrategies below) --
+ * NONE is only ever the single-value legacy field's default, never a
+ * member of the array.
  */
-export type SourceRedactionStrategy = 'NONE' | 'REDACT_IN_PLACE' | 'SHADOW_COPY';
+export type SourceRedactionStrategy = 'NONE' | 'REDACT_IN_PLACE' | 'SHADOW_COPY' | 'ENCRYPTED_COPY';
 
 export type RegistryConfidence = 'DECLARED' | 'INFERRED_HIGH' | 'INFERRED_MEDIUM' | 'INFERRED_LOW';
 
@@ -124,8 +136,22 @@ export interface PiiRegistryEntry {
   ownerConnector: string;
   lineageDestination: string;
   deletionStrategy: DeletionStrategy;
-  /** Defaults to 'NONE' for any existing entry that predates this field. */
+  /**
+   * @deprecated Superseded by sourceRedactionStrategies (a resource can now
+   * combine more than one strategy). Kept, never written by new
+   * declares/updates, so existing Firestore documents that predate the
+   * array field keep working -- read via resolveSourceRedactionStrategies()
+   * (source-redaction-strategies.ts), never this field directly.
+   */
   sourceRedactionStrategy?: SourceRedactionStrategy;
+  /**
+   * Zero or more of REDACT_IN_PLACE / SHADOW_COPY / ENCRYPTED_COPY,
+   * independently combinable ('NONE' is never a member -- an empty array
+   * means no source redaction). Absent on any entry declared before this
+   * field existed; always resolve via resolveSourceRedactionStrategies(),
+   * never read this directly, so old and new entries behave identically.
+   */
+  sourceRedactionStrategies?: SourceRedactionStrategy[];
   ghostDataScan: GhostDataScanPolicy;
   handlingPolicy: string;
   evidencePointers: string[];
@@ -176,8 +202,10 @@ export interface PiiRegistryDeclarationInput {
   updatedAtColumn?: string;
   piiFields: PiiFieldDeclarationInput[];
   deletionStrategy?: DeletionStrategy;
-  /** Only meaningful for manually-declared resources. Defaults to 'NONE'. */
+  /** @deprecated Send sourceRedactionStrategies instead. Only meaningful for manually-declared resources. */
   sourceRedactionStrategy?: SourceRedactionStrategy;
+  /** Only meaningful for manually-declared resources. Zero or more of REDACT_IN_PLACE/SHADOW_COPY/ENCRYPTED_COPY; omit or send [] for none. */
+  sourceRedactionStrategies?: SourceRedactionStrategy[];
   ghostDataScan?: Partial<GhostDataScanPolicy>;
   status?: RegistryEntryStatus;
   notes?: string;

@@ -174,6 +174,80 @@ describe('buildManualEntry (validation)', () => {
     expect(updated.declaredBy).toBe('first@example.com');
     expect(updated.lastModifiedBy).toBeUndefined();
   });
+
+  describe('sourceRedactionStrategies (array, combinable)', () => {
+    it('defaults to an empty array when nothing is declared', () => {
+      const { entry, errors } = buildManualEntry(validInput, 'acme');
+      expect(errors).toEqual([]);
+      expect(entry?.sourceRedactionStrategies).toEqual([]);
+    });
+
+    it('accepts multiple strategies together', () => {
+      const { entry, errors } = buildManualEntry(
+        { ...validInput, sourceRedactionStrategies: ['REDACT_IN_PLACE', 'ENCRYPTED_COPY'] },
+        'acme'
+      );
+      expect(errors).toEqual([]);
+      expect(entry?.sourceRedactionStrategies).toEqual(['REDACT_IN_PLACE', 'ENCRYPTED_COPY']);
+    });
+
+    it('accepts ENCRYPTED_COPY alone', () => {
+      const { entry, errors } = buildManualEntry(
+        { ...validInput, sourceRedactionStrategies: ['ENCRYPTED_COPY'] },
+        'acme'
+      );
+      expect(errors).toEqual([]);
+      expect(entry?.sourceRedactionStrategies).toEqual(['ENCRYPTED_COPY']);
+    });
+
+    it('rejects NONE inside the array -- an empty array is the array field\'s "none"', () => {
+      const { entry, errors } = buildManualEntry(
+        { ...validInput, sourceRedactionStrategies: ['NONE' as never] },
+        'acme'
+      );
+      expect(entry).toBeUndefined();
+      expect(errors.some((e) => e.includes('sourceRedactionStrategies[0]'))).toBe(true);
+    });
+
+    it('rejects an unknown value inside the array', () => {
+      const { entry, errors } = buildManualEntry(
+        { ...validInput, sourceRedactionStrategies: ['DELETE_EVERYTHING' as never] },
+        'acme'
+      );
+      expect(entry).toBeUndefined();
+      expect(errors.some((e) => e.includes('sourceRedactionStrategies[0]'))).toBe(true);
+    });
+
+    it('an empty array is accepted as the new none-state', () => {
+      const { entry, errors } = buildManualEntry(
+        { ...validInput, sourceRedactionStrategies: [] },
+        'acme'
+      );
+      expect(errors).toEqual([]);
+      expect(entry?.sourceRedactionStrategies).toEqual([]);
+    });
+
+    it('requires userIdColumn when only ENCRYPTED_COPY is set (via the array, not the legacy field)', () => {
+      const { entry, errors } = buildManualEntry(
+        { ...validInput, userIdColumn: undefined, sourceRedactionStrategies: ['ENCRYPTED_COPY'] },
+        'acme'
+      );
+      expect(entry).toBeUndefined();
+      expect(errors.some((e) => e.includes('userIdColumn is required'))).toBe(true);
+    });
+
+    it('legacy singular-field-only entries still normalize via the array on read', () => {
+      // Simulates an entry declared before the array field existed --
+      // buildManualEntry itself always writes the array going forward, but
+      // resolveSourceRedactionStrategies must still make sense of an entry
+      // that only ever had the singular field.
+      const { entry } = buildManualEntry(
+        { ...validInput, sourceRedactionStrategy: 'SHADOW_COPY' },
+        'acme'
+      );
+      expect(entry?.sourceRedactionStrategies).toEqual(['SHADOW_COPY']);
+    });
+  });
 });
 
 describe('PiiRegistryService mutation + tenant scoping', () => {
@@ -275,7 +349,7 @@ describe('piiRegistryRoutes write API (auth + lifecycle)', () => {
     await app.register(piiRegistryRoutes, {
       piiRegistryService: new PiiRegistryService([], new FakeStore()),
       writeToken: WRITE_TOKEN,
-      sourceRedactionHook: { ensureShadowCopy, dropShadowCopyIfExists },
+      sourceRedactionHook: { ensureShadowCopy, dropShadowCopyIfExists, ensureEncryptedCopyTable: jest.fn(async () => {}) },
     });
     const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
 
@@ -308,7 +382,11 @@ describe('piiRegistryRoutes write API (auth + lifecycle)', () => {
     await app.register(piiRegistryRoutes, {
       piiRegistryService: new PiiRegistryService([], new FakeStore()),
       writeToken: WRITE_TOKEN,
-      sourceRedactionHook: { ensureShadowCopy, dropShadowCopyIfExists: jest.fn(async () => {}) },
+      sourceRedactionHook: {
+        ensureShadowCopy,
+        dropShadowCopyIfExists: jest.fn(async () => {}),
+        ensureEncryptedCopyTable: jest.fn(async () => {}),
+      },
     });
     const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
 
@@ -325,6 +403,65 @@ describe('piiRegistryRoutes write API (auth + lifecycle)', () => {
     expect(create.statusCode).toBe(201);
     expect(JSON.parse(create.body).resource.ownerConnector).toBe('manual');
     expect(JSON.parse(create.body).shadowCopyError).toBe('permission denied creating view');
+
+    await app.close();
+  });
+
+  it('calls ensureEncryptedCopyTable on declare when ENCRYPTED_COPY is in sourceRedactionStrategies', async () => {
+    const ensureEncryptedCopyTable = jest.fn(async () => {});
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      sourceRedactionHook: {
+        ensureShadowCopy: jest.fn(async () => {}),
+        dropShadowCopyIfExists: jest.fn(async () => {}),
+        ensureEncryptedCopyTable,
+      },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategies: ['ENCRYPTED_COPY'] },
+    });
+
+    expect(create.statusCode).toBe(201);
+    expect(ensureEncryptedCopyTable).toHaveBeenCalledWith(
+      expect.objectContaining({ resourceId: validInput.resourceId, sourceRedactionStrategies: ['ENCRYPTED_COPY'] })
+    );
+
+    await app.close();
+  });
+
+  it('surfaces an encryptedCopyError without failing the declare when the hook throws', async () => {
+    const ensureEncryptedCopyTable = jest.fn(async () => {
+      throw new Error('permission denied creating table');
+    });
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, {
+      piiRegistryService: new PiiRegistryService([], new FakeStore()),
+      writeToken: WRITE_TOKEN,
+      sourceRedactionHook: {
+        ensureShadowCopy: jest.fn(async () => {}),
+        dropShadowCopyIfExists: jest.fn(async () => {}),
+        ensureEncryptedCopyTable,
+      },
+    });
+    const auth = { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' };
+
+    const create = await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: auth,
+      payload: { ...validInput, sourceRedactionStrategies: ['ENCRYPTED_COPY'] },
+    });
+
+    expect(create.statusCode).toBe(201);
+    expect(JSON.parse(create.body).resource.ownerConnector).toBe('manual');
+    expect(JSON.parse(create.body).encryptedCopyError).toBe('permission denied creating table');
 
     await app.close();
   });

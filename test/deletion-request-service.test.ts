@@ -445,7 +445,12 @@ describe('DeletionRequestService - source redaction integration', () => {
   let mockJanitorService: { [K in keyof JanitorService]: jest.Mock };
   let mockDekKmsClient: { [K in keyof CloudKMSClient]: jest.Mock };
   let mockCertificateService: { [K in keyof CertificateService]: jest.Mock };
-  let mockSourceRedactionService: { planRedaction: jest.Mock; redactUserInDeclaredSources: jest.Mock };
+  let mockSourceRedactionService: {
+    planRedaction: jest.Mock;
+    redactUserInDeclaredSources: jest.Mock;
+    planEncryptedCopyDeletion: jest.Mock;
+    deleteUserFromEncryptedCopies: jest.Mock;
+  };
   let currentRequest: DeletionRequest;
 
   beforeEach(() => {
@@ -483,6 +488,8 @@ describe('DeletionRequestService - source redaction integration', () => {
     mockSourceRedactionService = {
       planRedaction: jest.fn().mockReturnValue([]),
       redactUserInDeclaredSources: jest.fn().mockResolvedValue([]),
+      planEncryptedCopyDeletion: jest.fn().mockReturnValue([]),
+      deleteUserFromEncryptedCopies: jest.fn().mockResolvedValue([]),
     };
 
     service = new DeletionRequestService(
@@ -527,7 +534,7 @@ describe('DeletionRequestService - source redaction integration', () => {
     await flushMicrotasks();
 
     expect(mockDeletionRequestRepo.updateJanitorWipeStatus).toHaveBeenCalledWith(
-      'del-1', 'bigquery:acme.crm.contacts', 'FAILED', { rowsAffected: undefined, error: 'permission denied' }
+      'del-1', 'bigquery:acme.crm.contacts::REDACT_IN_PLACE', 'FAILED', { rowsAffected: undefined, error: 'permission denied' }
     );
     expect(currentRequest.status).toBe('CASCADE_PARTIAL_FAILURE');
     expect(mockCertificateService.issueAndStoreCertificate).not.toHaveBeenCalled();
@@ -543,7 +550,7 @@ describe('DeletionRequestService - source redaction integration', () => {
     await flushMicrotasks();
 
     expect(mockDeletionRequestRepo.updateJanitorWipeStatus).toHaveBeenCalledWith(
-      'del-1', 'bigquery:acme.crm.contacts', 'SUCCEEDED', { rowsAffected: 1, error: undefined }
+      'del-1', 'bigquery:acme.crm.contacts::REDACT_IN_PLACE', 'SUCCEEDED', { rowsAffected: 1, error: undefined }
     );
     expect(currentRequest.status).toBe('CERTIFICATE_ISSUED');
     expect(mockCertificateService.issueAndStoreCertificate).toHaveBeenCalledWith('user-1', 'del-1', 'default-tenant');
@@ -566,5 +573,64 @@ describe('DeletionRequestService - source redaction integration', () => {
     // No SaaS tasks, no redaction service configured -> the original empty-
     // plan shortcut still applies, reaching CERTIFICATE_ISSUED immediately.
     expect(currentRequest.status).toBe('CERTIFICATE_ISSUED');
+  });
+
+  it('does not shortcut to CASCADE_COMPLETE when there are no SaaS tasks or redactions but there is a pending ENCRYPTED_COPY resource', async () => {
+    mockSourceRedactionService.planEncryptedCopyDeletion.mockReturnValue([{ resourceId: 'bigquery:acme.crm.contacts' }]);
+    mockSourceRedactionService.deleteUserFromEncryptedCopies.mockResolvedValue([
+      { resourceId: 'bigquery:acme.crm.contacts', success: true, rowsAffected: 1 },
+    ]);
+
+    await service.advanceRequest('del-1', 'CASCADE_PENDING', 'op-1');
+    await flushMicrotasks();
+
+    expect(mockSourceRedactionService.deleteUserFromEncryptedCopies).toHaveBeenCalledWith('user-1', 'default-tenant');
+    expect(currentRequest.status).toBe('CERTIFICATE_ISSUED');
+  });
+
+  it('withholds the certificate when an ENCRYPTED_COPY deletion fails', async () => {
+    mockSourceRedactionService.planEncryptedCopyDeletion.mockReturnValue([{ resourceId: 'bigquery:acme.crm.contacts' }]);
+    mockSourceRedactionService.deleteUserFromEncryptedCopies.mockResolvedValue([
+      { resourceId: 'bigquery:acme.crm.contacts', success: false, error: 'permission denied' },
+    ]);
+
+    await service.advanceRequest('del-1', 'CASCADE_PENDING', 'op-1');
+    await flushMicrotasks();
+
+    expect(mockDeletionRequestRepo.updateJanitorWipeStatus).toHaveBeenCalledWith(
+      'del-1', 'bigquery:acme.crm.contacts::ENCRYPTED_COPY', 'FAILED', { rowsAffected: undefined, error: 'permission denied' }
+    );
+    expect(currentRequest.status).toBe('CASCADE_PARTIAL_FAILURE');
+    expect(mockCertificateService.issueAndStoreCertificate).not.toHaveBeenCalled();
+  });
+
+  it('a resource combining REDACT_IN_PLACE and ENCRYPTED_COPY records two distinct destination keys, not one overwriting the other', async () => {
+    // Directly guards the janitor_wipes key-collision fix: before it, both
+    // legs would have written to the same bare-resourceId key and the
+    // second write would have silently clobbered the first's recorded
+    // status, even though both strategies genuinely ran and one of them
+    // failed.
+    mockSourceRedactionService.planRedaction.mockReturnValue([{ resourceId: 'bigquery:acme.crm.contacts' }]);
+    mockSourceRedactionService.redactUserInDeclaredSources.mockResolvedValue([
+      { resourceId: 'bigquery:acme.crm.contacts', success: true, rowsAffected: 1 },
+    ]);
+    mockSourceRedactionService.planEncryptedCopyDeletion.mockReturnValue([{ resourceId: 'bigquery:acme.crm.contacts' }]);
+    mockSourceRedactionService.deleteUserFromEncryptedCopies.mockResolvedValue([
+      { resourceId: 'bigquery:acme.crm.contacts', success: false, error: 'permission denied' },
+    ]);
+
+    await service.advanceRequest('del-1', 'CASCADE_PENDING', 'op-1');
+    await flushMicrotasks();
+
+    expect(mockDeletionRequestRepo.updateJanitorWipeStatus).toHaveBeenCalledWith(
+      'del-1', 'bigquery:acme.crm.contacts::REDACT_IN_PLACE', 'SUCCEEDED', { rowsAffected: 1, error: undefined }
+    );
+    expect(mockDeletionRequestRepo.updateJanitorWipeStatus).toHaveBeenCalledWith(
+      'del-1', 'bigquery:acme.crm.contacts::ENCRYPTED_COPY', 'FAILED', { rowsAffected: undefined, error: 'permission denied' }
+    );
+    // One genuinely failed leg withholds the certificate even though the
+    // other leg for the exact same resourceId succeeded.
+    expect(currentRequest.status).toBe('CASCADE_PARTIAL_FAILURE');
+    expect(mockCertificateService.issueAndStoreCertificate).not.toHaveBeenCalled();
   });
 });

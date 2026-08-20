@@ -228,8 +228,9 @@ export class DeletionRequestService {
   ): Promise<{ shortcutToComplete: true } | { shortcutToComplete: false; afterStatusPersisted: () => void; taskDestinations: string[] }> {
     const tasks = await this.janitorService.createCleanupPlan(request.user_id, tenantId);
     const redactionResources = this.sourceRedactionService?.planRedaction(tenantId) ?? [];
+    const encryptedCopyResources = this.sourceRedactionService?.planEncryptedCopyDeletion(tenantId) ?? [];
 
-    if (tasks.length === 0 && redactionResources.length === 0) {
+    if (tasks.length === 0 && redactionResources.length === 0 && encryptedCopyResources.length === 0) {
       return { shortcutToComplete: true };
     }
 
@@ -239,7 +240,10 @@ export class DeletionRequestService {
         redactionResources.length > 0 && this.sourceRedactionService
           ? this.sourceRedactionService.redactUserInDeclaredSources(request.user_id, tenantId)
           : Promise.resolve([]),
-      ]).then(async ([janitorResults, redactionResults]) => {
+        encryptedCopyResources.length > 0 && this.sourceRedactionService
+          ? this.sourceRedactionService.deleteUserFromEncryptedCopies(request.user_id, tenantId)
+          : Promise.resolve([]),
+      ]).then(async ([janitorResults, redactionResults, encryptedCopyResults]) => {
         // Record each destination's real outcome on the request itself
         // (janitor_wipes), not just as a lineage event -- this is what
         // the next step actually gates on. processCleanup() already
@@ -253,26 +257,47 @@ export class DeletionRequestService {
             { attempts: result.attempts, recordsFound: result.recordsFound }
           ).catch(err => logger.error({ err, destination: result.destination }, 'Failed to record janitor wipe status'));
         }
-        // Source-redaction resources are tracked the same way, using
-        // the resource id as the destination label -- a redaction
-        // failure withholds the certificate exactly like a SaaS wipe
-        // failure already does, since both mean the user's data
-        // demonstrably still exists somewhere Chameleon knows about.
+        // Source-redaction resources are tracked the same way, using the
+        // resource id as the destination label -- a redaction failure
+        // withholds the certificate exactly like a SaaS wipe failure
+        // already does, since both mean the user's data demonstrably
+        // still exists somewhere Chameleon knows about. Suffixed with
+        // the strategy name: strategies are independently combinable now
+        // (see resolveSourceRedactionStrategies), so the same resourceId
+        // can legitimately appear in both redactionResults and
+        // encryptedCopyResults in one cascade run, and an unsuffixed key
+        // would let the second write silently clobber the first's
+        // recorded status instead of tracking both.
         for (const result of redactionResults) {
           await this.updateJanitorWipeStatus(
             deletionRequestId,
-            result.resourceId,
+            `${result.resourceId}::REDACT_IN_PLACE`,
             result.success ? 'SUCCEEDED' : 'FAILED',
             { rowsAffected: result.rowsAffected, error: result.error }
           ).catch(err => logger.error({ err, destination: result.resourceId }, 'Failed to record source redaction status'));
         }
+        for (const result of encryptedCopyResults) {
+          await this.updateJanitorWipeStatus(
+            deletionRequestId,
+            `${result.resourceId}::ENCRYPTED_COPY`,
+            result.success ? 'SUCCEEDED' : 'FAILED',
+            { rowsAffected: result.rowsAffected, error: result.error }
+          ).catch(err => logger.error({ err, destination: result.resourceId }, 'Failed to record encrypted-copy deletion status'));
+        }
 
         const failedJanitor = janitorResults.filter(r => r.status !== 'COMPLETE');
         const failedRedaction = redactionResults.filter(r => !r.success);
+        const failedEncryptedCopy = encryptedCopyResults.filter(r => !r.success);
         const nextStatus: DeletionRequestStatus =
-          failedJanitor.length > 0 || failedRedaction.length > 0 ? 'CASCADE_PARTIAL_FAILURE' : 'CASCADE_COMPLETE';
+          failedJanitor.length > 0 || failedRedaction.length > 0 || failedEncryptedCopy.length > 0
+            ? 'CASCADE_PARTIAL_FAILURE'
+            : 'CASCADE_COMPLETE';
         await this.advanceRequest(deletionRequestId, nextStatus, operationId, {
-          failedDestinations: [...failedJanitor.map(r => r.destination), ...failedRedaction.map(r => r.resourceId)],
+          failedDestinations: [
+            ...failedJanitor.map(r => r.destination),
+            ...failedRedaction.map(r => `${r.resourceId}::REDACT_IN_PLACE`),
+            ...failedEncryptedCopy.map(r => `${r.resourceId}::ENCRYPTED_COPY`),
+          ],
         });
       }).catch(async (err) => {
         logger.error({ err, userId: request.user_id }, 'Janitor cleanup / source redaction loop failed');
