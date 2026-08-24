@@ -248,6 +248,48 @@ describe('buildManualEntry (validation)', () => {
       expect(entry?.sourceRedactionStrategies).toEqual(['SHADOW_COPY']);
     });
   });
+
+  describe('pubsub declarations', () => {
+    const validPubsubInput: PiiRegistryDeclarationInput = {
+      resourceId: 'pubsub:acme-project.cdc-events',
+      system: 'pubsub',
+      pubsubAllowedCallerServiceAccount: '123456789012345678901',
+      userIdFieldPath: 'after.user_id',
+      piiFields: [{ name: 'after.email', classification: 'DIRECT_IDENTIFIER', handling: 'ENCRYPT' }],
+    };
+
+    it('accepts a pubsub declaration with both required fields set', () => {
+      const { entry, errors } = buildManualEntry(validPubsubInput, 'acme');
+      expect(errors).toEqual([]);
+      expect(entry?.system).toBe('pubsub');
+      expect(entry?.pubsubAllowedCallerServiceAccount).toBe('123456789012345678901');
+      expect(entry?.userIdFieldPath).toBe('after.user_id');
+      expect(entry?.piiFields[0].name).toBe('after.email');
+    });
+
+    it('rejects a pubsub declaration missing pubsubAllowedCallerServiceAccount', () => {
+      const { entry, errors } = buildManualEntry(
+        { ...validPubsubInput, pubsubAllowedCallerServiceAccount: undefined },
+        'acme'
+      );
+      expect(entry).toBeUndefined();
+      expect(errors).toContain('pubsubAllowedCallerServiceAccount is required when system is pubsub.');
+    });
+
+    it('rejects a pubsub declaration missing userIdFieldPath', () => {
+      const { entry, errors } = buildManualEntry(
+        { ...validPubsubInput, userIdFieldPath: undefined },
+        'acme'
+      );
+      expect(entry).toBeUndefined();
+      expect(errors).toContain('userIdFieldPath is required when system is pubsub.');
+    });
+
+    it('does not require pubsubAllowedCallerServiceAccount/userIdFieldPath for non-pubsub systems', () => {
+      const { errors } = buildManualEntry(validInput, 'acme');
+      expect(errors).toEqual([]);
+    });
+  });
 });
 
 describe('PiiRegistryService mutation + tenant scoping', () => {

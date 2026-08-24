@@ -6,7 +6,8 @@ export type PiiSystem =
   | 'log'
   | 'hubspot'
   | 'salesforce'
-  | 'external';
+  | 'external'
+  | 'pubsub';
 
 export type PiiClassification =
   | 'DIRECT_IDENTIFIER'
@@ -79,6 +80,14 @@ export type PiiResourceVisibility = 'CUSTOMER_FACING' | 'INTERNAL';
 export type RegistryEntryStatus = 'APPROVED' | 'PENDING_REVIEW' | 'DEPRECATED' | 'DISABLED';
 
 export interface PiiFieldPolicy {
+  /**
+   * A real BigQuery column name for every other system. For
+   * `system: 'pubsub'`, this is instead a dotted JSON path into each
+   * message's decoded body (e.g. "after.email") -- reused rather than
+   * given a parallel field-list shape, since every other declared-field
+   * concept (classification, handling, requiredInMart) applies identically
+   * either way.
+   */
   name: string;
   classification: PiiClassification;
   handling: PiiHandling;
@@ -102,6 +111,28 @@ export interface PiiRegistryEntry {
   visibility?: PiiResourceVisibility;
   tenantIdColumn?: string;
   userIdColumn?: string;
+  /**
+   * Only meaningful for `system: 'pubsub'`. The numeric unique ID (JWT `sub`
+   * claim, never the email -- a real Google-signed push-subscription token
+   * carries no `email` claim, confirmed the hard way against BigQuery's own
+   * connection SA in decrypted-views-decrypt.ts) of the service account the
+   * customer's own push subscription authenticates as. Compared against
+   * every incoming push's verified ID token before anything in the message
+   * is trusted -- this is the entire authorization boundary for the
+   * pubsub-ingest endpoint, which is otherwise publicly reachable (see that
+   * service's own docs for why it can't be gated by Cloud Run IAM invoker
+   * the way an internal, statically-known caller can be).
+   */
+  pubsubAllowedCallerServiceAccount?: string;
+  /**
+   * Only meaningful for `system: 'pubsub'`. Dotted JSON path to the user-id
+   * field within each message's decoded body (e.g. "after.user_id" for a
+   * Debezium-style change event) -- the pubsub equivalent of userIdColumn.
+   * No nested-schema introspection for v1 (there's no reliable schema to
+   * introspect without Pub/Sub's optional, not-always-attached native
+   * Schema resource) -- plain dotted-path text entry only.
+   */
+  userIdFieldPath?: string;
   /**
    * Which source-table column tracks last-modified, if the customer has
    * declared one -- lets chameleon-data-pipelines' daily pii_vault sync scan
@@ -198,6 +229,10 @@ export interface PiiRegistryDeclarationInput {
   visibility?: PiiResourceVisibility;
   tenantIdColumn?: string;
   userIdColumn?: string;
+  /** See PiiRegistryEntry.pubsubAllowedCallerServiceAccount. Only meaningful for system: 'pubsub'. */
+  pubsubAllowedCallerServiceAccount?: string;
+  /** See PiiRegistryEntry.userIdFieldPath. Only meaningful for system: 'pubsub'. */
+  userIdFieldPath?: string;
   /** See PiiRegistryEntry.updatedAtColumn. Omit or send an empty string to clear it. */
   updatedAtColumn?: string;
   piiFields: PiiFieldDeclarationInput[];

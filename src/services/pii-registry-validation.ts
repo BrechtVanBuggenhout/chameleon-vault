@@ -15,7 +15,7 @@ import {
 } from '../types/pii-registry.js';
 import { resolveSourceRedactionStrategies } from './source-redaction-strategies.js';
 
-const SYSTEMS: PiiSystem[] = ['bigquery', 'gcs', 'firestore', 'log', 'hubspot', 'salesforce', 'external'];
+const SYSTEMS: PiiSystem[] = ['bigquery', 'gcs', 'firestore', 'log', 'hubspot', 'salesforce', 'external', 'pubsub'];
 const CLASSIFICATIONS: PiiClassification[] = [
   'DIRECT_IDENTIFIER',
   'QUASI_IDENTIFIER',
@@ -137,6 +137,21 @@ export function buildManualEntry(
   ) {
     errors.push('userIdColumn and tenantIdColumn cannot be the same column -- this makes every row\'s tenant_id a per-user value instead of a real tenant identifier, and (with REDACT_IN_PLACE/SHADOW_COPY) an unsatisfiable WHERE clause. Leave tenantIdColumn unset for a single-tenant source.');
   }
+  // pubsubAllowedCallerServiceAccount is the entire authorization boundary
+  // for the pubsub-ingest endpoint (which is otherwise publicly reachable --
+  // see that service's own docs). userIdFieldPath is the pubsub equivalent
+  // of userIdColumn, needed to route any incoming message's fields to the
+  // right user's key. Both required, not optional, the moment system is
+  // 'pubsub' -- fail closed rather than accept a declaration that could
+  // never actually process a real message.
+  if (input.system === 'pubsub') {
+    if (!isNonEmptyString(input.pubsubAllowedCallerServiceAccount)) {
+      errors.push('pubsubAllowedCallerServiceAccount is required when system is pubsub.');
+    }
+    if (!isNonEmptyString(input.userIdFieldPath)) {
+      errors.push('userIdFieldPath is required when system is pubsub.');
+    }
+  }
   if (input.status !== undefined && !STATUSES.includes(input.status)) {
     errors.push(`status must be one of: ${STATUSES.join(', ')}.`);
   }
@@ -189,6 +204,8 @@ export function buildManualEntry(
     visibility: input.visibility ?? 'CUSTOMER_FACING',
     tenantIdColumn: input.tenantIdColumn,
     userIdColumn: input.userIdColumn,
+    pubsubAllowedCallerServiceAccount: input.pubsubAllowedCallerServiceAccount,
+    userIdFieldPath: input.userIdFieldPath,
     updatedAtColumn: input.updatedAtColumn,
     piiFields,
     ownerConnector: MANUAL_OWNER_CONNECTOR,
