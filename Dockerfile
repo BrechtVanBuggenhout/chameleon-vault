@@ -38,6 +38,11 @@ WORKDIR /app
 LABEL maintainer="Chameleon Team"
 LABEL description="Cryptographic Key Vault Service for Project Chameleon"
 
+# Refresh Alpine packages so OS-level CVEs (e.g. OpenSSL) fixed since this
+# base image tag was published are picked up at build time, not frozen --
+# same fix as chameleon-console's Dockerfile.
+RUN apk update && apk upgrade --no-cache
+
 # Create non-root user for security
 RUN addgroup -g 1001 -S nodejs && \
     adduser -S nodejs -u 1001
