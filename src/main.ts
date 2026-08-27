@@ -17,6 +17,7 @@ import { GCSClient } from './gcp/gcs-client.js';
 import { AnalystAccessRepository } from './gcp/analyst-access-repository.js';
 import { CertificateChainRepository } from './gcp/certificate-chain-repository.js';
 import { DecryptedViewsRepository } from './gcp/decrypted-views-repository.js';
+import { GithubActionsClient } from './gcp/github-actions-client.js';
 
 // Import Services
 import { JanitorService } from './services/janitor.js';
@@ -106,6 +107,20 @@ async function main() {
     pubSubDlqClient
   );
   const certificateService = new CertificateService(firestoreRegistry, lineageRepository, signingKmsClient, gcsClient, deletionRequestRepo, certificateChainRepo);
+
+  // Optional: only self-hosted/Chameleon-managed deployments that also mirror
+  // this service's source to a public repo (see sync-public-vault.yml) have
+  // a public JWKS mirror to publish to. Unset means the feature simply
+  // no-ops -- see certificate.ts's rotate handler.
+  const githubActionsDispatchToken = process.env.GITHUB_ACTIONS_DISPATCH_TOKEN;
+  const githubActionsClient = githubActionsDispatchToken
+    ? new GithubActionsClient({
+        token: githubActionsDispatchToken,
+        owner: process.env.GITHUB_ACTIONS_REPO_OWNER || 'BrechtVanBuggenhout',
+        repo: process.env.GITHUB_ACTIONS_REPO_NAME || 'chameleon-key-vault',
+        workflowFile: 'publish-jwks-snapshot.yml',
+      })
+    : undefined;
 
   // Federated PII registry, composed from three sources by owner:
   //  1. connector seed (devPiiRegistry) — bundled example/reference data for
@@ -298,7 +313,7 @@ async function main() {
   await fastify.register(cryptoRoutes, { kmsClient: dekKmsClient, firestoreRegistry, lineageRepository, deletionRequestService });
   await fastify.register(lineageRoutes, { lineageRepository, firestoreRegistry, janitorService });
   await fastify.register(deletionRequestRoutes, { deletionRequestService });
-  await fastify.register(certificateRoutes, { certificateService });
+  await fastify.register(certificateRoutes, { certificateService, githubActionsClient });
   await fastify.register(piiRegistryRoutes, {
     piiRegistryService,
     writeToken: registryWriteToken,

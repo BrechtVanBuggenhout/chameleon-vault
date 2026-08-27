@@ -1,15 +1,9 @@
 import { Firestore, Timestamp, CollectionReference, DocumentData } from '@google-cloud/firestore';
 import { CertificateChainState, CertificateChainEntry } from '../types/certificate-chain.js';
 import { createLogger } from '../logging/index.js';
+import { CHAIN_ANCHOR_MARKER } from '../logging/audit-anchor.js';
 
 const logger = createLogger('certificate-chain-repository');
-
-// Marker field on the log line emitted whenever the chain advances -- see
-// appendToChain. Matched by the Cloud Logging sink filter in
-// chameleon-infra-gcp/audit_logging.tf so these entries land in the
-// Bucket-Lock-protected audit_logs bucket, giving the chain an anchor
-// outside this service's own (mutable) Firestore document.
-const CHAIN_ANCHOR_MARKER = 'certificateChainAnchor';
 
 export interface ChainSignResult {
   certificate: string;
@@ -103,6 +97,7 @@ export class CertificateChainRepository {
     logger.info(
       {
         [CHAIN_ANCHOR_MARKER]: true,
+        auditEventType: 'certificate_chain_append',
         tenantId,
         deletionRequestId,
         sequence: outcome.sequence,

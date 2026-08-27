@@ -1,14 +1,15 @@
 import { FastifyInstance } from 'fastify';
 import { CertificateService } from '../services/certificate-service.js';
+import { GithubActionsClient } from '../gcp/github-actions-client.js';
 import { createLogger } from '../logging/index.js';
 
 const logger = createLogger('certificate-routes');
 
 export async function certificateRoutes(
   fastify: FastifyInstance,
-  options: { certificateService: CertificateService }
+  options: { certificateService: CertificateService; githubActionsClient?: GithubActionsClient }
 ): Promise<void> {
-  const { certificateService } = options;
+  const { certificateService, githubActionsClient } = options;
 
   /**
    * GET /certificate/:userId
@@ -109,9 +110,23 @@ export async function certificateRoutes(
    * be called on a schedule (Cloud Scheduler), not by end users -- gated by
    * the same shared VAULT_API_KEY as every other non-exempt route.
    */
-  fastify.post('/admin/signing-key/rotate', async (_request, reply) => {
+  fastify.post('/admin/signing-key/rotate', async (request, reply) => {
     try {
       const result = await certificateService.rotateSigningKey();
+
+      // Fire-and-forget, after rotation has already succeeded and the
+      // response is already decided -- see GithubActionsClient's own
+      // comment for why this must never affect this route's outcome.
+      // baseUrl comes from the request itself, not a new env var: this
+      // service can't reference its own Cloud Run .uri from within its own
+      // Terraform resource block (a same-resource cycle), and Cloud
+      // Scheduler's OIDC-authenticated call here carries the real public
+      // hostname in its Host header.
+      if (githubActionsClient) {
+        const baseUrl = `${request.protocol}://${request.hostname}`;
+        githubActionsClient.dispatchJwksSnapshot(result.newVersion, baseUrl).catch(() => {});
+      }
+
       return {
         status: 'rotated',
         newVersion: result.newVersion,

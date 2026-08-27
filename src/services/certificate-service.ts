@@ -7,6 +7,7 @@ import { CertificateChainRepository } from '../gcp/certificate-chain-repository.
 import { CertificateLineageItem, DestructionCertificateClaims, KeyStatus } from '../types/index.js';
 import { DeletionRequest } from '../types/deletion-request.js';
 import { createLogger } from '../logging/index.js';
+import { CHAIN_ANCHOR_MARKER } from '../logging/audit-anchor.js';
 import { GCSClient } from '../gcp/gcs-client.js';
 import { connectorRegistry } from './registry.js';
 
@@ -358,7 +359,17 @@ export class CertificateService {
     this._currentVersionCache = null;
     this._enabledVersionsCache = null;
 
-    logger.info({ previousVersion, newVersion }, 'Signing key rotated');
+    // Marked and worded identically to appendToChain's chain-anchor log line
+    // (same CHAIN_ANCHOR_MARKER, matched by the same Cloud Logging sink
+    // filter in chameleon-infra-gcp/audit_logging.tf) so rotation gets the
+    // same tamper-evident, Bucket-Lock-protected export that certificate
+    // issuance already gets -- previously this was a plain log line with no
+    // export anywhere, which would have made KEY_ROTATION_POLICY.md's
+    // claims about rotation being audited false.
+    logger.info(
+      { [CHAIN_ANCHOR_MARKER]: true, auditEventType: 'signing_key_rotated', previousVersion, newVersion },
+      'Signing key rotated'
+    );
     return { newVersion, previousVersion };
   }
 }
