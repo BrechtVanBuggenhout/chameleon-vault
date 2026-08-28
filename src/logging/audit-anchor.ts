@@ -6,4 +6,8 @@
 // site hand-copying the string and risking drift.
 export const CHAIN_ANCHOR_MARKER = 'certificateChainAnchor';
 
-export type AuditEventType = 'certificate_chain_append' | 'signing_key_rotated';
+export type AuditEventType =
+  | 'certificate_chain_append'
+  | 'signing_key_rotated'
+  | 'tsa_timestamp_obtained'
+  | 'tsa_timestamp_failed';

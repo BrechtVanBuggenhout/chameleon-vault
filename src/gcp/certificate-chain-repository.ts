@@ -1,5 +1,6 @@
 import { Firestore, Timestamp, CollectionReference, DocumentData } from '@google-cloud/firestore';
 import { CertificateChainState, CertificateChainEntry } from '../types/certificate-chain.js';
+import type { TsaTimestampInfo } from './tsa-client.js';
 import { createLogger } from '../logging/index.js';
 import { CHAIN_ANCHOR_MARKER } from '../logging/audit-anchor.js';
 
@@ -115,5 +116,15 @@ export class CertificateChainRepository {
   async getEntryByHash(certificateHash: string): Promise<CertificateChainEntry | null> {
     const doc = await this.entryCollection.doc(certificateHash).get();
     return doc.exists ? (doc.data() as CertificateChainEntry) : null;
+  }
+
+  // Best-effort update against an already-committed chain entry -- never
+  // part of appendToChain's transaction. .update() (not .set with merge)
+  // is safe because appendToChain always creates this doc synchronously,
+  // in the same await chain, before this ever runs. A failure here must
+  // never retroactively appear to invalidate the entry's already-committed
+  // core fields -- callers are expected to catch and swallow, not propagate.
+  async recordTsaTimestamp(certificateHash: string, tsaTimestamp: TsaTimestampInfo): Promise<void> {
+    await this.entryCollection.doc(certificateHash).update({ tsaTimestamp });
   }
 }

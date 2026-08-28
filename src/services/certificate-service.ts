@@ -9,6 +9,7 @@ import { DeletionRequest } from '../types/deletion-request.js';
 import { createLogger } from '../logging/index.js';
 import { CHAIN_ANCHOR_MARKER } from '../logging/audit-anchor.js';
 import { GCSClient } from '../gcp/gcs-client.js';
+import { TsaClient, TsaTimestampInfo } from '../gcp/tsa-client.js';
 import { connectorRegistry } from './registry.js';
 
 const logger = createLogger('certificate-service');
@@ -36,7 +37,8 @@ export class CertificateService {
     private readonly signingKmsClient: CloudKMSClient,
     private readonly gcsClient: GCSClient,
     private readonly deletionRequestRepo: DeletionRequestRepository,
-    private readonly chainRepository: CertificateChainRepository
+    private readonly chainRepository: CertificateChainRepository,
+    private readonly tsaClient?: TsaClient
   ) {}
 
   // Shared by generateCertificateClaims and getCertificateForUser so both
@@ -170,13 +172,50 @@ export class CertificateService {
       }
     );
 
+    // Timestamps the final signed JWT, never inside the transaction closure
+    // above -- appendToChain's own docs say `sign` may run more than once
+    // under Firestore contention, and multiplying calls to a free, no-SLA
+    // TSA on retries is a real risk worth avoiding. Reuses certificateHash
+    // (already computed once above) as the TSA message imprint -- never
+    // rehashed. Must be awaited, not fire-and-forget: this service runs
+    // min_instance_count=0, and the rotate-endpoint bug fixed earlier this
+    // session confirmed Cloud Run can reap an instance the moment a
+    // response is sent regardless of cpu_idle. TsaClient.requestTimestamp
+    // never throws, so this can only add latency, never a new failure mode.
+    let tsaTimestamp: TsaTimestampInfo | undefined;
+    if (this.tsaClient) {
+      tsaTimestamp = await this.tsaClient.requestTimestamp(certificateHash);
+      logger.info(
+        {
+          [CHAIN_ANCHOR_MARKER]: true,
+          auditEventType: tsaTimestamp.status === 'OBTAINED' ? 'tsa_timestamp_obtained' : 'tsa_timestamp_failed',
+          certificateHash,
+          tsaUrl: tsaTimestamp.tsaUrl,
+        },
+        'RFC 3161 timestamp attempted'
+      );
+
+      // Best-effort follow-up write against the already-committed chain
+      // entry. A failure here must never surface as a failure of
+      // issueAndStoreCertificate -- the certificate is already fully valid
+      // and chained without it, and the GCS wrapper below (the real source
+      // of truth for the public verification API) still gets the result
+      // either way.
+      try {
+        await this.chainRepository.recordTsaTimestamp(certificateHash, tsaTimestamp);
+      } catch (error) {
+        logger.error({ error, certificateHash }, 'Failed to persist TSA timestamp to chain entry -- issuance unaffected');
+      }
+    }
+
     const gcsPath = await this.gcsClient.uploadCertificate(
       userId,
       deletionRequestId,
       certificate,
       certificateHash,
       tenantId,
-      { previousCertificateHash: previousHash, chainSequence: sequence }
+      { previousCertificateHash: previousHash, chainSequence: sequence },
+      tsaTimestamp
     );
 
     return { certificate, gcsPath };
@@ -224,15 +263,18 @@ export class CertificateService {
    * be used to enumerate a tenant's certificate history the way a
    * by-sequence lookup could.
    */
-  async getCertificateByHash(certificateHash: string): Promise<{ certificate: string } | null> {
+  async getCertificateByHash(certificateHash: string): Promise<{ certificate: string; tsaTimestamp?: TsaTimestampInfo } | null> {
     const entry = await this.chainRepository.getEntryByHash(certificateHash);
     if (!entry) return null;
 
     const deletionRequest = await this.deletionRequestRepo.getDeletionRequest(entry.deletion_request_id);
     if (!deletionRequest?.certificate_gcs_path) return null;
 
+    // tsaTimestamp is read from the GCS wrapper (below), not the Firestore
+    // entry above -- GCS is the source of truth a Firestore write failure
+    // in issueAndStoreCertificate's best-effort follow-up can never affect.
     const stored = await this.gcsClient.downloadCertificate(deletionRequest.certificate_gcs_path);
-    return { certificate: stored.certificate };
+    return { certificate: stored.certificate, tsaTimestamp: stored.tsaTimestamp };
   }
 
   // Base (unversioned) path of the signing CryptoKey -- static for the

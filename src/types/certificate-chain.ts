@@ -1,3 +1,5 @@
+import type { TsaTimestampInfo } from '../gcp/tsa-client.js';
+
 // Per-tenant chain-of-custody state for the Certificate of Destruction log.
 // One document per tenant -- the current chain head. See
 // CertificateChainRepository.appendToChain for how this is advanced.
@@ -22,4 +24,17 @@ export interface CertificateChainEntry {
   previous_hash: string | null;
   deletion_request_id: string;
   created_at: Date;
+  // Absent entirely (undefined) means either: RFC 3161 timestamping was
+  // disabled when this certificate was issued, or -- for any certificate
+  // issued before this field existed at all -- it was never attempted.
+  // These two cases are permanently indistinguishable for pre-existing
+  // certificates; there is no way to retroactively obtain a third-party
+  // attestation for a certificate's *original* issuance time after the
+  // fact (a timestamp obtained later would only prove the certificate
+  // existed by the later date, defeating the purpose). This best-effort
+  // Firestore copy is a convenience for internal audit tooling querying
+  // this collection directly -- the GCS-stored certificate wrapper (see
+  // GCSClient.uploadCertificate) is the actual source of truth read by
+  // the public verification API.
+  tsaTimestamp?: TsaTimestampInfo;
 }

@@ -18,6 +18,7 @@ import { AnalystAccessRepository } from './gcp/analyst-access-repository.js';
 import { CertificateChainRepository } from './gcp/certificate-chain-repository.js';
 import { DecryptedViewsRepository } from './gcp/decrypted-views-repository.js';
 import { GithubActionsClient } from './gcp/github-actions-client.js';
+import { TsaClient } from './gcp/tsa-client.js';
 
 // Import Services
 import { JanitorService } from './services/janitor.js';
@@ -106,7 +107,18 @@ async function main() {
     dekKmsClient, // DEK KMS client for encryption/decryption
     pubSubDlqClient
   );
-  const certificateService = new CertificateService(firestoreRegistry, lineageRepository, signingKmsClient, gcsClient, deletionRequestRepo, certificateChainRepo);
+  // RFC 3161 trusted timestamping: opt-in, off by default via the explicit
+  // TSA_ENABLED switch (not just TSA_URL's presence) -- this is a brand-new,
+  // always-in-the-critical-path dependency on a free, no-SLA third party
+  // (issueAndStoreCertificate awaits it on the real POST
+  // /deletion-requests/:id/advance path), so a fresh/BYOC deployment
+  // shouldn't start calling it the moment this ships, and it needs to be
+  // instantly killable (no deploy) if the TSA ever has an outage.
+  const tsaClient = process.env.TSA_ENABLED === 'true'
+    ? new TsaClient(process.env.TSA_URL || 'https://freetsa.org/tsr')
+    : undefined;
+
+  const certificateService = new CertificateService(firestoreRegistry, lineageRepository, signingKmsClient, gcsClient, deletionRequestRepo, certificateChainRepo, tsaClient);
 
   // Optional: only self-hosted/Chameleon-managed deployments that also mirror
   // this service's source to a public repo (see sync-public-vault.yml) have
