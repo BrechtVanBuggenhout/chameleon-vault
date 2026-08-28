@@ -114,9 +114,18 @@ export async function certificateRoutes(
     try {
       const result = await certificateService.rotateSigningKey();
 
-      // Fire-and-forget, after rotation has already succeeded and the
-      // response is already decided -- see GithubActionsClient's own
-      // comment for why this must never affect this route's outcome.
+      // Awaited, not fire-and-forget -- confirmed live (2026-08-28) that an
+      // un-awaited call here gets silently killed mid-flight: this service
+      // runs with min_instance_count=0, and Cloud Run is free to scale an
+      // instance down as soon as the triggering request's response is
+      // sent, regardless of cpu_idle. Unawaited background work started
+      // after that point isn't guaranteed to run to completion -- a real
+      // rotation produced zero dispatch log output (neither success nor
+      // the internal error paths) because the instance was reaped before
+      // the GitHub API call finished. Still can't fail this route:
+      // GithubActionsClient's own try/catch guarantees this never throws
+      // and always resolves, so awaiting it only adds a bounded delay
+      // (capped by its own 10s request timeout), never a failure mode.
       // baseUrl comes from the request itself, not a new env var: this
       // service can't reference its own Cloud Run .uri from within its own
       // Terraform resource block (a same-resource cycle), and Cloud
@@ -124,7 +133,7 @@ export async function certificateRoutes(
       // hostname in its Host header.
       if (githubActionsClient) {
         const baseUrl = `${request.protocol}://${request.hostname}`;
-        githubActionsClient.dispatchJwksSnapshot(result.newVersion, baseUrl).catch(() => {});
+        await githubActionsClient.dispatchJwksSnapshot(result.newVersion, baseUrl);
       }
 
       return {
