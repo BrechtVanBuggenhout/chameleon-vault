@@ -126,13 +126,25 @@ export async function certificateRoutes(
       // GithubActionsClient's own try/catch guarantees this never throws
       // and always resolves, so awaiting it only adds a bounded delay
       // (capped by its own 10s request timeout), never a failure mode.
-      // baseUrl comes from the request itself, not a new env var: this
-      // service can't reference its own Cloud Run .uri from within its own
-      // Terraform resource block (a same-resource cycle), and Cloud
-      // Scheduler's OIDC-authenticated call here carries the real public
-      // hostname in its Host header.
+      // baseUrl's hostname comes from the request itself, not a new env
+      // var: this service can't reference its own Cloud Run .uri from
+      // within its own Terraform resource block (a same-resource cycle),
+      // and Cloud Scheduler's OIDC-authenticated call here carries the
+      // real public hostname in its Host header. The scheme is hardcoded
+      // to https, not derived from request.protocol -- confirmed live
+      // (2026-08-28) that request.protocol reports "http" here, since
+      // Cloud Run terminates TLS at its load balancer and forwards plain
+      // HTTP to the container, and this app has no trustProxy configured
+      // to read it back from X-Forwarded-Proto. A "http://...jwks.json"
+      // URL made the poll below 302-redirect on every attempt (curl -sf
+      // doesn't follow redirects), so it silently never found the new key
+      // for the workflow's entire poll budget. Every Cloud Run service in
+      // this org is HTTPS-only externally -- confirmed by that very
+      // redirect -- so hardcoding is simpler and safer here than opting
+      // this whole app into trustProxy just for one URL, which would also
+      // change how the rate-limit plugin resolves client IPs elsewhere.
       if (githubActionsClient) {
-        const baseUrl = `${request.protocol}://${request.hostname}`;
+        const baseUrl = `https://${request.hostname}`;
         await githubActionsClient.dispatchJwksSnapshot(result.newVersion, baseUrl);
       }
 
