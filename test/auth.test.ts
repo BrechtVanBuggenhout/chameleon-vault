@@ -194,4 +194,65 @@ describe('resolveAuth', () => {
     );
     expect(result).toEqual({ authorized: false });
   });
+
+  it('accepts a valid auditor credential on /audit/key-status/:userId, attaching the auditor email and role', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({
+      tenantId: 'tenant-a',
+      analystEmail: 'auditor@example.com',
+      role: 'auditor',
+    });
+    const result = await resolveAuth(
+      '/audit/key-status/user-123',
+      'auditor-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService
+    );
+    expect(result).toEqual({ authorized: true, analystEmail: 'auditor@example.com', role: 'auditor' });
+  });
+
+  it('rejects a valid auditor credential on /encrypt -- an auditor can check erasure status, nothing else', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({
+      tenantId: 'tenant-a',
+      analystEmail: 'auditor@example.com',
+      role: 'auditor',
+    });
+    const result = await resolveAuth(
+      '/encrypt',
+      'auditor-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService
+    );
+    expect(result).toEqual({ authorized: false });
+  });
+
+  it('rejects a valid analyst credential on /audit/key-status/:userId -- the two roles are not interchangeable', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({
+      tenantId: 'tenant-a',
+      analystEmail: 'a@example.com',
+      role: 'analyst',
+    });
+    const result = await resolveAuth(
+      '/audit/key-status/user-123',
+      'analyst-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService
+    );
+    expect(result).toEqual({ authorized: false });
+  });
+
+  it('rejects any credential on /admin/analyst-claims -- unreachable by either role, resolveCredential never consulted', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({
+      tenantId: 'tenant-a',
+      analystEmail: 'auditor@example.com',
+      role: 'auditor',
+    });
+    const result = await resolveAuth(
+      '/admin/analyst-claims',
+      'auditor-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService
+    );
+    expect(result).toEqual({ authorized: false });
+    expect(mockAnalystAccessService.resolveCredential).not.toHaveBeenCalled();
+  });
 });

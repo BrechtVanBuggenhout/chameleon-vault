@@ -12,13 +12,20 @@ import { analystClaimsRoutes } from '../src/routes/analyst-claims.js';
 class InMemoryAnalystAccessRepo implements Pick<AnalystAccessRepository, 'createClaim' | 'getClaimByTokenHash' | 'claimAndIssueCredential' | 'resolveCredential'> {
   private byTokenHash = new Map<string, AnalystAccess>();
 
-  async createClaim(tenantId: string, analystEmail: string, claimTokenHash: string, expiresAt: Date): Promise<void> {
+  async createClaim(
+    tenantId: string,
+    analystEmail: string,
+    claimTokenHash: string,
+    expiresAt: Date,
+    role: 'analyst' | 'auditor' = 'analyst'
+  ): Promise<void> {
     this.byTokenHash.set(claimTokenHash, {
       claim_token_hash: claimTokenHash,
       tenant_id: tenantId,
       analyst_email: analystEmail,
       created_at: new Date(),
       expires_at: expiresAt,
+      role,
     });
   }
 
@@ -116,6 +123,39 @@ describe('analyst-claims routes', () => {
     });
 
     expect(response.statusCode).toBe(410);
+    await app.close();
+  });
+
+  it('creates auditor claim tokens on /admin/auditor-claims, and claiming one yields an auditor-role credential', async () => {
+    const { app } = await buildApp();
+
+    const createResponse = await app.inject({
+      method: 'POST',
+      url: '/admin/auditor-claims',
+      payload: { auditorEmails: ['auditor@example.com'] },
+    });
+    expect(createResponse.statusCode).toBe(201);
+    const { claimToken } = JSON.parse(createResponse.body).claimTokens[0];
+
+    const claimResponse = await app.inject({ method: 'POST', url: `/admin/analyst-claims/${claimToken}/claim` });
+    expect(claimResponse.statusCode).toBe(200);
+    const body = JSON.parse(claimResponse.body);
+    expect(body.analystEmail).toBe('auditor@example.com');
+    expect(body.role).toBe('auditor');
+
+    await app.close();
+  });
+
+  it('rejects auditor-claim creation with no emails', async () => {
+    const { app } = await buildApp();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/admin/auditor-claims',
+      payload: { auditorEmails: [] },
+    });
+
+    expect(response.statusCode).toBe(400);
     await app.close();
   });
 });

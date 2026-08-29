@@ -7,6 +7,14 @@ export interface AnalystAccess {
   expires_at: Date;
   claimed_at?: Date;
   revoked_at?: Date;
+  // Absent means 'analyst' (every record before this field existed was one).
+  // 'auditor' credentials are scoped to a single, minimal route
+  // (GET /audit/key-status/:userId) -- see AUDITOR_CREDENTIAL_EXACT_PATHS in
+  // middleware/auth.ts. Reuses this same claim-link/session-credential
+  // machinery rather than a parallel system, since the underlying need
+  // (narrowly-scoped, individually-attributable, revocable credential) is
+  // identical -- only the allowed-paths set differs by role.
+  role?: 'analyst' | 'auditor';
   // Absent means 'claim_link' (every record before this field existed came
   // from that flow). 'console_session' records are minted directly by
   // POST /admin/session-credentials on behalf of a logged-in console user --

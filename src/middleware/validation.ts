@@ -170,6 +170,14 @@ export const createAnalystClaimsSchema = Joi.object({
   analystEmails: Joi.array().items(Joi.string().email()).min(1).max(50).required(),
 }).required();
 
+// Structurally identical to createAnalystClaimsSchema -- kept as a separate
+// export for a clearer validation error message on the auditor-claims route
+// ("auditorEmails" rather than "analystEmails"), not because the shape
+// differs.
+export const createAuditorClaimsSchema = Joi.object({
+  auditorEmails: Joi.array().items(Joi.string().email()).min(1).max(50).required(),
+}).required();
+
 // Base64url, matching randomBytes(32).toString('base64url') -- no padding,
 // URL-safe alphabet only.
 const claimTokenSchema = Joi.string()

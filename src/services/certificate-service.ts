@@ -10,6 +10,7 @@ import { createLogger } from '../logging/index.js';
 import { CHAIN_ANCHOR_MARKER } from '../logging/audit-anchor.js';
 import { GCSClient } from '../gcp/gcs-client.js';
 import { TsaClient, TsaTimestampInfo } from '../gcp/tsa-client.js';
+import { RekorClient, RekorLogEntryInfo } from '../gcp/rekor-client.js';
 import { connectorRegistry } from './registry.js';
 
 const logger = createLogger('certificate-service');
@@ -38,7 +39,8 @@ export class CertificateService {
     private readonly gcsClient: GCSClient,
     private readonly deletionRequestRepo: DeletionRequestRepository,
     private readonly chainRepository: CertificateChainRepository,
-    private readonly tsaClient?: TsaClient
+    private readonly tsaClient?: TsaClient,
+    private readonly rekorClient?: RekorClient
   ) {}
 
   // Shared by generateCertificateClaims and getCertificateForUser so both
@@ -208,6 +210,32 @@ export class CertificateService {
       }
     }
 
+    // Rekor transparency-log publishing: same must-await reasoning as TSA
+    // above (min_instance_count=0, Cloud Run can reap the instance the
+    // moment a response is sent). Publishes hashes only -- certificateHash
+    // and previousHash, never tenantId/userId -- so the public log can't
+    // become an enumerable record of who was deleted when. RekorClient never
+    // throws, so this can only add latency, never a new failure mode.
+    let rekorEntry: RekorLogEntryInfo | undefined;
+    if (this.rekorClient) {
+      rekorEntry = await this.rekorClient.publishCertificateHash(certificateHash, previousHash);
+      logger.info(
+        {
+          [CHAIN_ANCHOR_MARKER]: true,
+          auditEventType: rekorEntry.status === 'PUBLISHED' ? 'rekor_entry_published' : 'rekor_entry_failed',
+          certificateHash,
+          rekorUrl: rekorEntry.rekorUrl,
+        },
+        'Rekor transparency log entry attempted'
+      );
+
+      try {
+        await this.chainRepository.recordRekorEntry(certificateHash, rekorEntry);
+      } catch (error) {
+        logger.error({ error, certificateHash }, 'Failed to persist Rekor entry to chain entry -- issuance unaffected');
+      }
+    }
+
     const gcsPath = await this.gcsClient.uploadCertificate(
       userId,
       deletionRequestId,
@@ -215,7 +243,8 @@ export class CertificateService {
       certificateHash,
       tenantId,
       { previousCertificateHash: previousHash, chainSequence: sequence },
-      tsaTimestamp
+      tsaTimestamp,
+      rekorEntry
     );
 
     return { certificate, gcsPath };
@@ -320,6 +349,14 @@ export class CertificateService {
   async getPublicKey(): Promise<string> {
     const keyVersionPath = await this.getCurrentSigningKeyVersion();
     return this.signingKmsClient.getPublicKey(keyVersionPath);
+  }
+
+  // Returns null when Rekor publishing isn't configured, rather than
+  // throwing -- a deployment with REKOR_ENABLED unset simply has nothing to
+  // return here, same as any other optional feature's absence.
+  async getRekorPublicKey(): Promise<string | null> {
+    if (!this.rekorClient) return null;
+    return this.rekorClient.getPublicKeyPem();
   }
 
   // Keyed by version path -- a given version's public key/fingerprint never

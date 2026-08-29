@@ -1,5 +1,6 @@
 import { Storage } from '@google-cloud/storage';
 import type { TsaTimestampInfo } from './tsa-client.js';
+import type { RekorLogEntryInfo } from './rekor-client.js';
 import { createLogger } from '../logging/index.js';
 
 const logger = createLogger('gcs-client');
@@ -23,7 +24,8 @@ export class GCSClient {
     hash: string,
     tenantId: string = 'default-tenant',
     chain?: { previousCertificateHash: string | null; chainSequence: number },
-    tsaTimestamp?: TsaTimestampInfo
+    tsaTimestamp?: TsaTimestampInfo,
+    rekorEntry?: RekorLogEntryInfo
   ): Promise<string> {
     try {
       const now = new Date();
@@ -46,6 +48,7 @@ export class GCSClient {
         previousCertificateHash: chain?.previousCertificateHash ?? null,
         chainSequence: chain?.chainSequence,
         tsaTimestamp: tsaTimestamp ?? null,
+        rekorEntry: rekorEntry ?? null,
       });
 
       await bucket.file(certPath).save(certPayload, {
@@ -92,6 +95,7 @@ export class GCSClient {
     previousCertificateHash: string | null;
     chainSequence?: number;
     tsaTimestamp?: TsaTimestampInfo;
+    rekorEntry?: RekorLogEntryInfo;
   }> {
     try {
       const match = gcsPath.match(/^gs:\/\/([^/]+)\/(.+)$/);

@@ -168,6 +168,25 @@ export class FirestoreRegistry {
     }
   }
 
+  // Deliberately separate from getKeyStatus/getKeyForUser below, even though
+  // it overlaps with them -- this is the one function an outside auditor's
+  // trust in the erasure claim ultimately rests on, so it's kept small and
+  // legible on its own rather than layered on top of logic that also serves
+  // unrelated purposes (decryption context, detailed status timestamps) and
+  // could change for reasons that have nothing to do with this guarantee.
+  // Returns false for a document that never existed at all -- no key was
+  // ever generated, so there's nothing to have leaked either way, and that's
+  // the correct answer to "is there currently recoverable key material."
+  async hasActiveKeyMaterial(userId: string, tenantId: string = 'default-tenant'): Promise<boolean> {
+    const docId = this.getDocId(tenantId, userId);
+    const doc = await this.db.collection(this.collectionName).doc(docId).get();
+    if (!doc.exists) {
+      return false;
+    }
+    const data = doc.data() as KeyMetadata;
+    return (data.status === 'ACTIVE' || data.status === 'ROTATED') && Object.keys(data.deks || {}).length > 0;
+  }
+
   async getKeyStatus(userId: string, tenantId: string = 'default-tenant'): Promise<KeyStatus | null> {
     try {
       const docId = this.getDocId(tenantId, userId);

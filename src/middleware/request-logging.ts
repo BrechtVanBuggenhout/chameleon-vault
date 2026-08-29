@@ -16,6 +16,9 @@ export interface RequestContext {
   // per-analyst credential rather than the shared VAULT_API_KEY -- lets
   // /encrypt and /decrypt attribute their audit events to a specific person.
   analystEmail?: string;
+  // Set alongside analystEmail for any scoped (non-shared-key) credential --
+  // 'analyst' or 'auditor'. See middleware/auth.ts.
+  credentialRole?: 'analyst' | 'auditor';
 }
 
 declare module 'fastify' {

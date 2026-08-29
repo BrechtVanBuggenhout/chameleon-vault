@@ -37,6 +37,20 @@ describe('AnalystAccessService', () => {
       expect(storedHash).toBe(hash(token));
       expect(storedHash).not.toBe(token);
       expect(expiresAt.getTime()).toBeGreaterThan(Date.now());
+
+      // Not passed explicitly above -- defaults to 'analyst' for backward
+      // compatibility with every call site that predates the role param.
+      const [, , , , role] = mockRepo.createClaim.mock.calls[0];
+      expect(role).toBe('analyst');
+    });
+
+    it('passes through an explicit auditor role', async () => {
+      await service.createClaim('tenant-a', 'auditor@example.com', 'auditor');
+
+      const [tenantId, auditorEmail, , , role] = mockRepo.createClaim.mock.calls[0];
+      expect(tenantId).toBe('tenant-a');
+      expect(auditorEmail).toBe('auditor@example.com');
+      expect(role).toBe('auditor');
     });
   });
 
@@ -91,6 +105,7 @@ describe('AnalystAccessService', () => {
 
       expect(result).not.toBeNull();
       expect(result!.analystEmail).toBe('analyst@example.com');
+      expect(result!.role).toBe('analyst');
       expect(typeof result!.apiKey).toBe('string');
       expect(result!.apiKey.length).toBeGreaterThan(20);
 
@@ -105,6 +120,19 @@ describe('AnalystAccessService', () => {
 
       const result = await service.claim('some-token');
       expect(result).toBeNull();
+    });
+
+    it('carries an auditor-role claim through to the issued credential', async () => {
+      const auditorRecord = { ...baseRecord, role: 'auditor' as const };
+      mockRepo.getClaimByTokenHash.mockResolvedValue(auditorRecord);
+      mockRepo.claimAndIssueCredential.mockImplementation(async (_claimTokenHash: string, credentialKeyHash: string) => ({
+        ...auditorRecord,
+        claimed_at: new Date(),
+        credential_key_hash: credentialKeyHash,
+      }));
+
+      const result = await service.claim('some-token');
+      expect(result!.role).toBe('auditor');
     });
   });
 
@@ -143,7 +171,7 @@ describe('AnalystAccessService', () => {
 
       const result = await service.resolveCredential('some-api-key');
 
-      expect(result).toEqual({ tenantId: 'tenant-a', analystEmail: 'analyst@example.com' });
+      expect(result).toEqual({ tenantId: 'tenant-a', analystEmail: 'analyst@example.com', role: 'analyst' });
       expect(mockRepo.resolveCredential).toHaveBeenCalledWith(hash('some-api-key'));
     });
 
@@ -178,7 +206,7 @@ describe('AnalystAccessService', () => {
       });
 
       const result = await service.resolveCredential('some-api-key');
-      expect(result).toEqual({ tenantId: 'tenant-a', analystEmail: 'analyst@example.com' });
+      expect(result).toEqual({ tenantId: 'tenant-a', analystEmail: 'analyst@example.com', role: 'analyst' });
     });
 
     it('handles a Firestore Timestamp-shaped credential_expires_at (toMillis), not just a native Date', async () => {

@@ -40,15 +40,16 @@ function toMillis(value: Date | { toMillis: () => number } | { toDate: () => Dat
 export interface ResolvedAnalystIdentity {
   tenantId: string;
   analystEmail: string;
+  role: 'analyst' | 'auditor';
 }
 
 export class AnalystAccessService {
   constructor(private readonly repo: AnalystAccessRepository) {}
 
-  async createClaim(tenantId: string, analystEmail: string): Promise<string> {
+  async createClaim(tenantId: string, analystEmail: string, role: 'analyst' | 'auditor' = 'analyst'): Promise<string> {
     const claimToken = generateSecret();
     const expiresAt = new Date(Date.now() + CLAIM_EXPIRY_MS);
-    await this.repo.createClaim(tenantId, analystEmail, hash(claimToken), expiresAt);
+    await this.repo.createClaim(tenantId, analystEmail, hash(claimToken), expiresAt, role);
     return claimToken;
   }
 
@@ -58,7 +59,7 @@ export class AnalystAccessService {
    * those cases, since they're expected outcomes (a re-clicked link, an
    * email scanner's prefetch), not failures.
    */
-  async claim(claimToken: string): Promise<{ apiKey: string; analystEmail: string } | null> {
+  async claim(claimToken: string): Promise<{ apiKey: string; analystEmail: string; role: 'analyst' | 'auditor' } | null> {
     const claimTokenHash = hash(claimToken);
     const record = await this.repo.getClaimByTokenHash(claimTokenHash);
     if (!record) {
@@ -80,8 +81,9 @@ export class AnalystAccessService {
       return null;
     }
 
-    logger.info({ tenantId: record.tenant_id, analystEmail: record.analyst_email }, 'Analyst claimed their Key Vault credential');
-    return { apiKey, analystEmail: record.analyst_email };
+    const role = record.role || 'analyst';
+    logger.info({ tenantId: record.tenant_id, analystEmail: record.analyst_email, role }, 'Analyst claimed their Key Vault credential');
+    return { apiKey, analystEmail: record.analyst_email, role };
   }
 
   async resolveCredential(presentedApiKey: string): Promise<ResolvedAnalystIdentity | null> {
@@ -94,7 +96,7 @@ export class AnalystAccessService {
     if (record.credential_expires_at && toMillis(record.credential_expires_at) < Date.now()) {
       return null;
     }
-    return { tenantId: record.tenant_id, analystEmail: record.analyst_email };
+    return { tenantId: record.tenant_id, analystEmail: record.analyst_email, role: record.role || 'analyst' };
   }
 
   /**

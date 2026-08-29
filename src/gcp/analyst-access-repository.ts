@@ -21,7 +21,8 @@ export class AnalystAccessRepository {
     tenantId: string,
     analystEmail: string,
     claimTokenHash: string,
-    expiresAt: Date
+    expiresAt: Date,
+    role: 'analyst' | 'auditor' = 'analyst'
   ): Promise<void> {
     const now = Timestamp.now().toDate();
     const record: AnalystAccess = {
@@ -30,9 +31,10 @@ export class AnalystAccessRepository {
       analyst_email: analystEmail,
       created_at: now,
       expires_at: expiresAt,
+      role,
     };
     await this.collection.doc(claimTokenHash).set(record);
-    logger.info({ tenantId, analystEmail }, 'Created analyst claim');
+    logger.info({ tenantId, analystEmail, role }, 'Created analyst claim');
   }
 
   async getClaimByTokenHash(claimTokenHash: string): Promise<AnalystAccess | null> {

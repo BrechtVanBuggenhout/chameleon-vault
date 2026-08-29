@@ -7,7 +7,7 @@ import { CloudKMSClient } from '../src/gcp/cloud-kms.js';
 import { GCSClient } from '../src/gcp/gcs-client.js';
 import { DeletionRequestRepository } from '../src/gcp/deletion-request-repository.js';
 import { CertificateChainRepository } from '../src/gcp/certificate-chain-repository.js';
-import { TsaClient, TsaTimestampInfo } from '../src/gcp/tsa-client.js';
+import { RekorClient, RekorLogEntryInfo } from '../src/gcp/rekor-client.js';
 import { DeletionRequest } from '../src/types/deletion-request.js';
 
 jest.mock('../src/services/registry.js', () => ({
@@ -28,7 +28,7 @@ const { CertificateService } = await import('../src/services/certificate-service
 const { publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
 const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
 
-describe('CertificateService.issueAndStoreCertificate -- TSA integration', () => {
+describe('CertificateService.issueAndStoreCertificate -- Rekor integration', () => {
   let service: InstanceType<typeof CertificateService>;
   let mockFirestoreRegistry: { getKeyStatus: jest.Mock };
   let mockLineageRepo: { getGhostDataFindings: jest.Mock };
@@ -39,9 +39,9 @@ describe('CertificateService.issueAndStoreCertificate -- TSA integration', () =>
     asymmetricSign: jest.Mock;
   };
   let mockDeletionRequestRepo: { getDeletionRequest: jest.Mock; getLatestCompletedDeletionRequestForUser: jest.Mock };
-  let mockChainRepository: { appendToChain: jest.Mock; recordTsaTimestamp: jest.Mock };
+  let mockChainRepository: { appendToChain: jest.Mock; recordTsaTimestamp: jest.Mock; recordRekorEntry: jest.Mock };
   let mockGcsClient: { uploadCertificate: jest.Mock };
-  let mockTsaClient: { requestTimestamp: jest.Mock };
+  let mockRekorClient: { publishCertificateHash: jest.Mock };
   let baseRequest: DeletionRequest;
 
   beforeEach(() => {
@@ -57,7 +57,7 @@ describe('CertificateService.issueAndStoreCertificate -- TSA integration', () =>
     };
 
     mockFirestoreRegistry = {
-      getKeyStatus: jest.fn().mockResolvedValue({ status: 'SHREDDED', created_at: '2026-01-01T00:00:00Z', shredAt: '2026-08-28T00:00:00.000Z' }),
+      getKeyStatus: jest.fn().mockResolvedValue({ status: 'SHREDDED', created_at: '2026-01-01T00:00:00Z', shredAt: '2026-08-29T00:00:00.000Z' }),
     };
     mockLineageRepo = { getGhostDataFindings: jest.fn().mockResolvedValue([]) };
     mockKmsClient = {
@@ -70,17 +70,16 @@ describe('CertificateService.issueAndStoreCertificate -- TSA integration', () =>
       getDeletionRequest: jest.fn(async () => ({ ...baseRequest })),
       getLatestCompletedDeletionRequestForUser: jest.fn(async () => ({ ...baseRequest })),
     };
-    // Mirrors the real appendToChain's contract: invokes `sign`, returns its
-    // result plus previousHash/sequence.
     mockChainRepository = {
       appendToChain: jest.fn(async (_tenantId: string, _deletionRequestId: string, sign: (p: string | null, s: number) => Promise<{ certificate: string; certificateHash: string }>) => {
         const result = await sign(null, 1);
         return { ...result, previousHash: null, sequence: 1 };
       }),
       recordTsaTimestamp: jest.fn().mockResolvedValue(undefined),
+      recordRekorEntry: jest.fn().mockResolvedValue(undefined),
     };
     mockGcsClient = { uploadCertificate: jest.fn().mockResolvedValue('gs://bucket/path.json') };
-    mockTsaClient = { requestTimestamp: jest.fn() };
+    mockRekorClient = { publishCertificateHash: jest.fn() };
 
     service = new CertificateService(
       mockFirestoreRegistry as unknown as FirestoreRegistry,
@@ -89,62 +88,68 @@ describe('CertificateService.issueAndStoreCertificate -- TSA integration', () =>
       mockGcsClient as unknown as GCSClient,
       mockDeletionRequestRepo as unknown as DeletionRequestRepository,
       mockChainRepository as unknown as CertificateChainRepository,
-      mockTsaClient as unknown as TsaClient
+      undefined, // tsaClient
+      mockRekorClient as unknown as RekorClient
     );
   });
 
-  it('succeeds and passes the OBTAINED timestamp through to GCS when the TSA succeeds', async () => {
-    const timestamp: TsaTimestampInfo = {
-      status: 'OBTAINED',
-      token: 'base64token',
-      timestamp: '2026-08-28T00:00:00.000Z',
-      tsaUrl: 'https://freetsa.org/tsr',
-      attemptedAt: '2026-08-28T00:00:00.000Z',
+  it('publishes certificateHash/previousHash to Rekor, persists the result, and passes it through to GCS', async () => {
+    const rekorEntry: RekorLogEntryInfo = {
+      status: 'PUBLISHED',
+      entryUuid: 'entry-uuid-123',
+      logIndex: 42,
+      rekorUrl: 'https://rekor.sigstore.dev',
+      attemptedAt: '2026-08-29T00:00:00.000Z',
     };
-    mockTsaClient.requestTimestamp.mockResolvedValue(timestamp);
+    mockRekorClient.publishCertificateHash.mockResolvedValue(rekorEntry);
 
     const result = await service.issueAndStoreCertificate('user-1', 'del-1');
 
     expect(result.certificate).toBeTruthy();
-    expect(mockChainRepository.recordTsaTimestamp).toHaveBeenCalledWith(expect.any(String), timestamp);
+
+    // Called with the certificate's own hash and previousHash -- never
+    // tenantId/userId, matching the by-hash lookup's same principle.
+    expect(mockRekorClient.publishCertificateHash).toHaveBeenCalledWith(expect.any(String), null);
+
+    expect(mockChainRepository.recordRekorEntry).toHaveBeenCalledWith(expect.any(String), rekorEntry);
+
     expect(mockGcsClient.uploadCertificate).toHaveBeenCalledWith(
       'user-1', 'del-1', expect.any(String), expect.any(String), 'default-tenant',
-      expect.any(Object), timestamp, undefined
+      expect.any(Object), undefined, rekorEntry
     );
   });
 
-  it('still succeeds when the TSA call resolves to FAILED', async () => {
-    const failed: TsaTimestampInfo = {
+  it('still succeeds when the Rekor publish resolves to FAILED -- issuance is never blocked', async () => {
+    const failed: RekorLogEntryInfo = {
       status: 'FAILED',
-      tsaUrl: 'https://freetsa.org/tsr',
-      attemptedAt: '2026-08-28T00:00:00.000Z',
-      error: 'timeout',
+      rekorUrl: 'https://rekor.sigstore.dev',
+      attemptedAt: '2026-08-29T00:00:00.000Z',
+      error: 'HTTP 400',
     };
-    mockTsaClient.requestTimestamp.mockResolvedValue(failed);
+    mockRekorClient.publishCertificateHash.mockResolvedValue(failed);
 
     const result = await service.issueAndStoreCertificate('user-1', 'del-1');
 
     expect(result.certificate).toBeTruthy();
     expect(mockGcsClient.uploadCertificate).toHaveBeenCalledWith(
       'user-1', 'del-1', expect.any(String), expect.any(String), 'default-tenant',
-      expect.any(Object), failed, undefined
+      expect.any(Object), undefined, failed
     );
   });
 
   it('still succeeds even if the best-effort Firestore follow-up write itself rejects', async () => {
-    mockTsaClient.requestTimestamp.mockResolvedValue({
-      status: 'OBTAINED', token: 'x', timestamp: 'x', tsaUrl: 'x', attemptedAt: 'x',
+    mockRekorClient.publishCertificateHash.mockResolvedValue({
+      status: 'PUBLISHED', entryUuid: 'x', logIndex: 1, rekorUrl: 'x', attemptedAt: 'x',
     });
-    mockChainRepository.recordTsaTimestamp.mockRejectedValue(new Error('Firestore unavailable'));
+    mockChainRepository.recordRekorEntry.mockRejectedValue(new Error('Firestore unavailable'));
 
     await expect(service.issueAndStoreCertificate('user-1', 'del-1')).resolves.toEqual(
       expect.objectContaining({ certificate: expect.any(String), gcsPath: 'gs://bucket/path.json' })
     );
-    // Issuance succeeded despite the rejection -- GCS upload still happened.
     expect(mockGcsClient.uploadCertificate).toHaveBeenCalled();
   });
 
-  it('never calls the TSA and never touches the chain-entry when tsaClient is not configured (disabled)', async () => {
+  it('never calls Rekor and never touches the chain-entry when rekorClient is not configured (disabled)', async () => {
     const disabledService = new CertificateService(
       mockFirestoreRegistry as unknown as FirestoreRegistry,
       mockLineageRepo as unknown as BigQueryLineageRepository,
@@ -152,13 +157,13 @@ describe('CertificateService.issueAndStoreCertificate -- TSA integration', () =>
       mockGcsClient as unknown as GCSClient,
       mockDeletionRequestRepo as unknown as DeletionRequestRepository,
       mockChainRepository as unknown as CertificateChainRepository
-      // tsaClient omitted entirely
+      // tsaClient and rekorClient both omitted
     );
 
     await disabledService.issueAndStoreCertificate('user-1', 'del-1');
 
-    expect(mockTsaClient.requestTimestamp).not.toHaveBeenCalled();
-    expect(mockChainRepository.recordTsaTimestamp).not.toHaveBeenCalled();
+    expect(mockRekorClient.publishCertificateHash).not.toHaveBeenCalled();
+    expect(mockChainRepository.recordRekorEntry).not.toHaveBeenCalled();
     expect(mockGcsClient.uploadCertificate).toHaveBeenCalledWith(
       'user-1', 'del-1', expect.any(String), expect.any(String), 'default-tenant',
       expect.any(Object), undefined, undefined

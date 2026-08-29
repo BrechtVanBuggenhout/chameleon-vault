@@ -1,6 +1,7 @@
 import { Firestore, Timestamp, CollectionReference, DocumentData } from '@google-cloud/firestore';
 import { CertificateChainState, CertificateChainEntry } from '../types/certificate-chain.js';
 import type { TsaTimestampInfo } from './tsa-client.js';
+import type { RekorLogEntryInfo } from './rekor-client.js';
 import { createLogger } from '../logging/index.js';
 import { CHAIN_ANCHOR_MARKER } from '../logging/audit-anchor.js';
 
@@ -126,5 +127,10 @@ export class CertificateChainRepository {
   // core fields -- callers are expected to catch and swallow, not propagate.
   async recordTsaTimestamp(certificateHash: string, tsaTimestamp: TsaTimestampInfo): Promise<void> {
     await this.entryCollection.doc(certificateHash).update({ tsaTimestamp });
+  }
+
+  // Same shape and caveats as recordTsaTimestamp above.
+  async recordRekorEntry(certificateHash: string, rekorEntry: RekorLogEntryInfo): Promise<void> {
+    await this.entryCollection.doc(certificateHash).update({ rekorEntry });
   }
 }

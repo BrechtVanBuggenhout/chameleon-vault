@@ -19,6 +19,7 @@ import { CertificateChainRepository } from './gcp/certificate-chain-repository.j
 import { DecryptedViewsRepository } from './gcp/decrypted-views-repository.js';
 import { GithubActionsClient } from './gcp/github-actions-client.js';
 import { TsaClient } from './gcp/tsa-client.js';
+import { RekorClient } from './gcp/rekor-client.js';
 
 // Import Services
 import { JanitorService } from './services/janitor.js';
@@ -50,6 +51,7 @@ import { certificateRoutes } from './routes/certificate.js';
 import { piiRegistryRoutes } from './routes/pii-registry.js';
 import { syncRunsRoutes } from './routes/sync-runs.js';
 import { analystClaimsRoutes } from './routes/analyst-claims.js';
+import { auditorVerifyRoutes } from './routes/auditor-verify.js';
 import { adminSessionCredentialsRoutes } from './routes/admin-session-credentials.js';
 import { auditRoutes } from './routes/audit.js';
 import { decryptedViewsRoutes } from './routes/decrypted-views.js';
@@ -118,7 +120,37 @@ async function main() {
     ? new TsaClient(process.env.TSA_URL || 'https://freetsa.org/tsr')
     : undefined;
 
-  const certificateService = new CertificateService(firestoreRegistry, lineageRepository, signingKmsClient, gcsClient, deletionRequestRepo, certificateChainRepo, tsaClient);
+  // Rekor transparency-log publishing: same opt-in shape as TSA above, same
+  // reasoning. Uses a SEPARATE KMS key/client from signingKmsClient --
+  // rekor.sigstore.dev's hashedrekord entry type rejects RSA-PSS signatures
+  // (confirmed live, 2026-08-29), and certificate_signing_key's purpose
+  // (RSA_SIGN_PSS_2048_SHA256) is fixed at creation, so it can never produce
+  // a signature Rekor will accept. rekor_signing_key is EC_SIGN_P256_SHA256
+  // instead, which Rekor does accept.
+  const rekorClient = process.env.REKOR_ENABLED === 'true'
+    ? (() => {
+        const rekorKmsClient = new CloudKMSClient(
+          projectId,
+          kmsRegion,
+          signingKmsKeyRing,
+          getRequiredEnv('CLOUD_KMS_REKOR_SIGNING_KEY_NAME')
+        );
+        return new RekorClient(process.env.REKOR_URL || 'https://rekor.sigstore.dev', rekorKmsClient, () =>
+          rekorKmsClient.getNewestEnabledVersion(rekorKmsClient.getCryptoKeyPath())
+        );
+      })()
+    : undefined;
+
+  const certificateService = new CertificateService(
+    firestoreRegistry,
+    lineageRepository,
+    signingKmsClient,
+    gcsClient,
+    deletionRequestRepo,
+    certificateChainRepo,
+    tsaClient,
+    rekorClient
+  );
 
   // Optional: only self-hosted/Chameleon-managed deployments that also mirror
   // this service's source to a public repo (see sync-public-vault.yml) have
@@ -314,6 +346,9 @@ async function main() {
       if (result.analystEmail) {
         getRequestContext(request).analystEmail = result.analystEmail;
       }
+      if (result.role) {
+        getRequestContext(request).credentialRole = result.role;
+      }
     });
   } else {
     logger.warn('VAULT_API_KEY is not set — Key Vault is running without authentication');
@@ -337,6 +372,7 @@ async function main() {
   await fastify.register(syncRunsRoutes, { syncRunRepository, writeToken: registryWriteToken });
   await fastify.register(analystClaimsRoutes, { analystAccessService });
   await fastify.register(adminSessionCredentialsRoutes, { analystAccessService });
+  await fastify.register(auditorVerifyRoutes, { firestoreRegistry });
   await fastify.register(auditRoutes, { piiRegistryService, deletionRequestRepo });
   if (decryptedViewService && decryptedViewsRepo) {
     await fastify.register(decryptedViewsRoutes, {

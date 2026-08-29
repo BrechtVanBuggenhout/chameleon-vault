@@ -92,6 +92,38 @@ export async function certificateRoutes(
   });
 
   /**
+   * GET /rekor-signing-public-key
+   * Returns the PEM-encoded public key used to sign entries published to the
+   * public Rekor transparency log (see RekorClient). Separate from
+   * /public-key above -- a different, dedicated KMS key, since Rekor's
+   * hashedrekord entry type rejects the certificate-signing key's RSA-PSS
+   * signatures. Lets a verifier confirm a Rekor entry's embedded public key
+   * really is Chameleon's, independent of trusting the entry alone. 404s
+   * (not 200 with a null body) when Rekor publishing isn't configured, so a
+   * verifier gets an unambiguous signal rather than having to parse a null.
+   */
+  fastify.get('/rekor-signing-public-key', async (_request, reply) => {
+    try {
+      const publicKey = await certificateService.getRekorPublicKey();
+      if (!publicKey) {
+        return reply.status(404).send({
+          statusCode: 404,
+          error: 'Not configured',
+          message: 'Rekor transparency log publishing is not enabled on this deployment',
+        });
+      }
+      return {
+        publicKey,
+        algorithm: 'EC_SIGN_P256_SHA256',
+        timestamp: new Date().toISOString(),
+      };
+    } catch (error) {
+      logger.error({ error }, 'Failed to fetch Rekor signing public key');
+      throw error;
+    }
+  });
+
+  /**
    * GET /.well-known/jwks.json
    * Returns the JSON Web Key Set for automatic certificate verification.
    */

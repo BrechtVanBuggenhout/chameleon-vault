@@ -1,4 +1,5 @@
 import type { TsaTimestampInfo } from '../gcp/tsa-client.js';
+import type { RekorLogEntryInfo } from '../gcp/rekor-client.js';
 
 // Per-tenant chain-of-custody state for the Certificate of Destruction log.
 // One document per tenant -- the current chain head. See
@@ -37,4 +38,11 @@ export interface CertificateChainEntry {
   // GCSClient.uploadCertificate) is the actual source of truth read by
   // the public verification API.
   tsaTimestamp?: TsaTimestampInfo;
+  // Same absence semantics as tsaTimestamp above (disabled vs. never
+  // attempted are indistinguishable after the fact). Also a best-effort
+  // Firestore copy for internal tooling -- the entry actually published to
+  // Rekor is the source of truth for third-party verification, not this
+  // field; a verifier looks it up on rekor.sigstore.dev by entryUuid/hash,
+  // independent of Chameleon's own infrastructure entirely.
+  rekorEntry?: RekorLogEntryInfo;
 }

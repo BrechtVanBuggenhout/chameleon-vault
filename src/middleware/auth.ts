@@ -3,6 +3,7 @@ import { AnalystAccessService } from '../services/analyst-access-service.js';
 export interface AuthResult {
   authorized: boolean;
   analystEmail?: string;
+  role?: 'analyst' | 'auditor';
 }
 
 // The claim-consumption route is the one place an anonymous caller (an
@@ -34,6 +35,19 @@ function isAnalystCredentialAllowedPath(path: string): boolean {
   return ANALYST_CREDENTIAL_EXACT_PATHS.has(path) || ANALYST_CREDENTIAL_RESOURCE_PATTERN.test(path);
 }
 
+// An auditor credential is deliberately the narrowest scope in the system --
+// narrower even than an analyst credential. It can reach exactly one route:
+// a minimal, single-purpose erasure-status check (see routes/auditor-verify.ts,
+// FirestoreRegistry.hasActiveKeyMaterial). It can never read/write PII,
+// declare resources, or touch anything else -- an auditor's whole reason for
+// holding this credential is to check a deletion claim independently, not to
+// gain any operational capability.
+const AUDITOR_CREDENTIAL_ROUTE_PATTERN = /^\/audit\/key-status\/[^/]+$/;
+
+function isAuditorCredentialAllowedPath(path: string): boolean {
+  return AUDITOR_CREDENTIAL_ROUTE_PATTERN.test(path);
+}
+
 // BigQuery's remote function has no way to present VAULT_API_KEY -- it
 // authenticates as the connection's own service account via a Google-signed
 // ID token instead. Exempt from the shared-key hook here; the route itself
@@ -48,9 +62,9 @@ const DECRYPTED_VIEWS_BATCH_DECRYPT_PATH = '/internal/decrypted-views/batch-decr
 // received a certificate JWT from a customer, with no VAULT_API_KEY of their
 // own. Gating them behind the shared key would make that impossible while
 // looking like it worked (verify-cert.ts would just 401 for exactly the
-// audience it's meant to serve). Neither endpoint returns anything secret --
-// a KMS asymmetric-sign public key and a JWKS document, by definition.
-const PUBLIC_VERIFICATION_PATHS = new Set(['/public-key', '/.well-known/jwks.json']);
+// audience it's meant to serve). None of these return anything secret --
+// KMS asymmetric-sign public keys and a JWKS document, by definition.
+const PUBLIC_VERIFICATION_PATHS = new Set(['/public-key', '/rekor-signing-public-key', '/.well-known/jwks.json']);
 
 // Same reasoning as PUBLIC_VERIFICATION_PATHS above, for chain-continuity
 // lookups: a hash is only ever known to someone who already holds a real
@@ -80,10 +94,19 @@ export async function resolveAuth(
     return { authorized: true };
   }
 
-  if (providedKey && isAnalystCredentialAllowedPath(path)) {
+  // Cheap, synchronous pre-check before the Firestore read below -- if the
+  // path is on neither role's allowed list, no credential could possibly
+  // authorize it, so there's no reason to resolve one. Preserves the
+  // original short-circuit behavior (and its test coverage) now that there
+  // are two roles to check instead of one.
+  if (providedKey && (isAnalystCredentialAllowedPath(path) || isAuditorCredentialAllowedPath(path))) {
     const identity = await analystAccessService.resolveCredential(providedKey);
     if (identity) {
-      return { authorized: true, analystEmail: identity.analystEmail };
+      const allowed =
+        identity.role === 'auditor' ? isAuditorCredentialAllowedPath(path) : isAnalystCredentialAllowedPath(path);
+      if (allowed) {
+        return { authorized: true, analystEmail: identity.analystEmail, role: identity.role };
+      }
     }
   }
 
