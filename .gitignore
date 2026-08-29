@@ -42,4 +42,17 @@ Thumbs.db
 # GCP
 google-credentials.json
 service-account-key.json
-*.pem
+# Deliberately no blanket "*.pem" here -- this repo's sync workflow
+# (sync-public-vault.yml, chameleon-key-vault) legitimately needs to publish
+# public-only .pem fixtures (test/fixtures/freetsa-root-ca.pem,
+# freetsa-tsa-cert.pem -- a CA cert and a TSA signing cert, no private key
+# material). A blanket pattern here silently dropped them from `git add -A`
+# on every sync run for a month, even though rsync copied them in every
+# time and the sync itself reported success -- nothing checked that the
+# intended files actually got staged. Real protection against an actual
+# accidentally-synced private key already exists in the sync workflow's own
+# "Secret / personal-identifier safety gate" step, which scans file
+# *content* for "-----BEGIN (RSA|PRIVATE|OPENSSH) PRIVATE KEY-----" --
+# correctly catching real private keys regardless of extension, and
+# correctly not flagging a public certificate that happens to be named
+# *.pem, which the filename-based rule here couldn't distinguish.
