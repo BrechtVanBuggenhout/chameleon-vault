@@ -40,6 +40,43 @@ await jest.unstable_mockModule('../src/gcp/firestore-registry.js', () => ({
   }
 }));
 
+// CertificateSigner's own minimal Firestore client (see
+// certificate-signer/firestore-client.ts) -- reads from the exact same
+// mockRegistryStore/mockDeletionRequestStore maps as the FirestoreRegistry/
+// DeletionRequestRepository mocks below, so both the orchestrator's own
+// early-check reads (getCertificateForUser) and the signer's independent
+// reads (the actual trust-critical decision) see consistent test data.
+// Unlike FirestoreRegistry's mock below, this one sets BOTH shred_at and
+// shredAt -- the real CertificateSignerFirestoreClient fixes a bug where
+// the original class only ever set shred_at, silently leaving every
+// certificate's shredDate as its own issuance time instead of the real
+// shred time.
+await jest.unstable_mockModule('../src/certificate-signer/firestore-client.js', () => ({
+  CertificateSignerFirestoreClient: class {
+    getKeyStatus = jest.fn(async (userId: string) => {
+      const entry = mockRegistryStore.get(userId);
+      if (!entry) return null;
+      return {
+        status: entry.status,
+        shred_at: entry.shredAt,
+        shredAt: entry.shredAt,
+        created_at: '2026-01-01T00:00:00Z',
+      };
+    });
+    getDeletionRequest = jest.fn(async (deletionRequestId: string) => {
+      const userId = deletionRequestId.replace(/^del_/, '');
+      const entry = mockDeletionRequestStore.get(userId);
+      if (!entry) return null;
+      return { deletion_request_id: deletionRequestId, user_id: userId, ...entry };
+    });
+    getLatestCompletedDeletionRequestForUser = jest.fn(async (userId: string) => {
+      const entry = mockDeletionRequestStore.get(userId);
+      if (!entry) return null;
+      return { deletion_request_id: `del_${userId}`, user_id: userId, ...entry };
+    });
+  }
+}));
+
 await jest.unstable_mockModule('../src/gcp/bigquery-lineage.js', () => ({
   BigQueryLineageRepository: class {
     getGhostDataFindings = jest.fn(async () => [
@@ -212,6 +249,8 @@ const { CloudKMSClient } = await import('../src/gcp/cloud-kms.js');
 const { DeletionRequestRepository } = await import('../src/gcp/deletion-request-repository.js');
 const { CertificateChainRepository } = await import('../src/gcp/certificate-chain-repository.js');
 const { GCSClient } = await import('../src/gcp/gcs-client.js');
+const { CertificateSigner } = await import('../src/certificate-signer/sign.js');
+const { CertificateSignerFirestoreClient } = await import('../src/certificate-signer/firestore-client.js');
 
 describe('Certificate API Integration Tests', () => {
   let app: FastifyInstance;
@@ -224,8 +263,15 @@ describe('Certificate API Integration Tests', () => {
     const gcs = new (GCSClient as any)('p', 'test-bucket');
     const deletionRequestRepo = new (DeletionRequestRepository as any)('p', 'c', 'd');
     const chainRepo = new (CertificateChainRepository as any)('p', 'c', 'd');
+    // Deliberately a separate CloudKMSClient instance from `kms` above,
+    // matching main.ts's real wiring -- both instances share the same
+    // underlying mock state (mockVersions etc.) since CloudKMSClient is
+    // mocked at the class level, so rotation/JWKS assertions below still
+    // stay consistent with what the signer actually signs with.
+    const signerKms = new (CloudKMSClient as any)('p', 'r', 'kr', 'kn');
+    const certificateSigner = new (CertificateSigner as any)(new (CertificateSignerFirestoreClient as any)('p', 'c', 'd'), signerKms);
 
-    certificateService = new (CertificateService as any)(registry, lineage, kms, gcs, deletionRequestRepo, chainRepo);
+    certificateService = new (CertificateService as any)(registry, lineage, kms, gcs, deletionRequestRepo, chainRepo, certificateSigner);
 
     app = Fastify();
     await app.register(certificateRoutes, { certificateService });

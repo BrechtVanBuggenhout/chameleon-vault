@@ -8,6 +8,7 @@ import { GCSClient } from '../src/gcp/gcs-client.js';
 import { DeletionRequestRepository } from '../src/gcp/deletion-request-repository.js';
 import { CertificateChainRepository } from '../src/gcp/certificate-chain-repository.js';
 import { RekorClient, RekorLogEntryInfo } from '../src/gcp/rekor-client.js';
+import { CertificateSigner } from '../src/certificate-signer/sign.js';
 import { DeletionRequest } from '../src/types/deletion-request.js';
 
 jest.mock('../src/services/registry.js', () => ({
@@ -42,6 +43,7 @@ describe('CertificateService.issueAndStoreCertificate -- Rekor integration', () 
   let mockChainRepository: { appendToChain: jest.Mock; recordTsaTimestamp: jest.Mock; recordRekorEntry: jest.Mock };
   let mockGcsClient: { uploadCertificate: jest.Mock };
   let mockRekorClient: { publishCertificateHash: jest.Mock };
+  let mockCertificateSigner: { generateClaims: jest.Mock; signClaims: jest.Mock; invalidateSigningKeyCache: jest.Mock };
   let baseRequest: DeletionRequest;
 
   beforeEach(() => {
@@ -80,6 +82,11 @@ describe('CertificateService.issueAndStoreCertificate -- Rekor integration', () 
     };
     mockGcsClient = { uploadCertificate: jest.fn().mockResolvedValue('gs://bucket/path.json') };
     mockRekorClient = { publishCertificateHash: jest.fn() };
+    mockCertificateSigner = {
+      generateClaims: jest.fn().mockResolvedValue({}),
+      signClaims: jest.fn().mockResolvedValue({ certificate: 'fake-jwt-token', certificateHash: 'fake-hash' }),
+      invalidateSigningKeyCache: jest.fn(),
+    };
 
     service = new CertificateService(
       mockFirestoreRegistry as unknown as FirestoreRegistry,
@@ -88,6 +95,7 @@ describe('CertificateService.issueAndStoreCertificate -- Rekor integration', () 
       mockGcsClient as unknown as GCSClient,
       mockDeletionRequestRepo as unknown as DeletionRequestRepository,
       mockChainRepository as unknown as CertificateChainRepository,
+      mockCertificateSigner as unknown as CertificateSigner,
       undefined, // tsaClient
       mockRekorClient as unknown as RekorClient
     );
@@ -156,7 +164,8 @@ describe('CertificateService.issueAndStoreCertificate -- Rekor integration', () 
       mockKmsClient as unknown as CloudKMSClient,
       mockGcsClient as unknown as GCSClient,
       mockDeletionRequestRepo as unknown as DeletionRequestRepository,
-      mockChainRepository as unknown as CertificateChainRepository
+      mockChainRepository as unknown as CertificateChainRepository,
+      mockCertificateSigner as unknown as CertificateSigner
       // tsaClient and rekorClient both omitted
     );
 

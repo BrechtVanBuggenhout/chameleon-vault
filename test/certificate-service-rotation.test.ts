@@ -6,6 +6,7 @@ import { CloudKMSClient } from '../src/gcp/cloud-kms.js';
 import { GCSClient } from '../src/gcp/gcs-client.js';
 import { DeletionRequestRepository } from '../src/gcp/deletion-request-repository.js';
 import { CertificateChainRepository } from '../src/gcp/certificate-chain-repository.js';
+import { CertificateSigner } from '../src/certificate-signer/sign.js';
 
 const mockLoggerInfo = jest.fn();
 await jest.unstable_mockModule('../src/logging/index.js', () => ({
@@ -41,7 +42,10 @@ describe('CertificateService.rotateSigningKey audit trail', () => {
       mockKmsClient as unknown as CloudKMSClient,
       {} as unknown as GCSClient,
       {} as unknown as DeletionRequestRepository,
-      {} as unknown as CertificateChainRepository
+      {} as unknown as CertificateChainRepository,
+      // rotateSigningKey() also invalidates certificateSigner's own,
+      // separate cache -- see certificate-signer/sign.ts.
+      { invalidateSigningKeyCache: jest.fn() } as unknown as CertificateSigner
     );
   });
 

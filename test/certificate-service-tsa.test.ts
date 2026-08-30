@@ -8,6 +8,7 @@ import { GCSClient } from '../src/gcp/gcs-client.js';
 import { DeletionRequestRepository } from '../src/gcp/deletion-request-repository.js';
 import { CertificateChainRepository } from '../src/gcp/certificate-chain-repository.js';
 import { TsaClient, TsaTimestampInfo } from '../src/gcp/tsa-client.js';
+import { CertificateSigner } from '../src/certificate-signer/sign.js';
 import { DeletionRequest } from '../src/types/deletion-request.js';
 
 jest.mock('../src/services/registry.js', () => ({
@@ -42,6 +43,7 @@ describe('CertificateService.issueAndStoreCertificate -- TSA integration', () =>
   let mockChainRepository: { appendToChain: jest.Mock; recordTsaTimestamp: jest.Mock };
   let mockGcsClient: { uploadCertificate: jest.Mock };
   let mockTsaClient: { requestTimestamp: jest.Mock };
+  let mockCertificateSigner: { generateClaims: jest.Mock; signClaims: jest.Mock; invalidateSigningKeyCache: jest.Mock };
   let baseRequest: DeletionRequest;
 
   beforeEach(() => {
@@ -81,6 +83,15 @@ describe('CertificateService.issueAndStoreCertificate -- TSA integration', () =>
     };
     mockGcsClient = { uploadCertificate: jest.fn().mockResolvedValue('gs://bucket/path.json') };
     mockTsaClient = { requestTimestamp: jest.fn() };
+    // CertificateService no longer builds/signs claims itself (see
+    // certificate-signer/sign.ts) -- these tests exercise TSA orchestration
+    // specifically, so a minimal stand-in is enough; claims content isn't
+    // asserted on here (see certificate-signer.test.ts for that).
+    mockCertificateSigner = {
+      generateClaims: jest.fn().mockResolvedValue({}),
+      signClaims: jest.fn().mockResolvedValue({ certificate: 'fake-jwt-token', certificateHash: 'fake-hash' }),
+      invalidateSigningKeyCache: jest.fn(),
+    };
 
     service = new CertificateService(
       mockFirestoreRegistry as unknown as FirestoreRegistry,
@@ -89,6 +100,7 @@ describe('CertificateService.issueAndStoreCertificate -- TSA integration', () =>
       mockGcsClient as unknown as GCSClient,
       mockDeletionRequestRepo as unknown as DeletionRequestRepository,
       mockChainRepository as unknown as CertificateChainRepository,
+      mockCertificateSigner as unknown as CertificateSigner,
       mockTsaClient as unknown as TsaClient
     );
   });
@@ -151,7 +163,8 @@ describe('CertificateService.issueAndStoreCertificate -- TSA integration', () =>
       mockKmsClient as unknown as CloudKMSClient,
       mockGcsClient as unknown as GCSClient,
       mockDeletionRequestRepo as unknown as DeletionRequestRepository,
-      mockChainRepository as unknown as CertificateChainRepository
+      mockChainRepository as unknown as CertificateChainRepository,
+      mockCertificateSigner as unknown as CertificateSigner
       // tsaClient omitted entirely
     );
 

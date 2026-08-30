@@ -4,7 +4,7 @@ import { BigQueryLineageRepository } from '../gcp/bigquery-lineage.js';
 import { CloudKMSClient } from '../gcp/cloud-kms.js';
 import { DeletionRequestRepository } from '../gcp/deletion-request-repository.js';
 import { CertificateChainRepository } from '../gcp/certificate-chain-repository.js';
-import { CertificateLineageItem, DestructionCertificateClaims, KeyStatus } from '../types/index.js';
+import { DestructionCertificateClaims, KeyStatus } from '../types/index.js';
 import { DeletionRequest } from '../types/deletion-request.js';
 import { createLogger } from '../logging/index.js';
 import { CHAIN_ANCHOR_MARKER } from '../logging/audit-anchor.js';
@@ -12,24 +12,9 @@ import { GCSClient } from '../gcp/gcs-client.js';
 import { TsaClient, TsaTimestampInfo } from '../gcp/tsa-client.js';
 import { RekorClient, RekorLogEntryInfo } from '../gcp/rekor-client.js';
 import { connectorRegistry } from './registry.js';
+import { CertificateSigner } from '../certificate-signer/sign.js';
 
 const logger = createLogger('certificate-service');
-
-// Firestore's Node SDK reads timestamp fields back as its own Timestamp
-// class, not a native Date -- `instanceof Date` fails on it, and it has no
-// toString() override, so String(timestampInstance) silently produces the
-// literal string "[object Object]" instead of throwing. Found live in a
-// real issued certificate's lineageSummary (Immoscoop, 2026-08-17). Duck-
-// types via toDate() rather than importing Timestamp, since a plain Date
-// also needs to work here (e.g. in tests that construct janitor_wipes by
-// hand) and only one of the two ever has that method.
-function timestampToIso(value: unknown): string {
-  if (value instanceof Date) return value.toISOString();
-  if (value && typeof (value as { toDate?: unknown }).toDate === 'function') {
-    return (value as { toDate: () => Date }).toDate().toISOString();
-  }
-  return String(value);
-}
 
 export class CertificateService {
   constructor(
@@ -39,16 +24,20 @@ export class CertificateService {
     private readonly gcsClient: GCSClient,
     private readonly deletionRequestRepo: DeletionRequestRepository,
     private readonly chainRepository: CertificateChainRepository,
+    private readonly certificateSigner: CertificateSigner,
     private readonly tsaClient?: TsaClient,
     private readonly rekorClient?: RekorClient
   ) {}
 
-  // Shared by generateCertificateClaims and getCertificateForUser so both
-  // enforce the exact same eligibility rule (and error wording) for issuing
-  // or returning a certificate -- key must be shredded, and a real deletion
-  // cascade must have actually completed. Split into two assertion
-  // functions (rather than one checking both) because a TS `asserts x is Y`
-  // clause can only narrow a single identifier.
+  // Used by getCertificateForUser below for its own early-exit branching
+  // (stored vs. regenerate) -- a separate, smaller copy of the same
+  // assertions CertificateSigner.generateClaims makes independently inside
+  // the trust boundary (see certificate-signer/sign.ts). Harmless
+  // duplication, not a security concession: this copy exists for control
+  // flow here, not as something the signer trusts instead of checking
+  // itself. Split into two assertion functions (rather than one checking
+  // both) because a TS `asserts x is Y` clause can only narrow a single
+  // identifier.
   private assertKeyShredded(userId: string, keyStatus: KeyStatus | null): asserts keyStatus is KeyStatus {
     if (!keyStatus || (keyStatus.status !== 'SHREDDED' && keyStatus.status !== 'DELETED')) {
       throw new Error(`Cannot generate certificate: Key for user ${userId} is not shredded.`);
@@ -62,115 +51,40 @@ export class CertificateService {
   }
 
   /**
-   * Generates the unsigned claims for a Certificate of Destruction.
-   *
-   * Gated on a real, completed deletion cascade -- not just the key being
-   * shredded. Previously this pulled destination names from raw lineage
-   * events/Firestore hot-path data and stamped every one of them 'ERASED'
-   * unconditionally, with no check that a cascade wipe had ever actually
-   * run or succeeded for this user. That let GET /certificate/:userId issue
-   * a signed certificate claiming destinations were erased when nothing
-   * had been verified. lineageSummary now comes only from the deletion
-   * request's own janitor_wipes -- the same real, per-destination
-   * SUCCEEDED/FAILED results the CASCADE_COMPLETE gate already relies on --
-   * so a certificate can only ever repeat what was actually confirmed.
-   */
-  async generateCertificateClaims(
-    userId: string,
-    tenantId: string = 'default-tenant',
-    deletionRequestId?: string
-  ): Promise<Omit<DestructionCertificateClaims, 'previousCertificateHash' | 'chainSequence'>> {
-    logger.info({ userId, tenantId, deletionRequestId }, 'Generating destruction certificate claims');
-
-    const keyStatus = await this.firestoreRegistry.getKeyStatus(userId, tenantId);
-
-    const deletionRequest = deletionRequestId
-      ? await this.deletionRequestRepo.getDeletionRequest(deletionRequestId)
-      : await this.deletionRequestRepo.getLatestCompletedDeletionRequestForUser(userId, tenantId);
-
-    this.assertKeyShredded(userId, keyStatus);
-    this.assertCascadeComplete(userId, deletionRequest);
-
-    // Only ever built from real, recorded outcomes -- never re-derived from
-    // raw lineage/destination-name data. Filtering to SUCCEEDED is
-    // defensive, not load-bearing: CASCADE_COMPLETE is only reachable when
-    // every wipe succeeded (see deletion-request-service.ts), so a FAILED
-    // entry here should never actually occur.
-    const lineageSummary: CertificateLineageItem[] = (deletionRequest.janitor_wipes || [])
-      .filter(wipe => wipe.status === 'SUCCEEDED')
-      .map(wipe => ({
-        system: wipe.destination,
-        // recordsFound === 0 is the janitor/SaaS connectors' "nothing here"
-        // signal; rowsAffected === 0 is source-redaction's equivalent (see
-        // source-redaction-service.ts's redactOne, which returns
-        // numDmlAffectedRows). Before this fix only recordsFound was
-        // checked, so a REDACT_IN_PLACE UPDATE matching zero rows -- e.g. a
-        // WHERE clause that can never match, found live on Immoscoop
-        // 2026-08-17 -- got unconditionally labeled ERASED with no
-        // indication nothing was actually redacted.
-        status: (wipe.details?.recordsFound === 0 || wipe.details?.rowsAffected === 0)
-          ? ('CONFIRMED_ABSENT' as const)
-          : ('ERASED' as const),
-        timestamp: timestampToIso(wipe.updated_at),
-      }));
-
-    const ghostDataSummary = await this.lineageRepo.getGhostDataFindings(userId, tenantId);
-
-    const keyDestructionStatus = (keyStatus.status === 'SHREDDED' || keyStatus.status === 'DELETED') ? 'COMPLETE' : 'PENDING';
-
-    // See assertCascadeComplete: reachable only once every attempted
-    // destination in janitor_wipes succeeded, so checked === succeeded here
-    // in practice -- both are stated so the claim is self-contained.
-    const destinationsChecked = deletionRequest.janitor_wipes?.length ?? 0;
-    const destinationsSucceeded = (deletionRequest.janitor_wipes || []).filter(w => w.status === 'SUCCEEDED').length;
-
-    const claims: Omit<DestructionCertificateClaims, 'previousCertificateHash' | 'chainSequence'> = {
-      iss: 'Chameleon Key Vault',
-      sub: userId,
-      tenantId,
-      tenant_id: tenantId,
-      user_id: userId, // Add snake_case alias for auditors
-      keyDestructionStatus,
-      keyDestructionMethod: 'DEK_ERASURE',
-      warehouseData: 'CRYPTOGRAPHICALLY UNREADABLE',
-      iat: Math.floor(Date.now() / 1000),
-      jti: `cert_${userId}_${Date.now()}`,
-      shredDate: keyStatus.shredAt ?? new Date().toISOString(),
-      shred_date: keyStatus.shredAt ?? new Date().toISOString(), // Add snake_case alias for auditors
-      keyFingerprint: await this.getKeyFingerprint(),
-      lineageSummary,
-      lineageCoverage: {
-        destinationsChecked,
-        destinationsSucceeded,
-        knownDestinationTypes: connectorRegistry.getRegisteredConnectorNames(),
-      },
-      ghostDataSummary,
-      ghost_data_summary: ghostDataSummary,
-      ghostDataScanCoverage: 'NOT_TRACKED',
-    };
-
-    return claims;
-  }
-
-  /**
    * Issues, signs, and persists a Certificate of Destruction to GCS. This is
    * the one place a certificate is ever actually added to the tenant's hash
    * chain -- see CertificateChainRepository.appendToChain for why the sign
    * happens inside that transaction (reserves the sequence/previous-hash
    * atomically, so two deletions completing for the same tenant at once
    * can't corrupt the chain).
+   *
+   * The actual issuance decision (is the key really shredded, did the
+   * cascade really complete, what should the claims say) lives in
+   * CertificateSigner now, not here -- see
+   * chameleon-paper/TEE_ATTESTATION_PLAN.md. This method is the orchestrator:
+   * it fetches the two caller-supplied-but-non-authoritative inputs
+   * (ghostDataSummary, knownDestinationTypes -- see CertificateSigner's own
+   * doc comment for why those two specifically are safe to pre-fetch here
+   * rather than re-derived inside the trust boundary), owns the chain
+   * transaction, and handles everything that happens after a certificate is
+   * signed (TSA, Rekor, GCS).
    */
   async issueAndStoreCertificate(userId: string, deletionRequestId: string, tenantId: string = 'default-tenant'): Promise<{ certificate: string; gcsPath: string }> {
-    const baseClaims = await this.generateCertificateClaims(userId, tenantId, deletionRequestId);
+    const ghostDataSummary = await this.lineageRepo.getGhostDataFindings(userId, tenantId);
+    const baseClaims = await this.certificateSigner.generateClaims({
+      userId,
+      tenantId,
+      deletionRequestId,
+      ghostDataSummary,
+      knownDestinationTypes: connectorRegistry.getRegisteredConnectorNames(),
+    });
 
     const { certificate, certificateHash, previousHash, sequence } = await this.chainRepository.appendToChain(
       tenantId,
       deletionRequestId,
       async (previousCertificateHash, chainSequence) => {
         const claims: DestructionCertificateClaims = { ...baseClaims, previousCertificateHash, chainSequence };
-        const signed = await this.signCertificate(claims);
-        const hash = crypto.createHash('sha256').update(signed).digest('hex');
-        return { certificate: signed, certificateHash: hash };
+        return this.certificateSigner.signClaims(claims);
       }
     );
 
@@ -278,8 +192,15 @@ export class CertificateService {
       return { certificate: stored.certificate, stored: true };
     }
 
-    const claims = await this.generateCertificateClaims(userId, tenantId, deletionRequest.deletion_request_id);
-    const certificate = await this.signCertificate({ ...claims, previousCertificateHash: null, chainSequence: null });
+    const ghostDataSummary = await this.lineageRepo.getGhostDataFindings(userId, tenantId);
+    const baseClaims = await this.certificateSigner.generateClaims({
+      userId,
+      tenantId,
+      deletionRequestId: deletionRequest.deletion_request_id,
+      ghostDataSummary,
+      knownDestinationTypes: connectorRegistry.getRegisteredConnectorNames(),
+    });
+    const { certificate } = await this.certificateSigner.signClaims({ ...baseClaims, previousCertificateHash: null, chainSequence: null });
     return { certificate, stored: false };
   }
 
@@ -328,24 +249,6 @@ export class CertificateService {
     return value;
   }
 
-  async signCertificate(claims: DestructionCertificateClaims): Promise<string> {
-    const keyVersionPath = await this.getCurrentSigningKeyVersion();
-
-    const header = Buffer.from(JSON.stringify({
-      alg: 'PS256',
-      typ: 'JWT',
-      kid: keyVersionPath // Use full KMS resource name as kid for rotation mapping
-    })).toString('base64url');
-
-    const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
-
-    const unsignedToken = `${header}.${payload}`;
-
-    const signature = await this.signingKmsClient.asymmetricSign(unsignedToken, keyVersionPath);
-
-    return `${unsignedToken}.${signature}`;
-  }
-
   async getPublicKey(): Promise<string> {
     const keyVersionPath = await this.getCurrentSigningKeyVersion();
     return this.signingKmsClient.getPublicKey(keyVersionPath);
@@ -359,24 +262,7 @@ export class CertificateService {
     return this.rekorClient.getPublicKeyPem();
   }
 
-  // Keyed by version path -- a given version's public key/fingerprint never
-  // changes once ENABLED, so unlike the primary-version cache above this
-  // never needs a TTL or invalidation, just one entry per version ever seen.
-  private _fingerprintCache = new Map<string, string>();
-
-  async getKeyFingerprint(): Promise<string> {
-    const keyVersionPath = await this.getCurrentSigningKeyVersion();
-    const cached = this._fingerprintCache.get(keyVersionPath);
-    if (cached) return cached;
-    const pem = await this.signingKmsClient.getPublicKey(keyVersionPath);
-    const keyObject = crypto.createPublicKey(pem);
-    const der = keyObject.export({ type: 'spki', format: 'der' });
-    const fingerprint = `sha256:${crypto.createHash('sha256').update(der).digest('hex')}`;
-    this._fingerprintCache.set(keyVersionPath, fingerprint);
-    return fingerprint;
-  }
-
-  // Same never-expires reasoning as _fingerprintCache: a version's JWK is
+  // Same never-expires reasoning as the version cache above: a version's JWK is
   // immutable once ENABLED.
   private _jwkCache = new Map<string, Record<string, unknown>>();
   private _enabledVersionsCache: { value: string[]; expiresAt: number } | null = null;
@@ -434,9 +320,15 @@ export class CertificateService {
     await this.signingKmsClient.waitForVersionEnabled(newVersion);
 
     // Invalidate so the new version takes effect immediately rather than
-    // waiting out the caches' TTLs.
+    // waiting out the caches' TTLs -- including certificateSigner's own,
+    // separate cache (it uses its own CloudKMSClient instance, so its cache
+    // is never invalidated by the two lines above). Found missing via a
+    // real failing integration test during Phase 0's extraction: without
+    // this, a rotation would silently leave certificate issuance signing
+    // with the old key version for up to five minutes.
     this._currentVersionCache = null;
     this._enabledVersionsCache = null;
+    this.certificateSigner.invalidateSigningKeyCache();
 
     // Marked and worded identically to appendToChain's chain-anchor log line
     // (same CHAIN_ANCHOR_MARKER, matched by the same Cloud Logging sink

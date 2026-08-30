@@ -20,6 +20,8 @@ import { DecryptedViewsRepository } from './gcp/decrypted-views-repository.js';
 import { GithubActionsClient } from './gcp/github-actions-client.js';
 import { TsaClient } from './gcp/tsa-client.js';
 import { RekorClient } from './gcp/rekor-client.js';
+import { CertificateSigner } from './certificate-signer/sign.js';
+import { CertificateSignerFirestoreClient } from './certificate-signer/firestore-client.js';
 
 // Import Services
 import { JanitorService } from './services/janitor.js';
@@ -141,6 +143,22 @@ async function main() {
       })()
     : undefined;
 
+  // The trust-critical certificate-issuance decision, extracted into its
+  // own module (chameleon-paper/TEE_ATTESTATION_PLAN.md, Phase 0) -- a
+  // deliberately separate CloudKMSClient instance from signingKmsClient
+  // above, even though both currently point at the same underlying signing
+  // key. Phase 2 is what actually moves this module's execution into a
+  // Confidential Space enclave; Phase 0 only isolates the code, so this is
+  // still the same key/credentials as today, just constructed independently.
+  const certificateSignerFirestoreClient = new CertificateSignerFirestoreClient(
+    projectId,
+    firestoreCollection,
+    firestoreDeletionRequestCollection,
+    firestoreDatabaseId
+  );
+  const certificateSignerKmsClient = new CloudKMSClient(projectId, kmsRegion, signingKmsKeyRing, signingKmsKeyName);
+  const certificateSigner = new CertificateSigner(certificateSignerFirestoreClient, certificateSignerKmsClient);
+
   const certificateService = new CertificateService(
     firestoreRegistry,
     lineageRepository,
@@ -148,6 +166,7 @@ async function main() {
     gcsClient,
     deletionRequestRepo,
     certificateChainRepo,
+    certificateSigner,
     tsaClient,
     rekorClient
   );
