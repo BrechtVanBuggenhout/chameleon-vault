@@ -5,8 +5,13 @@ import { LocalSigningKmsClient } from './kms-client.js';
 import { GoogleIdTokenVerifier } from './auth.js';
 import { createServer } from './server.js';
 import { createLogger } from './logger.js';
+import { configureWorkloadIdentityCredentialsIfPresent } from './gcp-credentials.js';
 
 const logger = createLogger('certificate-signer-entrypoint');
+
+// Must run before any GCP client is constructed below -- see
+// gcp-credentials.ts for why.
+configureWorkloadIdentityCredentialsIfPresent();
 
 const projectId = getRequiredEnv('GCP_PROJECT_ID');
 const kmsRegion = getRequiredEnv('CLOUD_KMS_REGION');
