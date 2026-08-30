@@ -1,0 +1,21 @@
+{
+  "name": "chameleon-certificate-signer",
+  "version": "0.1.0",
+  "description": "Standalone build of the certificate-issuance decision (see ../../TEE_ATTESTATION_PLAN.md in chameleon-paper) -- the source lives here as part of chameleon-key-vault (relative imports from certificate-service.ts/main.ts still work as before), but this package.json/Dockerfile.certificate-signer define a SEPARATE, minimal, reproducible build pointed at just this directory. Not published, not npm-linked into the parent -- a second, parallel build pipeline over the same source.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^6.8.0",
+    "@google-cloud/kms": "^4.2.0",
+    "pino": "^8.17.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0"
+  },
+  "scripts": {
+    "build": "tsc"
+  }
+}

@@ -1,10 +1,10 @@
 import * as crypto from 'crypto';
-import { CloudKMSClient } from '../gcp/cloud-kms.js';
+import { SigningKmsClient } from './kms-client.js';
 import { CertificateSignerFirestoreClient } from './firestore-client.js';
 import { CertificateLineageItem, DestructionCertificateClaims, KeyStatus } from '../types/index.js';
 import { DeletionRequest } from '../types/deletion-request.js';
 import { GhostDataSummary } from '../types/lineage.js';
-import { createLogger } from '../logging/index.js';
+import { createLogger } from './logger.js';
 
 const logger = createLogger('certificate-signer');
 
@@ -71,7 +71,7 @@ export interface GenerateClaimsInput {
 export class CertificateSigner {
   constructor(
     private readonly firestoreClient: CertificateSignerFirestoreClient,
-    private readonly signingKmsClient: CloudKMSClient
+    private readonly signingKmsClient: SigningKmsClient
   ) {}
 
   async generateClaims(input: GenerateClaimsInput): Promise<Omit<DestructionCertificateClaims, 'previousCertificateHash' | 'chainSequence'>> {

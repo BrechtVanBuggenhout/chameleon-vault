@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "NodeNext",
+    "lib": ["ES2020"],
+    "moduleResolution": "NodeNext",
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "isolatedModules": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": false,
+    "sourceMap": false,
+    "outDir": "./dist",
+    "rootDir": "..",
+    "baseUrl": "."
+  },
+  "include": [
+    "./**/*",
+    "../types/index.ts",
+    "../types/deletion-request.ts",
+    "../types/lineage.ts"
+  ],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}
