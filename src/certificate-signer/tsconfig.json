@@ -21,7 +21,8 @@
     "./**/*",
     "../types/index.ts",
     "../types/deletion-request.ts",
-    "../types/lineage.ts"
+    "../types/lineage.ts",
+    "../config/env.ts"
   ],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }
