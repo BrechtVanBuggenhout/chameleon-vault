@@ -1,0 +1,42 @@
+# certificate-signer's own Trivy allowlist -- kept separate from the parent
+# monolith's .trivyignore (repo root) because this image's exposure profile
+# is different: certificate-signer is deliberately public-facing
+# (Cloudflare-fronted -- see chameleon-paper/TEE_ATTESTATION_PLAN.md's
+# Phase 2 networking decision), unlike the parent's
+# INGRESS_TRAFFIC_INTERNAL_ONLY posture. Reusing the parent file's "not
+# reachable from untrusted clients" reasoning would be actively misleading
+# here -- every entry below is justified on its own terms for this image.
+
+# node:22-alpine's own OpenSSL packages (libcrypto3/libssl3) -- no fix
+# published upstream yet as of 2026-08-31: the current node:22-alpine tag's
+# digest already matches what Dockerfile.certificate-signer pins, so there
+# is no newer base image available to re-pin to right now. Re-check on the
+# next periodic base-image re-pin (see that Dockerfile's own comment on
+# this discipline, and Phase 1's reasoning for why apk update/upgrade is
+# deliberately not run here instead).
+CVE-2026-14456
+
+# ip-address, pacote, tar -- npm's own bundled copy inside node:22-alpine
+# (/usr/local/lib/node_modules/npm/), same class of finding the parent
+# .trivyignore documents for other npm-internal CVEs (different CVE IDs,
+# same root cause). Confirmed via `npm ls ip-address/pacote/tar` in this
+# directory: none of these three are actual dependencies of this module
+# (all resolve empty) -- and this image's CMD
+# (`node dist/certificate-signer/entrypoint.js`) never invokes npm at
+# runtime.
+CVE-2026-69192
+CVE-2026-9496
+CVE-2026-73566
+
+# brace-expansion -- IS a real dependency here (confirmed via `npm ls
+# --all`: @google-cloud/firestore -> google-gax@3.6.1 -> protobufjs-cli@1.1.1
+# -> glob@8.1.0 -> minimatch@5.1.9 -> brace-expansion), unlike the three
+# above. protobufjs-cli provides the pbjs/pbts .proto-to-JS codegen CLI (its
+# own dependencies -- jsdoc, escodegen, espree -- confirm it's a
+# documentation/codegen toolchain, not a runtime library) -- google-gax
+# lists it as a direct dependency for an optional compileProtos step this
+# module never invokes. This module's runtime code only imports
+# protobufjs's message encode/decode APIs via google-gax's gRPC transport,
+# never protobufjs-cli's CLI, so glob/minimatch/brace-expansion's actual
+# code never executes in this image.
+CVE-2026-69152
