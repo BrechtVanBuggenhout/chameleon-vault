@@ -8,8 +8,8 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "@google-cloud/firestore": "^6.8.0",
-    "@google-cloud/kms": "^4.2.0",
+    "@google-cloud/firestore": "^9.0.0",
+    "@google-cloud/kms": "^6.0.0",
     "jose": "^5.10.0",
     "pino": "^8.17.0"
   },
