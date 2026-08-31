@@ -16,27 +16,24 @@
 # deliberately not run here instead).
 CVE-2026-14456
 
-# ip-address, pacote, tar -- npm's own bundled copy inside node:22-alpine
-# (/usr/local/lib/node_modules/npm/), same class of finding the parent
-# .trivyignore documents for other npm-internal CVEs (different CVE IDs,
-# same root cause). Confirmed via `npm ls ip-address/pacote/tar` in this
-# directory: none of these three are actual dependencies of this module
-# (all resolve empty) -- and this image's CMD
-# (`node dist/certificate-signer/entrypoint.js`) never invokes npm at
-# runtime.
+# Everything below is npm's own bundled copy inside node:22-alpine
+# (/usr/local/lib/node_modules/npm/) -- the same root cause as the parent
+# .trivyignore's npm-internal entries, confirmed independently for this
+# image rather than assumed: `npm ls <package>` in this directory resolves
+# empty for every package below except brace-expansion, where the
+# vulnerable installed version Trivy reports (2.0.2) doesn't match this
+# module's own real, reachable copy (2.1.4, via
+# @google-cloud/firestore -> google-gax -> rimraf -> glob -> minimatch --
+# not itself flagged by any of these CVEs). None of this executes at
+# runtime either way: this image's CMD is
+# `node dist/certificate-signer/entrypoint.js`, never npm.
 CVE-2026-69192
 CVE-2026-9496
 CVE-2026-73566
-
-# brace-expansion -- IS a real dependency here (confirmed via `npm ls
-# --all`: @google-cloud/firestore -> google-gax@3.6.1 -> protobufjs-cli@1.1.1
-# -> glob@8.1.0 -> minimatch@5.1.9 -> brace-expansion), unlike the three
-# above. protobufjs-cli provides the pbjs/pbts .proto-to-JS codegen CLI (its
-# own dependencies -- jsdoc, escodegen, espree -- confirm it's a
-# documentation/codegen toolchain, not a runtime library) -- google-gax
-# lists it as a direct dependency for an optional compileProtos step this
-# module never invokes. This module's runtime code only imports
-# protobufjs's message encode/decode APIs via google-gax's gRPC transport,
-# never protobufjs-cli's CLI, so glob/minimatch/brace-expansion's actual
-# code never executes in this image.
 CVE-2026-69152
+CVE-2026-13149
+CVE-2026-14257
+CVE-2026-33671
+CVE-2026-48815
+CVE-2026-59873
+CVE-2026-59874
