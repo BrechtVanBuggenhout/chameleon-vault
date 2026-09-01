@@ -320,6 +320,27 @@ describe('DeletionRequestService - cascade outcome gates certificate issuance', 
       })
     );
   });
+
+  it('advances to CASCADE_PARTIAL_FAILURE, not stuck at KEY_DESTROYED, when building the cleanup plan itself throws', async () => {
+    // createCleanupPlan throwing (e.g. a Firestore read failing) used to
+    // propagate straight out of advanceRequest before updateDeletionRequestStatus
+    // ever ran, leaving the request sitting at KEY_DESTROYED forever with no
+    // cascade ever attempted and nothing to indicate it failed.
+    mockJanitorService.createCleanupPlan.mockRejectedValue(new Error('Firestore unavailable'));
+
+    await expect(service.advanceRequest('del-1', 'CASCADE_PENDING', 'op-1')).resolves.toBeDefined();
+
+    expect(currentRequest.status).toBe('CASCADE_PARTIAL_FAILURE');
+    expect(mockCertificateService.issueAndStoreCertificate).not.toHaveBeenCalled();
+    expect(mockLineageRepository.recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'CASCADE_PARTIAL_FAILURE',
+        context: {
+          failedDestinations: expect.arrayContaining([expect.stringContaining('Firestore unavailable')]),
+        },
+      })
+    );
+  });
 });
 
 describe('DeletionRequestService - CASCADE_IN_PROGRESS retries a stuck CASCADE_PARTIAL_FAILURE', () => {
@@ -414,6 +435,24 @@ describe('DeletionRequestService - CASCADE_IN_PROGRESS retries a stuck CASCADE_P
     await flushMicrotasks();
 
     expect(currentRequest.status).toBe('CASCADE_PARTIAL_FAILURE');
+    expect(mockCertificateService.issueAndStoreCertificate).not.toHaveBeenCalled();
+  });
+
+  it('leaves the request at CASCADE_PARTIAL_FAILURE, not written as CASCADE_IN_PROGRESS, when the retry cannot even build a plan', async () => {
+    // Unlike the first-attempt case (KEY_DESTROYED -> CASCADE_PARTIAL_FAILURE
+    // is a valid transition), there is no CASCADE_PARTIAL_FAILURE ->
+    // CASCADE_PARTIAL_FAILURE self-transition -- and none is needed, since
+    // the request is already sitting there. The fix must not attempt one
+    // (that would throw "Invalid state transition") and must not persist
+    // CASCADE_IN_PROGRESS for a retry that never actually started.
+    mockJanitorService.createCleanupPlan.mockRejectedValue(new Error('Firestore unavailable'));
+
+    await expect(service.advanceRequest('del-1', 'CASCADE_IN_PROGRESS', 'op-2')).resolves.toBeDefined();
+
+    expect(currentRequest.status).toBe('CASCADE_PARTIAL_FAILURE');
+    expect(mockDeletionRequestRepo.updateDeletionRequestStatus).not.toHaveBeenCalledWith(
+      'del-1', 'CASCADE_IN_PROGRESS', expect.anything()
+    );
     expect(mockCertificateService.issueAndStoreCertificate).not.toHaveBeenCalled();
   });
 

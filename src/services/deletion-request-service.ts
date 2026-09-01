@@ -110,6 +110,24 @@ export class DeletionRequestService {
           // If no SaaS cleanup or source redaction is needed, move straight to COMPLETE
           return this.advanceRequest(deletionRequestId, 'CASCADE_COMPLETE', operationId);
         }
+        if (plan.planFailed) {
+          // Building the cleanup plan itself threw (e.g. createCleanupPlan /
+          // planRedaction / planEncryptedCopyDeletion) -- before this, that
+          // exception would propagate straight out of advanceRequest, this
+          // status write below would never run, and the request would be
+          // stuck at KEY_DESTROYED forever with no cascade ever attempted
+          // and no automated reconciliation to notice. KEY_DESTROYED ->
+          // CASCADE_PARTIAL_FAILURE is a valid transition, so force it
+          // instead -- same "representable, not hidden" principle the async
+          // cleanup-loop failure below already gets.
+          logger.error(
+            { deletionRequestId, userId: request.user_id, err: plan.error },
+            'Cascade plan creation failed before any wipe was dispatched -- advancing to CASCADE_PARTIAL_FAILURE instead of leaving the request stuck at KEY_DESTROYED'
+          );
+          return this.advanceRequest(deletionRequestId, 'CASCADE_PARTIAL_FAILURE', operationId, {
+            failedDestinations: [`internal-error (plan creation): ${plan.error instanceof Error ? plan.error.message : String(plan.error)}`],
+          });
+        }
 
         afterStatusPersisted = plan.afterStatusPersisted;
         logger.info({ deletionRequestId, userId: request.user_id }, 'Janitor cascade triggered for user');
@@ -142,6 +160,21 @@ export class DeletionRequestService {
         if (plan.shortcutToComplete) {
           logger.info({ userId: request.user_id }, 'Cascade retry found nothing left to wipe, advancing to complete');
           return this.advanceRequest(deletionRequestId, 'CASCADE_COMPLETE', operationId);
+        }
+        if (plan.planFailed) {
+          // Unlike the CASCADE_PENDING case above, there's no valid
+          // CASCADE_PARTIAL_FAILURE -> CASCADE_PARTIAL_FAILURE self-transition
+          // (isValidTransition has no self-loop) -- and none is needed. The
+          // request is already sitting at CASCADE_PARTIAL_FAILURE, which is
+          // how a retry gets triggered at all; that's already the correct,
+          // visible, retriable state. Log and return the request unchanged
+          // rather than writing CASCADE_IN_PROGRESS for a retry that never
+          // actually started.
+          logger.error(
+            { deletionRequestId, userId: request.user_id, err: plan.error },
+            'Cascade retry plan creation failed -- leaving request at CASCADE_PARTIAL_FAILURE for a future retry'
+          );
+          return request;
         }
 
         afterStatusPersisted = plan.afterStatusPersisted;
@@ -225,10 +258,22 @@ export class DeletionRequestService {
     request: DeletionRequest,
     tenantId: string,
     operationId: string
-  ): Promise<{ shortcutToComplete: true } | { shortcutToComplete: false; afterStatusPersisted: () => void; taskDestinations: string[] }> {
-    const tasks = await this.janitorService.createCleanupPlan(request.user_id, tenantId);
-    const redactionResources = this.sourceRedactionService?.planRedaction(tenantId) ?? [];
-    const encryptedCopyResources = this.sourceRedactionService?.planEncryptedCopyDeletion(tenantId) ?? [];
+  ): Promise<
+    | { shortcutToComplete: true }
+    | { shortcutToComplete: false; planFailed: true; error: unknown }
+    | { shortcutToComplete: false; planFailed: false; afterStatusPersisted: () => void; taskDestinations: string[] }
+  > {
+    let tasks: Awaited<ReturnType<JanitorService['createCleanupPlan']>>;
+    let redactionResources: ReturnType<NonNullable<SourceRedactionService['planRedaction']>>;
+    let encryptedCopyResources: ReturnType<NonNullable<SourceRedactionService['planEncryptedCopyDeletion']>>;
+    try {
+      tasks = await this.janitorService.createCleanupPlan(request.user_id, tenantId);
+      redactionResources = this.sourceRedactionService?.planRedaction(tenantId) ?? [];
+      encryptedCopyResources = this.sourceRedactionService?.planEncryptedCopyDeletion(tenantId) ?? [];
+    } catch (err) {
+      logger.error({ err, userId: request.user_id, deletionRequestId }, 'Failed to build cascade cleanup plan');
+      return { shortcutToComplete: false, planFailed: true, error: err };
+    }
 
     if (tasks.length === 0 && redactionResources.length === 0 && encryptedCopyResources.length === 0) {
       return { shortcutToComplete: true };
@@ -325,7 +370,7 @@ export class DeletionRequestService {
       });
     };
 
-    return { shortcutToComplete: false, afterStatusPersisted, taskDestinations: tasks.map(t => t.destination) };
+    return { shortcutToComplete: false, planFailed: false, afterStatusPersisted, taskDestinations: tasks.map(t => t.destination) };
   }
 
   async updateJanitorWipeStatus(
