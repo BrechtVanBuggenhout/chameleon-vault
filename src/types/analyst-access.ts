@@ -26,4 +26,15 @@ export interface AnalystAccess {
   // credential is deliberately short-lived instead, re-minted per console
   // session rather than handed out standing.
   credential_expires_at?: Date;
+  // Absent means 'analyst' (every record before this field existed was one).
+  // 'service' records are for an external system triggering deletions via
+  // POST /admin/service-credentials -- same hashed-secret-in-Firestore
+  // mechanism, but allowlisted to a different, narrower set of routes (see
+  // middleware/auth.ts's isServiceCredentialAllowedPath) and durable like a
+  // claim-link credential (no session-style expiry). For a 'service'
+  // record, analyst_email holds the caller's identifying label (e.g.
+  // "partner:acme-crm") instead of a real email -- reused rather than
+  // renamed, since it's already the one field threaded everywhere as
+  // attribution (requested_by, lineage analystEmail, etc.).
+  kind?: 'analyst' | 'service';
 }

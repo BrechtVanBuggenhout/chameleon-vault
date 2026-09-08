@@ -19,6 +19,8 @@ describe('AnalystAccessService', () => {
       claimAndIssueCredential: jest.fn(),
       resolveCredential: jest.fn(),
       createSessionCredential: jest.fn().mockResolvedValue(undefined),
+      createServiceCredential: jest.fn().mockResolvedValue(undefined),
+      revokeServiceCredentialsFor: jest.fn().mockResolvedValue(0),
     } as any;
     service = new AnalystAccessService(mockRepo as unknown as AnalystAccessRepository);
   });
@@ -224,6 +226,65 @@ describe('AnalystAccessService', () => {
 
       const result = await service.resolveCredential('some-api-key');
       expect(result).toBeNull();
+    });
+
+    it('passes through kind for a service credential, so callers can gate on it', async () => {
+      mockRepo.resolveCredential.mockResolvedValue({
+        claim_token_hash: hash('some-api-key'),
+        credential_key_hash: hash('some-api-key'),
+        tenant_id: 'tenant-a',
+        analyst_email: 'partner:acme-crm',
+        created_at: new Date(),
+        expires_at: new Date('2099-01-01T00:00:00Z'),
+        claimed_at: new Date(),
+        source: 'console_session',
+        kind: 'service',
+      });
+
+      const result = await service.resolveCredential('some-api-key');
+      expect(result).toEqual({ tenantId: 'tenant-a', analystEmail: 'partner:acme-crm', role: 'analyst', kind: 'service' });
+    });
+
+    it('leaves kind undefined for a record predating the field (an ordinary analyst credential)', async () => {
+      mockRepo.resolveCredential.mockResolvedValue({
+        claim_token_hash: 'x',
+        credential_key_hash: hash('some-api-key'),
+        tenant_id: 'tenant-a',
+        analyst_email: 'analyst@example.com',
+        created_at: new Date(),
+        expires_at: new Date(),
+        claimed_at: new Date(),
+      });
+
+      const result = await service.resolveCredential('some-api-key');
+      expect(result!.kind).toBeUndefined();
+    });
+  });
+
+  describe('mintServiceCredential', () => {
+    it('generates a random durable credential, stores only its hash under the callerName, and returns the raw credential', async () => {
+      const { credential } = await service.mintServiceCredential('tenant-a', 'partner:acme-crm');
+
+      expect(typeof credential).toBe('string');
+      expect(credential.length).toBeGreaterThan(20);
+
+      expect(mockRepo.createServiceCredential).toHaveBeenCalledTimes(1);
+      const [tenantId, callerName, storedHash] = mockRepo.createServiceCredential.mock.calls[0];
+      expect(tenantId).toBe('tenant-a');
+      expect(callerName).toBe('partner:acme-crm');
+      expect(storedHash).toBe(hash(credential));
+      expect(storedHash).not.toBe(credential);
+    });
+  });
+
+  describe('revokeServiceCredentials', () => {
+    it('delegates to the repository and returns the revoked count', async () => {
+      mockRepo.revokeServiceCredentialsFor.mockResolvedValue(3);
+
+      const count = await service.revokeServiceCredentials('tenant-a', 'partner:acme-crm');
+
+      expect(count).toBe(3);
+      expect(mockRepo.revokeServiceCredentialsFor).toHaveBeenCalledWith('tenant-a', 'partner:acme-crm');
     });
   });
 

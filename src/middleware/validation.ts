@@ -197,6 +197,17 @@ export const mintSessionCredentialSchema = Joi.object({
   email: Joi.string().email().required(),
 }).required();
 
+// A free-text label, not an email -- an external system's own name for
+// itself (e.g. "partner:acme-crm"), not a person. Same length bound as an
+// analyst email for consistency, no format requirement beyond that.
+export const mintServiceCredentialSchema = Joi.object({
+  callerName: Joi.string().min(1).max(255).required(),
+}).required();
+
+export const revokeServiceCredentialSchema = Joi.object({
+  callerName: Joi.string().min(1).max(255).required(),
+}).required();
+
 export async function validateRequest(schema: Joi.ObjectSchema, payload: unknown): Promise<any> {
   const { error, value } = schema.validate(payload, {
     abortEarly: false,

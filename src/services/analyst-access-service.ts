@@ -41,6 +41,9 @@ export interface ResolvedAnalystIdentity {
   tenantId: string;
   analystEmail: string;
   role: 'analyst' | 'auditor';
+  // Absent (undefined) means 'analyst' -- see AnalystAccess.kind's own
+  // doc comment for why records predating this field are never 'service'.
+  kind?: 'analyst' | 'service';
 }
 
 export class AnalystAccessService {
@@ -96,7 +99,12 @@ export class AnalystAccessService {
     if (record.credential_expires_at && toMillis(record.credential_expires_at) < Date.now()) {
       return null;
     }
-    return { tenantId: record.tenant_id, analystEmail: record.analyst_email, role: record.role || 'analyst' };
+    return {
+      tenantId: record.tenant_id,
+      analystEmail: record.analyst_email,
+      role: record.role || 'analyst',
+      kind: record.kind,
+    };
   }
 
   /**
@@ -114,5 +122,33 @@ export class AnalystAccessService {
     await this.repo.createSessionCredential(tenantId, analystEmail, hash(credential), expiresAt);
     logger.info({ tenantId, analystEmail }, 'Minted console-session credential');
     return { credential, expiresAt };
+  }
+
+  /**
+   * Mints a durable credential for an external system to trigger deletions
+   * on its own behalf -- e.g. another platform that wants to call Chameleon
+   * directly when one of its own users asks to be forgotten, instead of
+   * going through the console. Admin-only (gated by the shared key at the
+   * route level, like every /admin/* route) -- no self-serve minting.
+   * callerName is a free-text label the admin chooses to identify the
+   * integration (e.g. "partner:acme-crm") -- it becomes this credential's
+   * attribution everywhere a request/certificate/lineage event records who
+   * acted (see AnalystAccess.kind's doc comment for why it's stored in the
+   * analyst_email field rather than a new one).
+   */
+  async mintServiceCredential(tenantId: string, callerName: string): Promise<{ credential: string }> {
+    const credential = generateSecret();
+    await this.repo.createServiceCredential(tenantId, callerName, hash(credential));
+    return { credential };
+  }
+
+  /**
+   * Revokes every standing credential issued for (tenantId, callerName) --
+   * not a single specific secret, since there's no credential-listing UI to
+   * pick one from and "cut off this integration" is the real admin intent.
+   * Returns how many were actually revoked.
+   */
+  async revokeServiceCredentials(tenantId: string, callerName: string): Promise<number> {
+    return this.repo.revokeServiceCredentialsFor(tenantId, callerName);
   }
 }

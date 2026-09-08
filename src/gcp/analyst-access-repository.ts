@@ -108,4 +108,56 @@ export class AnalystAccessRepository {
     }
     return snapshot.docs[0].data() as AnalystAccess;
   }
+
+  // Durable like a claim-link credential (no credential_expires_at) --
+  // an external system integration needs a standing credential it can use
+  // indefinitely until explicitly revoked, not a re-minted-per-session one.
+  // Keyed by the credential's own hash, same convention as
+  // createSessionCredential above.
+  async createServiceCredential(
+    tenantId: string,
+    callerName: string,
+    credentialKeyHash: string
+  ): Promise<void> {
+    const now = Timestamp.now().toDate();
+    const record: AnalystAccess = {
+      claim_token_hash: credentialKeyHash,
+      credential_key_hash: credentialKeyHash,
+      tenant_id: tenantId,
+      analyst_email: callerName,
+      created_at: now,
+      // No real expiry concept for a durable credential -- set far enough
+      // out that it's never the reason a check fails, matching how a
+      // claim-link-issued analyst credential's (irrelevant, post-claim)
+      // expires_at is already treated.
+      expires_at: new Date('2099-01-01T00:00:00Z'),
+      claimed_at: now,
+      source: 'console_session',
+      kind: 'service',
+    };
+    await this.collection.doc(credentialKeyHash).set(record);
+    logger.info({ tenantId, callerName }, 'Minted service credential');
+  }
+
+  /**
+   * Revokes every non-revoked 'service' credential matching (tenantId,
+   * callerName) -- the admin mental model is "acme-crm should no longer be
+   * able to trigger deletions for this tenant," not "revoke this one
+   * specific secret," and there's no credential-listing UI to pick a
+   * specific record by id from. Returns how many were actually revoked, so
+   * the caller can tell "revoked 2" from "found nothing matching."
+   */
+  async revokeServiceCredentialsFor(tenantId: string, callerName: string): Promise<number> {
+    const snapshot = await this.collection
+      .where('tenant_id', '==', tenantId)
+      .where('analyst_email', '==', callerName)
+      .where('kind', '==', 'service')
+      .get();
+
+    const now = Timestamp.now().toDate();
+    const toRevoke = snapshot.docs.filter((doc) => !(doc.data() as AnalystAccess).revoked_at);
+    await Promise.all(toRevoke.map((doc) => doc.ref.update({ revoked_at: now })));
+    logger.info({ tenantId, callerName, revokedCount: toRevoke.length }, 'Revoked service credentials');
+    return toRevoke.length;
+  }
 }

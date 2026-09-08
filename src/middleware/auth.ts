@@ -8,6 +8,12 @@ export interface AuthResult {
   // the shared VAULT_API_KEY, which is deliberately tenant-unscoped (used
   // internally by the console/pipelines across every tenant).
   tenantId?: string;
+  // 'service' when a service credential resolved, otherwise absent
+  // (including for the shared key and analyst credentials) -- routes that
+  // need to tell "the console/an analyst called this" from "an external
+  // system's own credential called this" (e.g. for a distinct attribution
+  // label) can check this without re-deriving it themselves.
+  credentialKind?: 'service';
 }
 
 // The claim-consumption route is the one place an anonymous caller (an
@@ -50,6 +56,49 @@ const AUDITOR_CREDENTIAL_ROUTE_PATTERN = /^\/audit\/key-status\/[^/]+$/;
 
 function isAuditorCredentialAllowedPath(path: string): boolean {
   return AUDITOR_CREDENTIAL_ROUTE_PATTERN.test(path);
+}
+
+// A service credential (external system, see analyst-access-service.ts's
+// mintServiceCredential) is deliberately a DIFFERENT, narrower allowlist
+// than an analyst's -- not a superset or subset of it. It can create,
+// check, and advance a deletion request through to a certificate, and read
+// that certificate back -- the full real state machine, safe to expose in
+// full now that KEY_DESTROYED can no longer jump straight to
+// CASCADE_COMPLETE/CERTIFICATE_ISSUED (see deletion-request-service.ts's
+// isValidTransition). It can never touch /encrypt, /decrypt, or the PII
+// registry -- an external system triggering deletions has no legitimate
+// reason to read or declare PII.
+const SERVICE_CREDENTIAL_EXACT_PATHS = new Set(['/deletion-requests']);
+
+// GET/POST /deletion-requests/:id and .../advance, and GET /certificate/:userId.
+const SERVICE_CREDENTIAL_RESOURCE_PATTERNS = [
+  /^\/deletion-requests\/[^/]+$/,
+  /^\/deletion-requests\/[^/]+\/advance$/,
+  /^\/certificate\/[^/]+$/,
+];
+
+function isServiceCredentialAllowedPath(path: string): boolean {
+  return (
+    SERVICE_CREDENTIAL_EXACT_PATHS.has(path) ||
+    SERVICE_CREDENTIAL_RESOURCE_PATTERNS.some((pattern) => pattern.test(path))
+  );
+}
+
+// Which allowlist applies is a property of the CREDENTIAL, never the route
+// alone -- an analyst credential must never be let through on an
+// auditor-only or service-only path just because it happens to match that
+// pattern, and vice versa. `role` and `kind` are independent dimensions on
+// the same AnalystAccess record (see its own doc comments): in practice a
+// given credential only ever moves one of the two away from its 'analyst'
+// default, but role='auditor' is checked first since an auditor credential
+// must never fall through to the (broader) service or analyst allowlists.
+function isAllowedForCredential(
+  identity: { role: 'analyst' | 'auditor'; kind?: 'analyst' | 'service' },
+  path: string
+): boolean {
+  if (identity.role === 'auditor') return isAuditorCredentialAllowedPath(path);
+  if (identity.kind === 'service') return isServiceCredentialAllowedPath(path);
+  return isAnalystCredentialAllowedPath(path);
 }
 
 // BigQuery's remote function has no way to present VAULT_API_KEY -- it
@@ -117,18 +166,23 @@ export async function resolveAuth(
   }
 
   // Cheap, synchronous pre-check before the Firestore read below -- if the
-  // path is on neither role's allowed list, no credential could possibly
+  // path is on none of the three allowlists, no credential could possibly
   // authorize it, so there's no reason to resolve one. Preserves the
   // original short-circuit behavior (and its test coverage) now that there
-  // are two roles to check instead of one.
-  if (providedKey && (isAnalystCredentialAllowedPath(path) || isAuditorCredentialAllowedPath(path))) {
+  // are three kinds to check instead of one.
+  if (
+    providedKey &&
+    (isAnalystCredentialAllowedPath(path) || isAuditorCredentialAllowedPath(path) || isServiceCredentialAllowedPath(path))
+  ) {
     const identity = await analystAccessService.resolveCredential(providedKey);
-    if (identity && identity.tenantId === requestTenantId) {
-      const allowed =
-        identity.role === 'auditor' ? isAuditorCredentialAllowedPath(path) : isAnalystCredentialAllowedPath(path);
-      if (allowed) {
-        return { authorized: true, analystEmail: identity.analystEmail, role: identity.role, tenantId: identity.tenantId };
-      }
+    if (identity && identity.tenantId === requestTenantId && isAllowedForCredential(identity, path)) {
+      return {
+        authorized: true,
+        analystEmail: identity.analystEmail,
+        role: identity.role,
+        tenantId: identity.tenantId,
+        ...(identity.kind === 'service' ? { credentialKind: 'service' as const } : {}),
+      };
     }
   }
 

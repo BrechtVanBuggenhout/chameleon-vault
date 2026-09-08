@@ -313,4 +313,145 @@ describe('resolveAuth', () => {
       expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com', tenantId: 'tenant-a' });
     });
   });
+
+  describe('service credentials (external-system deletion trigger, found 2026-08-24)', () => {
+    const serviceIdentity = { tenantId: 'tenant-a', analystEmail: 'partner:acme-crm', kind: 'service' as const };
+
+    it('accepts a service credential on POST /deletion-requests (create)', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue(serviceIdentity);
+      const result = await resolveAuth(
+        '/deletion-requests',
+        'service-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result).toEqual({
+        authorized: true,
+        analystEmail: 'partner:acme-crm',
+        tenantId: 'tenant-a',
+        credentialKind: 'service',
+      });
+    });
+
+    it('accepts a service credential on GET /deletion-requests/:id', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue(serviceIdentity);
+      const result = await resolveAuth(
+        '/deletion-requests/del-123',
+        'service-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result.authorized).toBe(true);
+    });
+
+    it('accepts a service credential on POST /deletion-requests/:id/advance', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue(serviceIdentity);
+      const result = await resolveAuth(
+        '/deletion-requests/del-123/advance',
+        'service-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result.authorized).toBe(true);
+    });
+
+    it('accepts a service credential on GET /certificate/:userId', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue(serviceIdentity);
+      const result = await resolveAuth(
+        '/certificate/user-123',
+        'service-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result.authorized).toBe(true);
+    });
+
+    it('rejects a service credential on /encrypt -- deletion-triggering only, no PII read access', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue(serviceIdentity);
+      const result = await resolveAuth(
+        '/encrypt',
+        'service-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result).toEqual({ authorized: false });
+    });
+
+    it('rejects a service credential on /decrypt', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue(serviceIdentity);
+      const result = await resolveAuth(
+        '/decrypt',
+        'service-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result).toEqual({ authorized: false });
+    });
+
+    it('rejects a service credential on POST /pii-registry/resources -- no reason for a deletion-trigger integration to declare PII', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue(serviceIdentity);
+      const result = await resolveAuth(
+        '/pii-registry/resources',
+        'service-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result).toEqual({ authorized: false });
+    });
+
+    it('rejects an ORDINARY analyst credential on GET /certificate/:userId -- service-only path, even though the route pattern would otherwise match', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+      const result = await resolveAuth(
+        '/certificate/user-123',
+        'analyst-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result).toEqual({ authorized: false });
+    });
+
+    it('rejects an ordinary analyst credential on POST /deletion-requests/:id/advance -- analysts can create but never advance', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+      const result = await resolveAuth(
+        '/deletion-requests/del-123/advance',
+        'analyst-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result).toEqual({ authorized: false });
+    });
+
+    it('still enforces tenant match for a service credential', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue(serviceIdentity);
+      const result = await resolveAuth(
+        '/deletion-requests',
+        'service-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-b'
+      );
+      expect(result).toEqual({ authorized: false });
+    });
+
+    it('does not attach credentialKind for an ordinary analyst credential', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+      const result = await resolveAuth(
+        '/deletion-requests',
+        'analyst-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result.credentialKind).toBeUndefined();
+    });
+  });
 });

@@ -55,6 +55,7 @@ import { syncRunsRoutes } from './routes/sync-runs.js';
 import { analystClaimsRoutes } from './routes/analyst-claims.js';
 import { auditorVerifyRoutes } from './routes/auditor-verify.js';
 import { adminSessionCredentialsRoutes } from './routes/admin-session-credentials.js';
+import { adminServiceCredentialsRoutes } from './routes/admin-service-credentials.js';
 import { auditRoutes } from './routes/audit.js';
 import { decryptedViewsRoutes } from './routes/decrypted-views.js';
 import { decryptedViewsDecryptRoutes } from './routes/decrypted-views-decrypt.js';
@@ -399,6 +400,7 @@ async function main() {
   await fastify.register(analystClaimsRoutes, { analystAccessService });
   await fastify.register(adminSessionCredentialsRoutes, { analystAccessService });
   await fastify.register(auditorVerifyRoutes, { firestoreRegistry });
+  await fastify.register(adminServiceCredentialsRoutes, { analystAccessService });
   await fastify.register(auditRoutes, { piiRegistryService, deletionRequestRepo });
   if (decryptedViewService && decryptedViewsRepo) {
     await fastify.register(decryptedViewsRoutes, {
