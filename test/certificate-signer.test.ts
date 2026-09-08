@@ -19,6 +19,7 @@ describe('CertificateSigner.generateClaims', () => {
     getKeyStatus: jest.Mock;
     getDeletionRequest: jest.Mock;
     getLatestCompletedDeletionRequestForUser: jest.Mock;
+    getManualRegistryEntriesForTenant: jest.Mock;
   };
   let mockKmsClient: { getCryptoKeyPath: jest.Mock; getNewestEnabledVersion: jest.Mock; getPublicKey: jest.Mock };
   let baseRequest: DeletionRequest;
@@ -38,6 +39,7 @@ describe('CertificateSigner.generateClaims', () => {
       getKeyStatus: jest.fn().mockResolvedValue({ status: 'SHREDDED', created_at: '2026-01-01T00:00:00Z', shredAt: '2026-08-16T20:39:06.717Z' }),
       getDeletionRequest: jest.fn(async () => ({ ...baseRequest })),
       getLatestCompletedDeletionRequestForUser: jest.fn(async () => ({ ...baseRequest })),
+      getManualRegistryEntriesForTenant: jest.fn().mockResolvedValue([]),
     };
     mockKmsClient = {
       getCryptoKeyPath: jest.fn().mockReturnValue('projects/p/locations/l/keyRings/r/cryptoKeys/k'),
@@ -214,6 +216,181 @@ describe('CertificateSigner.generateClaims', () => {
     expect(claims.ghost_data_summary).toEqual(ghostDataSummary);
     expect(claims.lineageCoverage.knownDestinationTypes).toEqual(['hubspot', 'salesforce', 'custom-connector']);
     expect(claims.ghostDataScanCoverage).toBe('NOT_TRACKED');
+  });
+
+  describe('backupImmunity', () => {
+    const HOUR_MS = 60 * 60 * 1000;
+
+    it('REDACT_IN_PLACE within the 168h time-travel window is not yet backup-immune, with a correct immuneAsOf', async () => {
+      const redactedAt = new Date(Date.now() - 10 * HOUR_MS);
+      baseRequest.janitor_wipes = [
+        {
+          destination: 'bigquery:acme.crm.contacts::REDACT_IN_PLACE',
+          status: 'SUCCEEDED',
+          updated_at: redactedAt,
+          details: { rowsAffected: 3 },
+        },
+      ];
+
+      const claims = await signer.generateClaims({
+        userId: 'user-1', tenantId: 'default-tenant', deletionRequestId: 'del-1',
+        ghostDataSummary: [], knownDestinationTypes: [],
+      });
+
+      expect(claims.backupImmunity.cryptoShredCoverage).toBe('BACKUP_IMMUNE');
+      expect(claims.backupImmunity.sourceRedactionExceptions).toEqual([
+        expect.objectContaining({
+          resourceId: 'bigquery:acme.crm.contacts',
+          strategy: 'REDACT_IN_PLACE',
+          backupImmune: false,
+          redactedAt: redactedAt.toISOString(),
+          immuneAsOf: new Date(redactedAt.getTime() + 168 * HOUR_MS).toISOString(),
+        }),
+      ]);
+    });
+
+    it('REDACT_IN_PLACE past the 168h window is backup-immune, with no immuneAsOf key at all', async () => {
+      const redactedAt = new Date(Date.now() - 200 * HOUR_MS);
+      baseRequest.janitor_wipes = [
+        {
+          destination: 'bigquery:acme.crm.contacts::REDACT_IN_PLACE',
+          status: 'SUCCEEDED',
+          updated_at: redactedAt,
+          details: { rowsAffected: 3 },
+        },
+      ];
+
+      const claims = await signer.generateClaims({
+        userId: 'user-1', tenantId: 'default-tenant', deletionRequestId: 'del-1',
+        ghostDataSummary: [], knownDestinationTypes: [],
+      });
+
+      expect(claims.backupImmunity.sourceRedactionExceptions).toHaveLength(1);
+      const item = claims.backupImmunity.sourceRedactionExceptions[0];
+      expect(item.backupImmune).toBe(true);
+      expect(item).not.toHaveProperty('immuneAsOf');
+    });
+
+    it('a REDACT_IN_PLACE wipe with rowsAffected: 0 produces no backup-immunity item at all -- there was never plaintext there for time-travel to surface', async () => {
+      baseRequest.janitor_wipes = [
+        {
+          destination: 'bigquery:acme.crm.contacts::REDACT_IN_PLACE',
+          status: 'SUCCEEDED',
+          updated_at: new Date(),
+          details: { rowsAffected: 0 },
+        },
+      ];
+
+      const claims = await signer.generateClaims({
+        userId: 'user-1', tenantId: 'default-tenant', deletionRequestId: 'del-1',
+        ghostDataSummary: [], knownDestinationTypes: [],
+      });
+
+      expect(claims.backupImmunity.sourceRedactionExceptions).toEqual([]);
+    });
+
+    it('ENCRYPTED_COPY is backup-immune regardless of how recently it ran', async () => {
+      baseRequest.janitor_wipes = [
+        {
+          destination: 'bigquery:acme.crm.contacts::ENCRYPTED_COPY',
+          status: 'SUCCEEDED',
+          updated_at: new Date(),
+          details: { rowsAffected: 1 },
+        },
+      ];
+
+      const claims = await signer.generateClaims({
+        userId: 'user-1', tenantId: 'default-tenant', deletionRequestId: 'del-1',
+        ghostDataSummary: [], knownDestinationTypes: [],
+      });
+
+      expect(claims.backupImmunity.sourceRedactionExceptions).toEqual([
+        expect.objectContaining({
+          resourceId: 'bigquery:acme.crm.contacts',
+          strategy: 'ENCRYPTED_COPY',
+          backupImmune: true,
+        }),
+      ]);
+    });
+
+    it('a declared SHADOW_COPY resource is never backup-immune, even with no janitor_wipes entry at all', async () => {
+      mockFirestoreClient.getManualRegistryEntriesForTenant.mockResolvedValue([
+        { resourceId: 'bigquery:acme.crm.notes', sourceRedactionStrategies: ['SHADOW_COPY'] },
+      ]);
+      baseRequest.janitor_wipes = [];
+
+      const claims = await signer.generateClaims({
+        userId: 'user-1', tenantId: 'default-tenant', deletionRequestId: 'del-1',
+        ghostDataSummary: [], knownDestinationTypes: [],
+      });
+
+      expect(claims.backupImmunity.sourceRedactionExceptions).toEqual([
+        expect.objectContaining({
+          resourceId: 'bigquery:acme.crm.notes',
+          strategy: 'SHADOW_COPY',
+          backupImmune: false,
+        }),
+      ]);
+      const item = claims.backupImmunity.sourceRedactionExceptions[0];
+      expect(item).not.toHaveProperty('redactedAt');
+      expect(item).not.toHaveProperty('immuneAsOf');
+    });
+
+    it('pure crypto-shred with no manual resources declared: empty exceptions, but cryptoShredCoverage still present', async () => {
+      baseRequest.janitor_wipes = [
+        { destination: 'hubspot', status: 'SUCCEEDED', updated_at: new Date(), details: {} },
+      ];
+
+      const claims = await signer.generateClaims({
+        userId: 'user-1', tenantId: 'default-tenant', deletionRequestId: 'del-1',
+        ghostDataSummary: [], knownDestinationTypes: ['hubspot'],
+      });
+
+      expect(claims.backupImmunity).toEqual(
+        expect.objectContaining({
+          cryptoShredCoverage: 'BACKUP_IMMUNE',
+          sourceRedactionExceptions: [],
+          timeTravelCeilingHours: 168,
+        }),
+      );
+    });
+
+    it('one resourceId with both REDACT_IN_PLACE and SHADOW_COPY declared produces two distinct items, not clobbered', async () => {
+      const redactedAt = new Date(Date.now() - 200 * HOUR_MS);
+      baseRequest.janitor_wipes = [
+        {
+          destination: 'bigquery:acme.crm.contacts::REDACT_IN_PLACE',
+          status: 'SUCCEEDED',
+          updated_at: redactedAt,
+          details: { rowsAffected: 2 },
+        },
+      ];
+      mockFirestoreClient.getManualRegistryEntriesForTenant.mockResolvedValue([
+        { resourceId: 'bigquery:acme.crm.contacts', sourceRedactionStrategies: ['REDACT_IN_PLACE', 'SHADOW_COPY'] },
+      ]);
+
+      const claims = await signer.generateClaims({
+        userId: 'user-1', tenantId: 'default-tenant', deletionRequestId: 'del-1',
+        ghostDataSummary: [], knownDestinationTypes: [],
+      });
+
+      expect(claims.backupImmunity.sourceRedactionExceptions).toHaveLength(2);
+      expect(claims.backupImmunity.sourceRedactionExceptions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ resourceId: 'bigquery:acme.crm.contacts', strategy: 'REDACT_IN_PLACE', backupImmune: true }),
+          expect.objectContaining({ resourceId: 'bigquery:acme.crm.contacts', strategy: 'SHADOW_COPY', backupImmune: false }),
+        ]),
+      );
+    });
+
+    it('reads the manual registry scoped to the deletion request\'s real tenantId, not a hardcoded default', async () => {
+      await signer.generateClaims({
+        userId: 'user-1', tenantId: 'acme-tenant', deletionRequestId: 'del-1',
+        ghostDataSummary: [], knownDestinationTypes: [],
+      });
+
+      expect(mockFirestoreClient.getManualRegistryEntriesForTenant).toHaveBeenCalledWith('acme-tenant');
+    });
   });
 });
 

@@ -25,6 +25,58 @@ export interface CertificateLineageCoverage {
   knownDestinationTypes: string[];
 }
 
+export interface CertificateBackupImmunityItem {
+  resourceId: string;
+  // 'NONE' is deliberately excluded -- a resource with no source-redaction
+  // strategy declared never produces an item here at all (see
+  // CertificateBackupImmunityCoverage.sourceRedactionExceptions).
+  strategy: 'REDACT_IN_PLACE' | 'SHADOW_COPY' | 'ENCRYPTED_COPY';
+  // Whether backups of the CUSTOMER'S OWN source table are immune to
+  // recovering this user's data as of `iat` -- not a claim about Chameleon's
+  // own pii_vault, which is covered unconditionally by cryptoShredCoverage
+  // below regardless of what's in this array.
+  backupImmune: boolean;
+  // When the janitor cascade's redaction/deletion actually ran for this user.
+  // Present only for REDACT_IN_PLACE/ENCRYPTED_COPY; absent for SHADOW_COPY,
+  // which never runs a per-deletion step at all -- there is no "when" to
+  // record, only a standing, declare-time fact.
+  redactedAt?: string;
+  // Present only when backupImmune is false and a future date would make it
+  // true (REDACT_IN_PLACE, once BigQuery's time-travel window elapses).
+  // Absent for SHADOW_COPY -- no amount of waiting makes that one true.
+  immuneAsOf?: string;
+  reason: string;
+}
+
+export interface CertificateBackupImmunityCoverage {
+  // Always true: pii_vault and every janitor SaaS destination only ever
+  // stored ciphertext, so DEK erasure makes every backup snapshot of them
+  // unreadable regardless of the snapshot's age -- not conditioned on any
+  // time window. Distinct from the per-resource exceptions below, which are
+  // about a customer's own pre-existing source table, not Chameleon's vault.
+  cryptoShredCoverage: 'BACKUP_IMMUNE';
+  // Per-(resourceId, strategy) qualifications -- only for manually-declared
+  // resources that opted into a source-redaction strategy. Empty when the
+  // tenant has none declared, in which case cryptoShredCoverage above is the
+  // complete, unconditional picture.
+  sourceRedactionExceptions: CertificateBackupImmunityItem[];
+  // BigQuery's platform-wide MAXIMUM time-travel window (confirmed: the
+  // valid range is 48-168 hours, 168 being the ceiling, not just a common
+  // default) -- restated here, like lineageCoverage.knownDestinationTypes,
+  // so the claim is self-contained. Used as a conservative ceiling because
+  // Chameleon cannot introspect or pin a customer's actual per-dataset
+  // config on a BYOC project; 7 days is safe regardless of what that
+  // customer's real setting is.
+  timeTravelCeilingHours: 168;
+  // BigQuery also retains an additional Google-support-assisted "fail-safe"
+  // window after time-travel expires, reachable only via Google's own
+  // recovery tooling, never a customer/self-service query. Stated once, here,
+  // so backupImmune: true is never misread as "provably unrecoverable by
+  // anyone," only as "no longer retrievable through the customer's own
+  // BigQuery access."
+  timeTravelCaveat: string;
+}
+
 export interface CertificateGhostDataItem {
   scope: 'USER_LINKED' | 'RESOURCE_LEVEL';
   resourceId: string;
@@ -49,6 +101,7 @@ export interface DestructionCertificateClaims {
   keyFingerprint: string;// Hash of destroyed key metadata
   lineageSummary: CertificateLineageItem[];
   lineageCoverage: CertificateLineageCoverage;
+  backupImmunity: CertificateBackupImmunityCoverage;
   ghostDataSummary?: CertificateGhostDataItem[];
   ghost_data_summary?: CertificateGhostDataItem[];
   // Ghost-data findings above are real when present, but an empty array is

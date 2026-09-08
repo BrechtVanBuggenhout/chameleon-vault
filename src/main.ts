@@ -90,6 +90,11 @@ async function main() {
   const firestoreCollection = getRequiredEnv('FIRESTORE_COLLECTION');
   const firestoreDeletionRequestCollection = getRequiredEnv('FIRESTORE_DELETION_REQUEST_COLLECTION');
   const firestoreDatabaseId = process.env.FIRESTORE_DATABASE_ID; // Optional
+  // Read here (not down where FirestorePiiDeclarationRepository is built) so
+  // CertificateSignerFirestoreClient below and the declare API further down
+  // can never disagree about which collection is real -- one env read, one
+  // variable, two consumers.
+  const declarationCollection = process.env.FIRESTORE_PII_DECLARATION_COLLECTION || 'pii_registry_declarations';
   const dlqTopic = process.env.JANITOR_DLQ_TOPIC_ID || `janitor-dead-letter-queue-${process.env.NODE_ENV === 'production' ? 'prod' : 'dev'}`;
   const auditBucket = getRequiredEnv('GCP_AUDIT_BUCKET_NAME');
 
@@ -154,6 +159,7 @@ async function main() {
     projectId,
     firestoreCollection,
     firestoreDeletionRequestCollection,
+    declarationCollection,
     firestoreDatabaseId
   );
   const certificateSignerKmsClient = new CloudKMSClient(projectId, kmsRegion, signingKmsKeyRing, signingKmsKeyName);
@@ -241,7 +247,6 @@ async function main() {
     logger.info('PII_REGISTRY_SNOWFLAKE_ACCOUNT not set; Snowflake dbt registry slice disabled');
   }
 
-  const declarationCollection = process.env.FIRESTORE_PII_DECLARATION_COLLECTION || 'pii_registry_declarations';
   const auditDatasetId = process.env.PII_AUDIT_DATASET_ID; // e.g. 'compliance'; empty disables the mirror
   const auditMirror = auditDatasetId
     ? new BigQueryPiiRegistryAuditMirror(projectId, auditDatasetId, process.env.PII_AUDIT_TABLE_ID || 'pii_metadata_registry')

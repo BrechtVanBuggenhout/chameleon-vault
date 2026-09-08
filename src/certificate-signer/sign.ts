@@ -1,12 +1,45 @@
 import * as crypto from 'crypto';
 import { SigningKmsClient } from './kms-client.js';
 import { CertificateSignerFirestoreClient } from './firestore-client.js';
-import { CertificateLineageItem, DestructionCertificateClaims, KeyStatus } from '../types/index.js';
+import {
+  CertificateBackupImmunityItem,
+  CertificateLineageItem,
+  DestructionCertificateClaims,
+  KeyStatus,
+} from '../types/index.js';
 import { DeletionRequest } from '../types/deletion-request.js';
 import { GhostDataSummary } from '../types/lineage.js';
+import { hasSourceRedactionStrategy } from '../services/source-redaction-strategies.js';
 import { createLogger } from './logger.js';
 
 const logger = createLogger('certificate-signer');
+
+// BigQuery's max_time_travel_hours has a confirmed valid range of 48-168
+// hours -- 168 (7 days) is the platform-wide MAXIMUM, not just a common
+// default. Used as a conservative ceiling: Chameleon's own infra doesn't
+// manage a customer's own pre-existing source dataset (that's the
+// customer's own BigQuery asset, on a BYOC project Chameleon may not even
+// have introspection rights on), so this can't be looked up live per
+// customer -- but it doesn't need to be. No BigQuery dataset anywhere can
+// have a longer time-travel window than this, so "7 days since a
+// REDACT_IN_PLACE ran" is safe to claim regardless of what that specific
+// customer's actual setting is.
+const REDACT_IN_PLACE_TIME_TRAVEL_CEILING_HOURS = 168;
+const TIME_TRAVEL_CEILING_MS = REDACT_IN_PLACE_TIME_TRAVEL_CEILING_HOURS * 60 * 60 * 1000;
+
+const TIME_TRAVEL_CAVEAT =
+  "BigQuery also retains an additional Google-support-assisted \"fail-safe\" recovery window after this period ends, reachable only through Google's own recovery tooling, never a customer/self-service query. This claim covers self-service, customer-queryable recovery only.";
+
+// janitor_wipes destinations for a source-redaction resource are keyed as
+// "${resourceId}::STRATEGY" (see deletion-request-service.ts) -- "::" is a
+// safe, unambiguous separator since a resourceId itself only ever uses
+// single colons (e.g. "bigquery:project.dataset.table").
+function parseSourceRedactionDestination(
+  destination: string
+): { resourceId: string; strategy: 'REDACT_IN_PLACE' | 'ENCRYPTED_COPY' } | null {
+  const match = destination.match(/^(.+)::(REDACT_IN_PLACE|ENCRYPTED_COPY)$/);
+  return match ? { resourceId: match[1], strategy: match[2] as 'REDACT_IN_PLACE' | 'ENCRYPTED_COPY' } : null;
+}
 
 // Same duck-typing as the code this was extracted from -- Firestore's Node
 // SDK reads timestamp fields back as its own Timestamp class, not a native
@@ -101,6 +134,77 @@ export class CertificateSigner {
         timestamp: timestampToIso(wipe.updated_at),
       }));
 
+    // Per-resource backup-immunity exceptions. Chameleon's own pii_vault and
+    // every janitor SaaS destination are covered unconditionally (see
+    // cryptoShredCoverage below) -- this array is only about a customer's
+    // own pre-existing source table that opted into a source-redaction
+    // strategy, which is NOT uniformly backup-immune (see sign.ts's own
+    // module-level comments and the plan this implements).
+    const sourceRedactionExceptions: CertificateBackupImmunityItem[] = [];
+
+    // REDACT_IN_PLACE / ENCRYPTED_COPY: derived from the same SUCCEEDED
+    // janitor_wipes already iterated for lineageSummary above -- no new read.
+    // Zero-rows-affected wipes are skipped, same as lineageSummary's own
+    // CONFIRMED_ABSENT check: if this user never had a row in that table,
+    // there is no historical plaintext for time-travel to ever surface, so
+    // computing a future "immune as of" timestamp for it would misstate data
+    // that was never there.
+    for (const wipe of deletionRequest.janitor_wipes || []) {
+      if (wipe.status !== 'SUCCEEDED') continue;
+      if (wipe.details?.recordsFound === 0 || wipe.details?.rowsAffected === 0) continue;
+      const parsed = parseSourceRedactionDestination(wipe.destination);
+      if (!parsed) continue;
+
+      const redactedAt = timestampToIso(wipe.updated_at);
+      if (parsed.strategy === 'ENCRYPTED_COPY') {
+        sourceRedactionExceptions.push({
+          resourceId: parsed.resourceId,
+          strategy: 'ENCRYPTED_COPY',
+          backupImmune: true,
+          redactedAt,
+          reason:
+            'Only ciphertext was ever stored in this table -- unconditionally backup-immune once the key is shredded, same as pii_vault.',
+        });
+      } else {
+        const elapsedMs = Date.now() - new Date(redactedAt).getTime();
+        const backupImmune = elapsedMs >= TIME_TRAVEL_CEILING_MS;
+        sourceRedactionExceptions.push({
+          resourceId: parsed.resourceId,
+          strategy: 'REDACT_IN_PLACE',
+          backupImmune,
+          redactedAt,
+          ...(backupImmune
+            ? {}
+            : { immuneAsOf: new Date(new Date(redactedAt).getTime() + TIME_TRAVEL_CEILING_MS).toISOString() }),
+          reason: backupImmune
+            ? `This table's plaintext was redacted in place; BigQuery's maximum time-travel window (${REDACT_IN_PLACE_TIME_TRAVEL_CEILING_HOURS}h) has elapsed since then, so no pre-redaction plaintext remains queryable in a backup.`
+            : `This table's plaintext was redacted in place, but BigQuery's maximum time-travel window (${REDACT_IN_PLACE_TIME_TRAVEL_CEILING_HOURS}h) has not yet elapsed since then -- the pre-redaction plaintext may still be queryable via BigQuery's own time-travel until then.`,
+        });
+      }
+    }
+
+    // SHADOW_COPY: this strategy never touches the source table and never
+    // runs a per-deletion cascade step, so there is no janitor_wipes entry to
+    // read at all -- the only signal is the standing registry declaration
+    // itself. This is the one genuinely new read this feature needs, and
+    // it's deliberately independent (not caller-supplied) and left to throw
+    // on failure rather than silently defaulting to empty: a SHADOW_COPY
+    // declaration is load-bearing for the certificate's honesty exactly like
+    // keyStatus/deletionRequest above -- a swallowed failure here would let a
+    // certificate falsely claim full backup-immunity for a resource whose
+    // source table is permanently exposed.
+    const manualEntries = await this.firestoreClient.getManualRegistryEntriesForTenant(tenantId);
+    for (const entry of manualEntries) {
+      if (!hasSourceRedactionStrategy(entry, 'SHADOW_COPY')) continue;
+      sourceRedactionExceptions.push({
+        resourceId: entry.resourceId,
+        strategy: 'SHADOW_COPY',
+        backupImmune: false,
+        reason:
+          "This resource's source table was never modified -- only a live decrypted view was created alongside it. Backups of the source table are not covered by crypto-shred at any age.",
+      });
+    }
+
     const keyDestructionStatus = (keyStatus.status === 'SHREDDED' || keyStatus.status === 'DELETED') ? 'COMPLETE' : 'PENDING';
 
     // See assertCascadeComplete: reachable only once every attempted
@@ -124,6 +228,12 @@ export class CertificateSigner {
       shred_date: keyStatus.shredAt ?? new Date().toISOString(),
       keyFingerprint: await this.getKeyFingerprint(),
       lineageSummary,
+      backupImmunity: {
+        cryptoShredCoverage: 'BACKUP_IMMUNE',
+        sourceRedactionExceptions,
+        timeTravelCeilingHours: REDACT_IN_PLACE_TIME_TRAVEL_CEILING_HOURS,
+        timeTravelCaveat: TIME_TRAVEL_CAVEAT,
+      },
       lineageCoverage: {
         destinationsChecked,
         destinationsSucceeded,

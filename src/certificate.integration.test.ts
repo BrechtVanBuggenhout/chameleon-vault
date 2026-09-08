@@ -74,6 +74,12 @@ await jest.unstable_mockModule('../src/certificate-signer/firestore-client.js', 
       if (!entry) return null;
       return { deletion_request_id: `del_${userId}`, user_id: userId, ...entry };
     });
+    // No test in this file declares a manual SHADOW_COPY resource -- an
+    // empty result keeps every existing certificate-shape assertion here
+    // unaffected (backupImmunity.sourceRedactionExceptions stays [] unless a
+    // janitor_wipes entry itself carries a ::REDACT_IN_PLACE/::ENCRYPTED_COPY
+    // suffix, same as the real code path).
+    getManualRegistryEntriesForTenant = jest.fn(async () => []);
   }
 }));
 

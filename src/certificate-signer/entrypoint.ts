@@ -20,6 +20,11 @@ const signingKmsKeyName = getRequiredEnv('CLOUD_KMS_SIGNING_KEY_NAME');
 const firestoreCollection = getRequiredEnv('FIRESTORE_COLLECTION');
 const firestoreDeletionRequestCollection = getRequiredEnv('FIRESTORE_DELETION_REQUEST_COLLECTION');
 const firestoreDatabaseId = process.env.FIRESTORE_DATABASE_ID;
+// Same collection the monolith's declare API and main.ts's
+// CertificateSignerFirestoreClient wiring both use -- see main.ts's
+// comment on why this is read once, in one place, rather than risking two
+// deployments disagreeing about which collection is real.
+const declarationCollection = process.env.FIRESTORE_PII_DECLARATION_COLLECTION || 'pii_registry_declarations';
 const idTokenAudience = getRequiredEnv('ID_TOKEN_AUDIENCE');
 const allowedCallerEmail = getRequiredEnv('ALLOWED_CALLER_EMAIL');
 const port = Number(process.env.PORT ?? '8080');
@@ -28,6 +33,7 @@ const firestoreClient = new CertificateSignerFirestoreClient(
   projectId,
   firestoreCollection,
   firestoreDeletionRequestCollection,
+  declarationCollection,
   firestoreDatabaseId
 );
 const kmsClient = new LocalSigningKmsClient(projectId, kmsRegion, signingKmsKeyRing, signingKmsKeyName);

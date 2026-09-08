@@ -1,14 +1,17 @@
 import { Firestore } from '@google-cloud/firestore';
 import { KeyStatus } from '../types/index.js';
 import { DeletionRequest } from '../types/deletion-request.js';
+import type { PiiRegistryEntry } from '../types/pii-registry.js';
 
-// A deliberately minimal, read-only Firestore client -- exactly the two
-// reads the certificate-issuance decision needs (see sign.ts), nothing
-// else. Not a reuse of FirestoreRegistry/DeletionRequestRepository (which
-// carry write methods and other unrelated surface): the whole point of
-// this module is a small, independently-reviewable trust boundary, and
-// importing classes with a much larger surface than this actually needs
-// would work against that. See chameleon-paper/TEE_ATTESTATION_PLAN.md.
+// A deliberately minimal, read-only Firestore client -- exactly the reads
+// the certificate-issuance decision needs (see sign.ts), nothing else. Not
+// a reuse of FirestoreRegistry/DeletionRequestRepository/PiiRegistryService
+// (which carry write methods, other unrelated surface, or -- in
+// PiiRegistryService's case -- an in-memory cache that could be stale
+// relative to the moment a certificate is issued): the whole point of this
+// module is a small, independently-reviewable trust boundary, and importing
+// classes with a much larger surface (or staler data) than this actually
+// needs would work against that. See chameleon-paper/TEE_ATTESTATION_PLAN.md.
 export class CertificateSignerFirestoreClient {
   private db: Firestore;
 
@@ -16,6 +19,12 @@ export class CertificateSignerFirestoreClient {
     projectId: string,
     private readonly keyRegistryCollection: string,
     private readonly deletionRequestCollection: string,
+    // Required, not optional, and deliberately so: a SHADOW_COPY declaration
+    // is load-bearing for the certificate's honesty (see
+    // getManualRegistryEntriesForTenant below), so a caller that forgets to
+    // wire this up must fail to compile, not silently issue certificates
+    // that can never disclose a SHADOW_COPY exception.
+    private readonly piiRegistryDeclarationCollection: string,
     databaseId?: string
   ) {
     this.db = new Firestore({ projectId, ...(databaseId && { databaseId }) });
@@ -95,5 +104,23 @@ export class CertificateSignerFirestoreClient {
 
     if (snapshot.empty) return null;
     return snapshot.docs[0].data() as DeletionRequest;
+  }
+
+  /**
+   * Every manually-declared resource for a tenant, straight from Firestore --
+   * not PiiRegistryService's in-memory cache, which can be stale relative to
+   * the moment a certificate is issued. Used only to check for a SHADOW_COPY
+   * source-redaction strategy (see sign.ts's backupImmunity computation):
+   * SHADOW_COPY never produces a janitor_wipes entry, so there is no other
+   * signal that lets a certificate know one applies to this tenant's data at
+   * all. Tenant-scoped, not user-scoped -- SHADOW_COPY's exposure is a
+   * standing, declare-time fact about the resource, not a per-deletion event.
+   */
+  async getManualRegistryEntriesForTenant(tenantId: string): Promise<PiiRegistryEntry[]> {
+    const snapshot = await this.db
+      .collection(this.piiRegistryDeclarationCollection)
+      .where('tenantId', '==', tenantId)
+      .get();
+    return snapshot.docs.map((doc) => doc.data() as PiiRegistryEntry);
   }
 }
