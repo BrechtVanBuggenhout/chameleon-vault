@@ -108,7 +108,7 @@ export class DeletionRequestService {
         if (plan.shortcutToComplete) {
           logger.info({ userId: request.user_id }, 'No SaaS tasks or source redactions found, advancing to complete');
           // If no SaaS cleanup or source redaction is needed, move straight to COMPLETE
-          return this.advanceRequest(deletionRequestId, 'CASCADE_COMPLETE', operationId);
+          return this.shortcutToCascadeComplete(deletionRequestId, operationId);
         }
         if (plan.planFailed) {
           // Building the cleanup plan itself threw (e.g. createCleanupPlan /
@@ -159,7 +159,7 @@ export class DeletionRequestService {
         const plan = await this.prepareCascadeTrigger(deletionRequestId, request, tenantId, operationId);
         if (plan.shortcutToComplete) {
           logger.info({ userId: request.user_id }, 'Cascade retry found nothing left to wipe, advancing to complete');
-          return this.advanceRequest(deletionRequestId, 'CASCADE_COMPLETE', operationId);
+          return this.shortcutToCascadeComplete(deletionRequestId, operationId);
         }
         if (plan.planFailed) {
           // Unlike the CASCADE_PENDING case above, there's no valid
@@ -373,6 +373,44 @@ export class DeletionRequestService {
     return { shortcutToComplete: false, planFailed: false, afterStatusPersisted, taskDestinations: tasks.map(t => t.destination) };
   }
 
+  /**
+   * The ONLY legitimate way to reach CASCADE_COMPLETE without going through
+   * CASCADE_PENDING/CASCADE_IN_PROGRESS's normal post-cascade path -- used
+   * exclusively by prepareCascadeTrigger's own two shortcut call sites,
+   * immediately after it has itself just confirmed (via a real
+   * createCleanupPlan/planRedaction/planEncryptedCopyDeletion check) that
+   * there is nothing to clean up for this user. Deliberately bypasses
+   * isValidTransition's public table, which does NOT allow KEY_DESTROYED or
+   * CASCADE_PARTIAL_FAILURE to jump straight to CASCADE_COMPLETE for an
+   * externally-driven /advance call.
+   *
+   * That gap was real and exploitable, not hypothetical: any caller with
+   * access to POST /deletion-requests/:id/advance (today, just the shared
+   * VAULT_API_KEY) could call newStatus=CASCADE_COMPLETE or
+   * newStatus=CERTIFICATE_ISSUED directly from KEY_DESTROYED and receive a
+   * real, signed Certificate of Destruction WITHOUT the janitor/source-
+   * redaction cascade ever having run -- for a user who might still have
+   * live data in HubSpot, Salesforce, or a REDACT_IN_PLACE-declared source
+   * table. Found 2026-08-24 while scoping external-system deletion access;
+   * unrelated to that feature and exploitable today via existing
+   * credentials. Closed by removing those two entries from
+   * KEY_DESTROYED's row in isValidTransition and routing the one
+   * legitimate internal use through this method instead.
+   *
+   * Bonus fix, found the same way: before this, the CASCADE_IN_PROGRESS
+   * retry's identical shortcut (line above) would have thrown
+   * "Invalid state transition from CASCADE_PARTIAL_FAILURE to
+   * CASCADE_COMPLETE" the moment a retry found nothing left to wipe --
+   * CASCADE_PARTIAL_FAILURE -> CASCADE_COMPLETE was never in the public
+   * table at all. Untested (no existing test drove a retry into an empty
+   * plan), so this was silently broken. This method fixes that too, for
+   * free, since it never consults the FROM status.
+   */
+  private async shortcutToCascadeComplete(deletionRequestId: string, operationId: string): Promise<DeletionRequest> {
+    await this.deletionRequestRepo.updateDeletionRequestStatus(deletionRequestId, 'CASCADE_COMPLETE', {});
+    return this.advanceRequest(deletionRequestId, 'CERTIFICATE_ISSUED', operationId);
+  }
+
   async updateJanitorWipeStatus(
     deletionRequestId: string,
     destination: string,
@@ -388,11 +426,21 @@ export class DeletionRequestService {
   }
 
   private isValidTransition(currentStatus: DeletionRequestStatus, newStatus: DeletionRequestStatus): boolean {
-    // Note: Shortcuts (e.g., KEY_DESTROYED -> CASCADE_COMPLETE) are allowed 
-    // when no downstream SaaS tasks are found.
+    // This table governs every EXTERNALLY-DRIVEN /advance call (and the
+    // normal post-cascade CASCADE_PENDING/CASCADE_IN_PROGRESS -> COMPLETE
+    // transition, once a real cascade genuinely ran). It deliberately does
+    // NOT allow KEY_DESTROYED -> CASCADE_COMPLETE/CERTIFICATE_ISSUED --
+    // those direct jumps used to be listed here as a "shortcut for users
+    // without SaaS lineage," but they let ANY caller mint a real signed
+    // certificate without the cascade ever running or being checked at
+    // all. The equivalent, actually-verified shortcut (confirm nothing
+    // needs cleaning up, THEN complete) already exists and is the only way
+    // to reach it now: shortcutToCascadeComplete(), called exclusively
+    // from inside prepareCascadeTrigger's own two callers, immediately
+    // after that real check. See shortcutToCascadeComplete's docstring.
     const transitions: Record<DeletionRequestStatus, DeletionRequestStatus[]> = {
       'SHRED_REQUESTED': ['KEY_DESTROYED', 'CASCADE_PARTIAL_FAILURE'],
-      'KEY_DESTROYED': ['CASCADE_PENDING', 'CASCADE_COMPLETE', 'CERTIFICATE_ISSUED', 'CASCADE_PARTIAL_FAILURE'],
+      'KEY_DESTROYED': ['CASCADE_PENDING', 'CASCADE_PARTIAL_FAILURE'],
       'CASCADE_PENDING': ['CASCADE_IN_PROGRESS', 'CASCADE_COMPLETE', 'CASCADE_PARTIAL_FAILURE'],
       'CASCADE_IN_PROGRESS': ['CASCADE_COMPLETE', 'CASCADE_PARTIAL_FAILURE'],
       'CASCADE_PARTIAL_FAILURE': ['CASCADE_IN_PROGRESS', 'SHRED_REQUESTED'],

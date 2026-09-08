@@ -88,8 +88,18 @@ describe('DeletionRequestService - State Transition Matrix', () => {
   it('should disallow invalid transitions', () => {
     // Skipping states
     expect(callIsValidTransition('SHRED_REQUESTED', 'CASCADE_PENDING')).toBe(false);
-    // Update: KEY_DESTROYED -> CERTIFICATE_ISSUED is now allowed for users without SaaS lineage
-    expect(callIsValidTransition('KEY_DESTROYED', 'CERTIFICATE_ISSUED')).toBe(true);
+    // Real, exploitable gap (found 2026-08-24): these two used to be listed
+    // as valid here, as a "shortcut for users without SaaS lineage" -- but
+    // that let ANY caller with /advance access mint a real signed
+    // Certificate of Destruction without the janitor/source-redaction
+    // cascade ever running or being checked. The legitimate version of
+    // this shortcut (verify nothing needs cleaning up, THEN complete)
+    // still exists -- see shortcutToCascadeComplete, exercised by the
+    // "is a no-op when sourceRedactionService is not provided at all"
+    // test below -- it just deliberately bypasses this public table
+    // rather than being reachable through it.
+    expect(callIsValidTransition('KEY_DESTROYED', 'CERTIFICATE_ISSUED')).toBe(false);
+    expect(callIsValidTransition('KEY_DESTROYED', 'CASCADE_COMPLETE')).toBe(false);
 
     // Going backwards (except for retry from CASCADE_PARTIAL_FAILURE)
     expect(callIsValidTransition('CASCADE_COMPLETE', 'SHRED_REQUESTED')).toBe(false);
@@ -248,6 +258,25 @@ describe('DeletionRequestService - cascade outcome gates certificate issuance', 
       await new Promise(resolve => setImmediate(resolve));
     }
   }
+
+  it('rejects a direct caller-requested jump from KEY_DESTROYED straight to CERTIFICATE_ISSUED', async () => {
+    // Real, exploitable gap found 2026-08-24: this used to be a valid
+    // transition, letting any caller with /advance access mint a real
+    // signed certificate without the janitor/source-redaction cascade
+    // ever running -- for a user who might still have live data in
+    // HubSpot, Salesforce, or a REDACT_IN_PLACE-declared source table.
+    await expect(service.advanceRequest('del-1', 'CERTIFICATE_ISSUED', 'op-1')).rejects.toThrow(
+      'Invalid state transition from KEY_DESTROYED to CERTIFICATE_ISSUED'
+    );
+    expect(mockCertificateService.issueAndStoreCertificate).not.toHaveBeenCalled();
+  });
+
+  it('rejects a direct caller-requested jump from KEY_DESTROYED straight to CASCADE_COMPLETE', async () => {
+    await expect(service.advanceRequest('del-1', 'CASCADE_COMPLETE', 'op-1')).rejects.toThrow(
+      'Invalid state transition from KEY_DESTROYED to CASCADE_COMPLETE'
+    );
+    expect(mockCertificateService.issueAndStoreCertificate).not.toHaveBeenCalled();
+  });
 
   it('withholds the certificate and lands on CASCADE_PARTIAL_FAILURE when a SaaS wipe fails', async () => {
     mockJanitorService.processCleanup.mockResolvedValue([
@@ -421,6 +450,24 @@ describe('DeletionRequestService - CASCADE_IN_PROGRESS retries a stuck CASCADE_P
     expect(mockDeletionRequestRepo.updateJanitorWipeStatus).toHaveBeenCalledWith(
       'del-1', 'salesforce', 'SUCCEEDED', { attempts: 2, recordsFound: undefined }
     );
+    expect(currentRequest.status).toBe('CERTIFICATE_ISSUED');
+    expect(mockCertificateService.issueAndStoreCertificate).toHaveBeenCalledWith('user-1', 'del-1', 'default-tenant');
+  });
+
+  it('reaches CERTIFICATE_ISSUED when a retry finds nothing left to wipe at all', async () => {
+    // Real, previously-broken path (found 2026-08-24, untested until now):
+    // an empty plan on retry means prepareCascadeTrigger's shortcut fires
+    // while the persisted status is still CASCADE_PARTIAL_FAILURE (this
+    // branch returns before ever writing CASCADE_IN_PROGRESS). Before
+    // shortcutToCascadeComplete existed, this recursed into
+    // advanceRequest(..., 'CASCADE_COMPLETE', ...), which checked
+    // isValidTransition('CASCADE_PARTIAL_FAILURE', 'CASCADE_COMPLETE') --
+    // never a valid entry in the public table -- and would have thrown.
+    mockJanitorService.createCleanupPlan.mockResolvedValue([]);
+
+    await service.advanceRequest('del-1', 'CASCADE_IN_PROGRESS', 'op-2');
+    await flushMicrotasks();
+
     expect(currentRequest.status).toBe('CERTIFICATE_ISSUED');
     expect(mockCertificateService.issueAndStoreCertificate).toHaveBeenCalledWith('user-1', 'del-1', 'default-tenant');
   });
