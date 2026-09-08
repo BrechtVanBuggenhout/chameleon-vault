@@ -102,6 +102,31 @@ export class DeletionRequestRepository {
   }
 
   /**
+   * The most recently issued certificate across an entire tenant, not one
+   * specific user -- used by the console's "show me the latest one" default
+   * /proof view (see CertificateService.getLatestCertificateForTenant),
+   * which previously just probed 5 hardcoded demo user IDs and showed
+   * whichever one it found first, so a real customer with real certificates
+   * saw "no certificates yet" regardless of their real history. Ordered by
+   * certificate_issued_at (not created_at) since that's the field the claim
+   * is actually about; a request can be created well before its cascade and
+   * certificate complete.
+   */
+  async getMostRecentCertificateIssuedForTenant(tenantId: string = 'default-tenant'): Promise<DeletionRequest | null> {
+    const snapshot = await this.collection
+      .where('tenant_id', '==', tenantId)
+      .where('status', '==', 'CERTIFICATE_ISSUED')
+      .orderBy('certificate_issued_at', 'desc')
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return null;
+    }
+    return snapshot.docs[0].data() as DeletionRequest;
+  }
+
+  /**
    * The latest deletion request for a user that actually reached a real
    * cascade outcome -- used to gate certificate issuance on real
    * janitor_wipes results instead of freely regenerating claims from

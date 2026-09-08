@@ -47,6 +47,41 @@ export async function certificateRoutes(
   });
 
   /**
+   * GET /certificate/latest
+   * The most recently issued certificate across the whole tenant -- backs
+   * the console's default /proof view (no user ID given yet). Safe to share
+   * the /certificate prefix with /certificate/:userId above: Fastify's
+   * router (find-my-way) is a radix tree that always prefers a matching
+   * static segment over a parametric one at the same level, regardless of
+   * registration order -- unlike Express, "latest" can never be captured
+   * as :userId here.
+   */
+  fastify.get('/certificate/latest', async (request, reply) => {
+    const tenantId = (request.headers['x-tenant-id'] as string) || 'default-tenant';
+
+    try {
+      const result = await certificateService.getLatestCertificateForTenant(tenantId);
+      if (!result) {
+        return reply.status(404).send({
+          statusCode: 404,
+          error: 'No certificates found',
+          message: `No certificate has been issued yet for tenant ${tenantId}.`
+        });
+      }
+
+      return {
+        certificate: result.certificate,
+        tenantId,
+        userId: result.userId,
+        timestamp: new Date().toISOString()
+      };
+    } catch (error: unknown) {
+      logger.error({ error, tenantId }, 'Failed to look up the latest certificate for tenant');
+      throw error;
+    }
+  });
+
+  /**
    * GET /certificate-chain/by-hash/:hash
    * Returns the certificate whose own hash matches :hash -- lets a verifier
    * (see scripts/verify-cert.ts) walk previousCertificateHash backward

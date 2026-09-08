@@ -205,6 +205,22 @@ export class CertificateService {
   }
 
   /**
+   * The most recently issued certificate across a whole tenant, for the
+   * console's "show me the latest one" default /proof view -- see
+   * DeletionRequestRepository.getMostRecentCertificateIssuedForTenant for
+   * why this replaced a 5-hardcoded-demo-ID probe. Finds the user, then
+   * delegates to getCertificateForUser above rather than duplicating GCS
+   * retrieval here -- same trusted path a direct-by-ID lookup already uses.
+   */
+  async getLatestCertificateForTenant(tenantId: string = 'default-tenant'): Promise<{ certificate: string; userId: string } | null> {
+    const deletionRequest = await this.deletionRequestRepo.getMostRecentCertificateIssuedForTenant(tenantId);
+    if (!deletionRequest) return null;
+
+    const { certificate } = await this.getCertificateForUser(deletionRequest.user_id, tenantId);
+    return { certificate, userId: deletionRequest.user_id };
+  }
+
+  /**
    * Looks up a previously-issued certificate by its own hash -- the backing
    * lookup for chain-continuity verification (walking previousCertificateHash
    * backward through a tenant's chain, see scripts/verify-cert.ts). Public by
