@@ -1338,6 +1338,33 @@ describe('Crypto API Integration Tests', () => {
 
       expect(response.statusCode).toBe(404);
     });
+
+    it('should not advance a deletion request created under a different tenant (found 2026-08-24 -- this route had no tenant check at all before)', async () => {
+      await app.inject({
+        method: 'POST',
+        url: '/deletion-requests',
+        headers: { 'x-tenant-id': 'tenant-a' },
+        payload: { userId, operationId }
+      });
+
+      const advanceOpId = '00000000-0000-0000-0000-000000000003';
+      const response = await app.inject({
+        method: 'POST',
+        url: `/deletion-requests/${operationId}/advance`,
+        headers: { 'x-tenant-id': 'tenant-b' },
+        payload: { newStatus: 'KEY_DESTROYED', operationId: advanceOpId }
+      });
+
+      expect(response.statusCode).toBe(404);
+
+      // Confirm it genuinely never advanced -- read it back under its real tenant.
+      const statusResponse = await app.inject({
+        method: 'GET',
+        url: `/deletion-requests/${operationId}`,
+        headers: { 'x-tenant-id': 'tenant-a' }
+      });
+      expect(JSON.parse(statusResponse.body).status).toBe('SHRED_REQUESTED');
+    });
   });
 
 });

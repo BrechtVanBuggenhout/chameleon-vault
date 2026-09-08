@@ -59,12 +59,13 @@ describe('resolveAuth', () => {
     mockAnalystAccessService = { resolveCredential: jest.fn() };
   });
 
-  it('authorizes the shared key on any route, with no analyst identity attached', async () => {
+  it('authorizes the shared key on any route, with no analyst identity attached -- and regardless of the tenant header, since it is deliberately tenant-unscoped', async () => {
     const result = await resolveAuth(
       '/key/shred',
       SHARED_KEY,
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'some-other-tenant'
     );
     expect(result).toEqual({ authorized: true });
     expect(mockAnalystAccessService.resolveCredential).not.toHaveBeenCalled();
@@ -76,20 +77,22 @@ describe('resolveAuth', () => {
       '/encrypt',
       'some-random-key',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
     expect(result).toEqual({ authorized: false });
   });
 
-  it('accepts a valid analyst credential on /encrypt, attaching the analyst email', async () => {
+  it('accepts a valid analyst credential on /encrypt, attaching the analyst email and tenant', async () => {
     mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
     const result = await resolveAuth(
       '/encrypt',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
-    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com' });
+    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com', tenantId: 'tenant-a' });
   });
 
   it('accepts a valid analyst credential on /decrypt', async () => {
@@ -98,7 +101,8 @@ describe('resolveAuth', () => {
       '/decrypt',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
     expect(result.authorized).toBe(true);
   });
@@ -109,7 +113,8 @@ describe('resolveAuth', () => {
       '/key/shred',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
     // Route isn't in the allowed set, so resolveCredential must never even be
     // consulted -- an analyst key should not be able to rotate/shred keys.
@@ -123,7 +128,8 @@ describe('resolveAuth', () => {
       '/admin/analyst-claims',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
     expect(result).toEqual({ authorized: false });
   });
@@ -134,9 +140,10 @@ describe('resolveAuth', () => {
       '/pii-registry/resources',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
-    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com' });
+    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com', tenantId: 'tenant-a' });
   });
 
   it('accepts a valid credential on PUT/DELETE /pii-registry/resources/:resourceId', async () => {
@@ -145,9 +152,10 @@ describe('resolveAuth', () => {
       '/pii-registry/resources/bigquery%3Aproj.ds.table',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
-    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com' });
+    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com', tenantId: 'tenant-a' });
   });
 
   it('rejects a credential on the mark-synced sub-route -- machine-to-machine only, not an individual declare action', async () => {
@@ -156,7 +164,8 @@ describe('resolveAuth', () => {
       '/pii-registry/resources/some-resource/mark-synced',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
     expect(result).toEqual({ authorized: false });
     expect(mockAnalystAccessService.resolveCredential).not.toHaveBeenCalled();
@@ -168,7 +177,8 @@ describe('resolveAuth', () => {
       '/pii-registry/sync-now',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
     expect(result).toEqual({ authorized: false });
   });
@@ -179,9 +189,10 @@ describe('resolveAuth', () => {
       '/deletion-requests',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
-    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com' });
+    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com', tenantId: 'tenant-a' });
   });
 
   it('rejects a credential on /admin/session-credentials -- only the console (shared key) mints these, never an analyst credential', async () => {
@@ -190,7 +201,8 @@ describe('resolveAuth', () => {
       '/admin/session-credentials',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
     expect(result).toEqual({ authorized: false });
   });
@@ -205,9 +217,10 @@ describe('resolveAuth', () => {
       '/audit/key-status/user-123',
       'auditor-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
-    expect(result).toEqual({ authorized: true, analystEmail: 'auditor@example.com', role: 'auditor' });
+    expect(result).toEqual({ authorized: true, analystEmail: 'auditor@example.com', role: 'auditor', tenantId: 'tenant-a' });
   });
 
   it('rejects a valid auditor credential on /encrypt -- an auditor can check erasure status, nothing else', async () => {
@@ -220,7 +233,8 @@ describe('resolveAuth', () => {
       '/encrypt',
       'auditor-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
     expect(result).toEqual({ authorized: false });
   });
@@ -235,7 +249,8 @@ describe('resolveAuth', () => {
       '/audit/key-status/user-123',
       'analyst-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
     expect(result).toEqual({ authorized: false });
   });
@@ -250,9 +265,52 @@ describe('resolveAuth', () => {
       '/admin/analyst-claims',
       'auditor-key-value',
       SHARED_KEY,
-      mockAnalystAccessService as unknown as AnalystAccessService
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
     );
     expect(result).toEqual({ authorized: false });
     expect(mockAnalystAccessService.resolveCredential).not.toHaveBeenCalled();
+  });
+
+  describe('tenant enforcement (found 2026-08-24)', () => {
+    // Before this, a credential's own tenant_id was resolved but silently
+    // discarded -- nothing ever compared it against the request's
+    // x-tenant-id header, so a credential minted for one tenant could act
+    // on any other tenant just by changing the header.
+    it('rejects a valid, otherwise-allowed analyst credential when the request tenant does not match the credential\'s own tenant', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+      const result = await resolveAuth(
+        '/encrypt',
+        'analyst-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-b'
+      );
+      expect(result).toEqual({ authorized: false });
+    });
+
+    it('rejects on tenant mismatch even for the create-deletion-request route specifically', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+      const result = await resolveAuth(
+        '/deletion-requests',
+        'analyst-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-b'
+      );
+      expect(result).toEqual({ authorized: false });
+    });
+
+    it('accepts when the request tenant matches exactly (control case, not just "any mismatch rejected")', async () => {
+      mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+      const result = await resolveAuth(
+        '/encrypt',
+        'analyst-key-value',
+        SHARED_KEY,
+        mockAnalystAccessService as unknown as AnalystAccessService,
+        'tenant-a'
+      );
+      expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com', tenantId: 'tenant-a' });
+    });
   });
 });

@@ -117,13 +117,26 @@ export async function deletionRequestRoutes(fastify: FastifyInstance, options: D
     async (request, reply) => {
       const context = getRequestContext(request);
       context.operation = 'ADVANCE_DELETION_REQUEST';
+      const tenantId = (request.headers['x-tenant-id'] as string) || 'default-tenant';
 
       try {
         const { deletionRequestId } = await validateRequest(getDeletionRequestSchema, request.params);
         const body = await validateRequest(advanceDeletionRequestSchema, request.body);
-        
+
         const newStatus = body.newStatus || body.new_status;
         const opId = body.operationId || body.operation_id;
+
+        // Real gap, found 2026-08-24 alongside the credential-tenant-
+        // enforcement fix: this route had NO tenant check at all, unlike
+        // GET above -- any authorized caller could advance any tenant's
+        // deletion request just by knowing its id. Same 404-not-403
+        // convention as GET: don't reveal that a record exists under a
+        // different tenant to a caller that can't see it.
+        const existing = await deletionRequestService.getRequest(deletionRequestId);
+        if (!existing || (existing.tenant_id ?? 'default-tenant') !== tenantId) {
+          logger.warn({ correlationId: context.correlationId, deletionRequestId }, 'Deletion request not found');
+          return reply.status(404).send({ error: 'Deletion request not found', statusCode: 404 });
+        }
 
         const updatedRequest = await deletionRequestService.advanceRequest(deletionRequestId, newStatus, opId);
         logger.info({ correlationId: context.correlationId, deletionRequestId, newStatus: updatedRequest.status }, 'Advanced deletion request status');

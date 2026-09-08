@@ -4,6 +4,10 @@ export interface AuthResult {
   authorized: boolean;
   analystEmail?: string;
   role?: 'analyst' | 'auditor';
+  // Present only when an analyst/service credential resolved -- absent for
+  // the shared VAULT_API_KEY, which is deliberately tenant-unscoped (used
+  // internally by the console/pipelines across every tenant).
+  tenantId?: string;
 }
 
 // The claim-consumption route is the one place an anonymous caller (an
@@ -84,11 +88,29 @@ export function isExemptFromAuth(path: string): boolean {
   );
 }
 
+/**
+ * `requestTenantId` is the caller's `x-tenant-id` header (already defaulted
+ * to 'default-tenant' by the caller, same convention every tenant-scoped
+ * route already uses -- see routes/pii-registry.ts's tenantOf()).
+ *
+ * A credential's own `tenant_id` (real, non-optional on every AnalystAccess
+ * record -- see analyst-access-service.ts's resolveCredential) is compared
+ * against it here and rejected on mismatch. Before this, the credential's
+ * tenant was resolved but silently discarded -- a credential minted for
+ * tenant A could act on tenant B by simply changing the header, since
+ * nothing ever compared the two. Real gap, not hypothetical: this is the
+ * only enforcement point standing between "an analyst/service credential
+ * scoped to one customer" and "that credential reading or mutating a
+ * different customer's data" (found 2026-08-24, while scoping external-
+ * system deletion access -- that feature would have inherited this hole
+ * for every credential it mints, not just analyst ones).
+ */
 export async function resolveAuth(
   path: string,
   providedKey: string | undefined,
   sharedApiKey: string,
-  analystAccessService: AnalystAccessService
+  analystAccessService: AnalystAccessService,
+  requestTenantId: string
 ): Promise<AuthResult> {
   if (providedKey === sharedApiKey) {
     return { authorized: true };
@@ -101,11 +123,11 @@ export async function resolveAuth(
   // are two roles to check instead of one.
   if (providedKey && (isAnalystCredentialAllowedPath(path) || isAuditorCredentialAllowedPath(path))) {
     const identity = await analystAccessService.resolveCredential(providedKey);
-    if (identity) {
+    if (identity && identity.tenantId === requestTenantId) {
       const allowed =
         identity.role === 'auditor' ? isAuditorCredentialAllowedPath(path) : isAnalystCredentialAllowedPath(path);
       if (allowed) {
-        return { authorized: true, analystEmail: identity.analystEmail, role: identity.role };
+        return { authorized: true, analystEmail: identity.analystEmail, role: identity.role, tenantId: identity.tenantId };
       }
     }
   }

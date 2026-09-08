@@ -361,7 +361,9 @@ async function main() {
       if (isExemptFromAuth(path)) return;
 
       const provided = request.headers['x-api-key'] ?? request.headers['authorization']?.replace('Bearer ', '');
-      const result = await resolveAuth(path, provided as string | undefined, apiKey, analystAccessService);
+      const tenantHeader = request.headers['x-tenant-id'];
+      const requestTenantId = (Array.isArray(tenantHeader) ? tenantHeader[0] : tenantHeader)?.trim() || 'default-tenant';
+      const result = await resolveAuth(path, provided as string | undefined, apiKey, analystAccessService, requestTenantId);
 
       if (!result.authorized) {
         reply.code(401).send({ error: 'Unauthorized' });
