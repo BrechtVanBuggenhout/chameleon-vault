@@ -53,6 +53,33 @@ describe('computeDeletionEvidence', () => {
     });
   });
 
+  it('handles a real Firestore Timestamp-shaped object (toDate(), not a Date instance) without throwing', () => {
+    // doc.data() returns Firestore Timestamp instances for date fields at
+    // runtime, not native Dates -- confirmed live against the real dev
+    // deployment (this exact shape produced an empty-object RangeError
+    // before toDate() was added). A fake Timestamp here reproduces that.
+    class FakeTimestamp {
+      constructor(private readonly date: Date) {}
+      toDate() {
+        return this.date;
+      }
+    }
+
+    const requests = [
+      request({
+        deletion_request_id: 'ts-1',
+        status: 'CASCADE_PENDING',
+        created_at: new FakeTimestamp(new Date('2026-09-01T00:00:00.000Z')) as unknown as Date,
+      }),
+    ];
+
+    const report = computeDeletionEvidence(requests, new Date('2026-09-01T05:00:00.000Z'));
+
+    expect(report.incomplete).toHaveLength(1);
+    expect(report.incomplete[0].createdAt).toBe('2026-09-01T00:00:00.000Z');
+    expect(report.incomplete[0].ageHours).toBe(5);
+  });
+
   it('computes the median time-to-certificate correctly for an odd count', () => {
     const requests = [
       request({ deletion_request_id: 'a', created_at: new Date('2026-09-01T00:00:00.000Z'), certificate_issued_at: new Date('2026-09-01T01:00:00.000Z') }), // 1h

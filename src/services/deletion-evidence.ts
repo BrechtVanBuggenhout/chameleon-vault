@@ -28,6 +28,20 @@ export interface DeletionEvidenceReport {
   medianTimeToCertificateHours: number | null;
 }
 
+// Firestore's Node client returns a Timestamp (toDate()/toMillis()), not a
+// native Date, for a doc's timestamp fields at runtime -- the DeletionRequest
+// type says Date, but doc.data() doesn't actually convert it. Same defensive
+// handling as toIso() in routes/audit.ts; matters here because new Date(<a
+// Timestamp>) silently produces an Invalid Date rather than throwing, and
+// .toISOString() on that THEN throws a RangeError with no useful message.
+function toDate(value: unknown): Date {
+  if (value instanceof Date) return value;
+  if (typeof (value as { toDate?: () => Date })?.toDate === 'function') {
+    return (value as { toDate: () => Date }).toDate();
+  }
+  return new Date(value as string);
+}
+
 function hoursBetween(from: Date, to: Date): number {
   return (to.getTime() - from.getTime()) / (1000 * 60 * 60);
 }
@@ -53,7 +67,7 @@ export function computeDeletionEvidence(requests: DeletionRequest[], now: Date =
     if (request.status === 'CERTIFICATE_ISSUED') {
       certificateIssued += 1;
       if (request.certificate_issued_at) {
-        timeToCertificateHours.push(hoursBetween(new Date(request.created_at), new Date(request.certificate_issued_at)));
+        timeToCertificateHours.push(hoursBetween(toDate(request.created_at), toDate(request.certificate_issued_at)));
       }
       continue;
     }
@@ -62,8 +76,8 @@ export function computeDeletionEvidence(requests: DeletionRequest[], now: Date =
       deletionRequestId: request.deletion_request_id,
       userId: request.user_id,
       status: request.status,
-      createdAt: new Date(request.created_at).toISOString(),
-      ageHours: Math.round(hoursBetween(new Date(request.created_at), now) * 10) / 10,
+      createdAt: toDate(request.created_at).toISOString(),
+      ageHours: Math.round(hoursBetween(toDate(request.created_at), now) * 10) / 10,
     });
   }
 
