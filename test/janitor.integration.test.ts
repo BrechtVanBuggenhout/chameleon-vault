@@ -173,4 +173,65 @@ describe('JanitorService Integration Tests', () => {
     expect(hubspotResult.status).toBe('COMPLETE');
     expect(hubspotResult.attempts).toBe(2);
   });
+
+  // Real bug found and fixed this session: this repo's own connectors
+  // (hubspot-connector.ts, salesforce-connector.ts) already classify
+  // retryable: true/false from the real HTTP status they saw -- janitor.ts
+  // used to ignore that field entirely and re-derive a broken version from
+  // the error message text (case-sensitive substring checks that matched
+  // neither connector's real message format), so every failure got zero
+  // backoff regardless of whether it was actually transient, while a
+  // permanently-broken auth failure still got hammered for all
+  // MAX_RETRIES attempts back-to-back with no delay at all.
+  it('stops after a single attempt on a connector-classified non-retryable failure (e.g. real 401/403), never retries', async () => {
+    mockWipe.mockResolvedValue({
+      success: false,
+      destination: 'hubspot',
+      error: 'Authentication failed',
+      retryable: false,
+    });
+
+    const results = await janitor.processCleanup('user123');
+
+    const hubspotResult = results.find((r: any) => r.destination === 'hubspot');
+    expect(hubspotResult.status).toBe('FAILED');
+    expect(hubspotResult.attempts).toBe(1);
+    // Both destinations are non-retryable here -- 1 call each, not
+    // MAX_RETRIES (2) each. The old code always attempted MAX_RETRIES
+    // times regardless of retryable, just without a delay in between.
+    expect(mockWipe).toHaveBeenCalledTimes(2);
+  });
+
+  it('still retries a connector-classified retryable failure (e.g. real 429/5xx) up to MAX_RETRIES', async () => {
+    mockWipe.mockResolvedValue({
+      success: false,
+      destination: 'hubspot',
+      error: 'Rate limited',
+      retryable: true,
+    });
+
+    const results = await janitor.processCleanup('user123');
+
+    expect(results.every((r: any) => r.status === 'FAILED')).toBe(true);
+    // MAX_RETRIES is 2 in beforeEach, for each of the 2 destinations.
+    expect(mockWipe).toHaveBeenCalledTimes(4);
+  }, 10000);
+
+  it('a real HubSpot-shaped auth failure and a real Salesforce-shaped rate-limit failure are each handled by their own actual classification, not a shared misclassification', async () => {
+    // Mirrors exactly what hubspot-connector.ts and salesforce-connector.ts
+    // themselves actually return -- not a synthetic shape.
+    mockWipe
+      .mockResolvedValueOnce({ success: false, destination: 'hubspot', error: 'Request failed with status code 401', retryable: false })
+      .mockResolvedValueOnce({ success: false, destination: 'salesforce', error: 'Rate limited', retryable: true })
+      .mockResolvedValueOnce({ success: true, destination: 'salesforce' });
+
+    const results = await janitor.processCleanup('user123');
+
+    const hubspotResult = results.find((r: any) => r.destination === 'hubspot');
+    const salesforceResult = results.find((r: any) => r.destination === 'salesforce');
+    expect(hubspotResult.status).toBe('FAILED');
+    expect(hubspotResult.attempts).toBe(1);
+    expect(salesforceResult.status).toBe('COMPLETE');
+    expect(salesforceResult.attempts).toBe(2);
+  });
 });

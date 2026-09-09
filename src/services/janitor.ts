@@ -5,6 +5,7 @@ import { CloudKMSClient } from '../gcp/cloud-kms.js';
 import type { JanitorTask } from '../types/janitor.js';
 import { BigQueryLineageRepository } from '../gcp/bigquery-lineage.js';
 import { connectorRegistry } from './registry.js';
+import type { WipeResult } from './connectors/types.js';
 
 const logger = createLogger('janitor-service');
 
@@ -88,7 +89,7 @@ export class JanitorService {
         // reject processCleanup's caller's Promise.all, silently stalling
         // the whole deletion cascade at CASCADE_PENDING forever with no
         // visible failure state (see deletion-request-service.ts).
-        const response = await connector.wipe(userId, tenantId).catch((err: unknown) => ({
+        const response: WipeResult = await connector.wipe(userId, tenantId).catch((err: unknown) => ({
           success: false as const,
           destination: task.destination,
           error: err instanceof Error ? err.message : String(err),
@@ -100,15 +101,47 @@ export class JanitorService {
           logger.info({ userId, destination: task.destination, attempts }, 'Janitor wipe successful');
         } else {
           lastError = response.error || 'Unknown error';
-          
-          // Classification for real SaaS Connectors:
-          // 429 = Rate Limit, 5xx = Server Error (Retryable)
-          // 401/403 = Auth Error (Needs manual intervention)
-          const isRetryable = lastError.includes('rate limit') || lastError.includes('500');
-          
+
+          // Trust the connector's own real classification (see
+          // hubspot-connector.ts/salesforce-connector.ts, both derive this
+          // from the actual HTTP status they saw: 429/5xx retryable,
+          // 401/403 permanent) instead of re-deriving one from the error
+          // message text here. The old re-derivation matched neither
+          // connector's real message format -- HubSpot's error.message is
+          // axios's own text (never contains the literal substring
+          // "rate limit"), and Salesforce's is "Rate limited"/"Server error
+          // (503)" (capital R, never the literal "500") -- so isRetryable
+          // was effectively always false: every failure got zero backoff
+          // delay regardless of whether it was actually transient, while
+          // permanently-broken auth still got hammered for all
+          // MAX_RETRIES attempts since the loop only skips the *delay*, not
+          // the retry itself. Falls back to retryable when a connector
+          // doesn't set the field at all (the .catch() below for an
+          // unexpected thrown error, not a connector's own classified
+          // response) -- an unrecognized failure is more likely a
+          // transient blip than provably permanent, and a wrongly-retried
+          // permanent failure just self-limits at MAX_RETRIES, while a
+          // wrongly-skipped retry on a real transient failure fails the
+          // whole cascade unnecessarily.
+          const isRetryable = response.retryable ?? true;
+
           logger.warn({ userId, destination: task.destination, attempt: attempts, error: lastError, isRetryable }, 'Janitor wipe attempt failed');
-          
-          if (attempts < this.MAX_RETRIES && isRetryable) {
+
+          // A non-retryable failure (permanently broken auth, most often)
+          // stops here instead of burning through the remaining attempts
+          // immediately -- classifying it correctly above only fixed
+          // whether a *delay* happens before the next attempt; the loop's
+          // own condition never actually gated the retry on this at all,
+          // so a real 401/403 still got hammered 3 times back-to-back with
+          // zero delay between them. That's a real trust problem, not just
+          // a performance one: the customer's own SaaS admin sees 3 rapid
+          // failed calls from Chameleon's connector on their side, for a
+          // problem retrying can never fix. One attempt, then stop.
+          if (!isRetryable) {
+            break;
+          }
+
+          if (attempts < this.MAX_RETRIES) {
             // Exponential backoff with jitter
             const delay = (Math.pow(2, attempts) * 1000) + (Math.random() * 1000);
             await new Promise(resolve => setTimeout(resolve, delay));
