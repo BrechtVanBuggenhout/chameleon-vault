@@ -290,17 +290,6 @@ describe('Crypto API Integration Tests', () => {
       expect(body.status).toBe('ok');
       expect(body.service).toBe('chameleon-key-vault');
     });
-
-    it('GET /ready should return 200 with ready true', async () => {
-      const response = await app.inject({
-        method: 'GET',
-        url: '/ready',
-      });
-
-      expect(response.statusCode).toBe(200);
-      const body = JSON.parse(response.body);
-      expect(body.ready).toBe(true);
-    });
   });
 
   describe('POST /key/generate', () => {

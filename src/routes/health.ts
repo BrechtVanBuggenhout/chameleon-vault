@@ -13,12 +13,4 @@ export async function healthRoutes(fastify: FastifyInstance): Promise<void> {
       version: '0.1.0',
     });
   });
-
-  fastify.get('/ready', { logLevel: 'silent' }, async (request, reply) => {
-    // TODO: Check GCP service connectivity
-    return reply.send({
-      ready: true,
-      timestamp: new Date().toISOString(),
-    });
-  });
 }
