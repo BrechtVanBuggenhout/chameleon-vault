@@ -32,6 +32,11 @@ const ANALYST_CREDENTIAL_EXACT_PATHS = new Set([
   '/decrypt',
   '/pii-registry/resources',
   '/deletion-requests',
+  // The console's real "Decrypt" page action (routes/pii-vault-decrypt.ts)
+  // -- previously shared-key-only by deliberate deferral, now attributable
+  // to the individual analyst who requested it, same as every other
+  // console-facing mutating action. See that route's own doc comment.
+  '/pii-vault/decrypt',
 ]);
 
 // PUT/DELETE /pii-registry/resources/:resourceId -- deliberately does NOT

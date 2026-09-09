@@ -158,6 +158,18 @@ describe('resolveAuth', () => {
     expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com', tenantId: 'tenant-a' });
   });
 
+  it('accepts a valid analyst/console-session credential on POST /pii-vault/decrypt -- the console\'s real "Decrypt" page action, previously shared-key-only by deliberate deferral', async () => {
+    mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
+    const result = await resolveAuth(
+      '/pii-vault/decrypt',
+      'analyst-key-value',
+      SHARED_KEY,
+      mockAnalystAccessService as unknown as AnalystAccessService,
+      'tenant-a'
+    );
+    expect(result).toEqual({ authorized: true, analystEmail: 'a@example.com', tenantId: 'tenant-a' });
+  });
+
   it('rejects a credential on the mark-synced sub-route -- machine-to-machine only, not an individual declare action', async () => {
     mockAnalystAccessService.resolveCredential.mockResolvedValue({ tenantId: 'tenant-a', analystEmail: 'a@example.com' });
     const result = await resolveAuth(

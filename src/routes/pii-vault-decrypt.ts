@@ -41,11 +41,14 @@ interface DecryptBody {
  * decryptPiiVaultValue (Firestore key lookup + KMS unwrap + ChameleonAesGcm)
  * -- against one looked-up row instead of a BigQuery remote-function batch.
  *
- * Auth: no special-casing -- the shared VAULT_API_KEY is sufficient here,
- * same trust model as every other console-facing route (Declare, Sync Now,
- * Deletion). Per-analyst attribution for this specific action was
- * considered and deliberately deferred for now; the mitigation is
- * operational (restrict who has console access), not technical.
+ * Auth: the shared VAULT_API_KEY still works (same trust model as every
+ * other console-facing route), but this path is also on
+ * ANALYST_CREDENTIAL_EXACT_PATHS (middleware/auth.ts) so the console's own
+ * per-session credential (see chameleon-console's resolveWriteAuthHeaders)
+ * is accepted too -- real attribution, not just operational restriction of
+ * who has console access. context.analystEmail below is null only for a
+ * shared-key call; the audit event below records whichever actually
+ * authorized the request.
  *
  * Never reveals *why* a value is unavailable -- an undeclared field, a
  * user with no synced row, and a shredded key all produce the same
