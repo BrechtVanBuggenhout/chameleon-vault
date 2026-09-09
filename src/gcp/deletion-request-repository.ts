@@ -78,6 +78,25 @@ export class DeletionRequestRepository {
     return snapshot.docs.map((doc) => doc.data() as DeletionRequest);
   }
 
+  /**
+   * Every deletion request for a tenant whose created_at falls in
+   * [from, to] -- used by GET /audit/deletion-evidence for a period rollup.
+   * No pagination in v1: both dev (~300 total docs) and prod (~38) are far
+   * below any real limit here; revisit if a real high-volume tenant needs
+   * this. Deliberately created_at-scoped (not certificate_issued_at) so a
+   * request that never reached a certificate still shows up in the period
+   * it was opened in.
+   */
+  async listByTenantAndDateRange(tenantId: string, from: Date, to: Date): Promise<DeletionRequest[]> {
+    const snapshot = await this.collection
+      .where('tenant_id', '==', tenantId)
+      .where('created_at', '>=', Timestamp.fromDate(from))
+      .where('created_at', '<=', Timestamp.fromDate(to))
+      .orderBy('created_at', 'desc')
+      .get();
+    return snapshot.docs.map((doc) => doc.data() as DeletionRequest);
+  }
+
   async getDeletionRequest(deletionRequestId: string): Promise<DeletionRequest | null> {
     const doc = await this.collection.doc(deletionRequestId).get();
     if (!doc.exists) {

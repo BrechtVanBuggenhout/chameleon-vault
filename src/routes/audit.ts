@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { PiiRegistryService } from '../services/pii-registry-service.js';
 import { DeletionRequestRepository } from '../gcp/deletion-request-repository.js';
+import { computeDeletionEvidence } from '../services/deletion-evidence.js';
 import { createLogger } from '../logging/index.js';
 import { getRequestContext } from '../middleware/request-logging.js';
 import type { PiiRegistryEntry } from '../types/pii-registry.js';
@@ -158,6 +159,42 @@ export async function auditRoutes(fastify: FastifyInstance, options: AuditRoutes
     } catch (error) {
       logger.error({ correlationId: context.correlationId, error, resourceId }, 'Failed to load audit trail for resource');
       return reply.status(500).send({ error: 'Failed to load audit trail', statusCode: 500 });
+    }
+  });
+
+  /**
+   * GET /audit/deletion-evidence?from=...&to=...
+   * A period rollup of every deletion request for the tenant: how many
+   * reached a certificate, and a plain list of every one that didn't (with
+   * its current status and age) -- the shape a compliance auditor sampling
+   * a "data disposal" control wants, not a per-user proof (that's /proof).
+   * Gated the same way as /audit/actor/:email -- the shared VAULT_API_KEY,
+   * no new auth tier.
+   */
+  fastify.get<{ Querystring: { from?: string; to?: string } }>('/audit/deletion-evidence', async (request, reply) => {
+    const context = getRequestContext(request);
+    context.operation = 'AUDIT_DELETION_EVIDENCE';
+    const tenantId = (request.headers['x-tenant-id'] as string) || 'default-tenant';
+    const { from, to } = request.query;
+
+    const fromDate = from ? new Date(from) : new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const toDate = to ? new Date(to) : new Date();
+    if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime())) {
+      return reply.status(400).send({ error: 'from/to must be valid dates', statusCode: 400 });
+    }
+
+    try {
+      const requests = await deletionRequestRepo.listByTenantAndDateRange(tenantId, fromDate, toDate);
+      const report = computeDeletionEvidence(requests);
+      return reply.send({
+        tenantId,
+        period: { from: fromDate.toISOString(), to: toDate.toISOString() },
+        ...report,
+        generatedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.error({ correlationId: context.correlationId, error, tenantId }, 'Failed to compute deletion evidence rollup');
+      return reply.status(500).send({ error: 'Failed to compute deletion evidence', statusCode: 500 });
     }
   });
 }
