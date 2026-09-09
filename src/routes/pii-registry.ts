@@ -8,6 +8,7 @@ import { resolveSourceRedactionStrategies } from '../services/source-redaction-s
 import { InvalidResourceIdError, type DiscoveredColumn } from '../gcp/bigquery-schema-service.js';
 import type { PiiRegistryDeclarationInput, PiiRegistryEntry } from '../types/pii-registry.js';
 import type { WarehouseDiscoveryFinding } from '../types/lineage.js';
+import type { ContentConfirmedFinding } from '../services/pii-content-findings-lookup.js';
 
 const logger = createLogger('pii-registry-routes');
 
@@ -16,6 +17,17 @@ const DEFAULT_TENANT = 'default-tenant';
 /** Narrow dependency: just the discovery-findings reader from the lineage store. */
 export interface DiscoveryFindingsSource {
   getWarehouseDiscoveryFindings?(tenantId?: string): Promise<WarehouseDiscoveryFinding[]>;
+}
+
+/**
+ * Narrow dependency: just the content-confirmed (Stage 2, path-level)
+ * findings reader, so tests don't need a real BigQuery client. See
+ * PiiContentFindingsLookupService for what distinguishes this from
+ * DiscoveryFindingsSource above -- this one actually inspected real column
+ * values, that one only ever read column names/schema.
+ */
+export interface ContentFindingsSource {
+  getPathLevelFindings(): Promise<ContentConfirmedFinding[]>;
 }
 
 /** Narrow dependency: just the schema reader, so tests don't need a real BigQuery client. */
@@ -58,6 +70,8 @@ export interface PiiRegistryRoutesOptions {
   writeToken?: string;
   /** Source of crawler discovery findings for the "declare undeclared table" workflow. */
   discoverySource?: DiscoveryFindingsSource;
+  /** Source of content-confirmed (Stage 2, path-level) findings. Undefined disables that tier gracefully. */
+  contentFindingsSource?: ContentFindingsSource;
   /** Live BigQuery schema reader for the Declare form's column picker. Undefined disables it gracefully. */
   schemaSource?: SchemaSource;
   /** On-demand trigger for the pii_vault backfill/sync job. Undefined disables it gracefully. */
@@ -76,7 +90,7 @@ export async function piiRegistryRoutes(
   fastify: FastifyInstance,
   options: PiiRegistryRoutesOptions
 ): Promise<void> {
-  const { piiRegistryService, writeToken, discoverySource, schemaSource, syncTrigger, sourceRedactionHook } = options;
+  const { piiRegistryService, writeToken, discoverySource, contentFindingsSource, schemaSource, syncTrigger, sourceRedactionHook } = options;
 
   // Gate every mutating route behind the shared-secret bearer token -- or,
   // for the two routes an analyst credential is allowed on (see
@@ -180,15 +194,54 @@ export async function piiRegistryRoutes(
 
   // Undeclared tables the warehouse crawler discovered — the "declare this" work queue.
   // Already-declared resources are filtered out so the list self-clears as users declare.
+  //
+  // Two independently-sourced tiers, deliberately not merged into one list:
+  // `findings` (schema-level) only ever knows a column's NAME suggests PII --
+  // it's never read a single row. `contentFindings` (Stage 2, path-level)
+  // actually found real PII VALUES at a specific JSON path -- strictly
+  // stronger evidence, from a completely different pipeline
+  // (chameleon-pii-dbt's content scanner, not the metadata crawler). See
+  // PiiContentFindingsLookupService's own doc comment. A content finding for
+  // an already-declared resource is filtered out here the same way schema
+  // findings are -- this endpoint is specifically the "you don't know this
+  // exists" work queue, not a general findings feed.
   fastify.get('/pii-registry/discovery', async (request, reply) => {
     const tenantId = tenantOf(request);
-    if (!discoverySource?.getWarehouseDiscoveryFindings) {
-      return reply.send({ findings: [], count: 0, timestamp: new Date().toISOString() });
+
+    let undeclared: WarehouseDiscoveryFinding[] = [];
+    if (discoverySource?.getWarehouseDiscoveryFindings) {
+      try {
+        const findings = await discoverySource.getWarehouseDiscoveryFindings(tenantId);
+        undeclared = findings.filter((finding) => !piiRegistryService.getEntry(finding.resourceId, tenantId));
+      } catch (error) {
+        logger.error({ error }, 'Failed to list warehouse discovery findings');
+        return reply.status(500).send({ error: 'Internal server error', statusCode: 500 });
+      }
     }
+
+    let undeclaredContentFindings: ContentConfirmedFinding[] = [];
+    if (contentFindingsSource) {
+      try {
+        const contentFindings = await contentFindingsSource.getPathLevelFindings();
+        undeclaredContentFindings = contentFindings.filter(
+          (finding) => !piiRegistryService.getEntry(finding.resourceId, tenantId)
+        );
+      } catch (error) {
+        // Best-effort: a content-findings read failure (e.g. chameleon-pii-dbt
+        // hasn't run yet, or a transient BigQuery error) shouldn't take down
+        // the schema-level tier, which has already succeeded above.
+        logger.error({ error }, 'Failed to list content-confirmed findings');
+      }
+    }
+
     try {
-      const findings = await discoverySource.getWarehouseDiscoveryFindings(tenantId);
-      const undeclared = findings.filter((finding) => !piiRegistryService.getEntry(finding.resourceId, tenantId));
-      return reply.send({ findings: undeclared, count: undeclared.length, timestamp: new Date().toISOString() });
+      return reply.send({
+        findings: undeclared,
+        count: undeclared.length,
+        contentFindings: undeclaredContentFindings,
+        contentFindingCount: undeclaredContentFindings.length,
+        timestamp: new Date().toISOString(),
+      });
     } catch (error) {
       logger.error({ error }, 'Failed to list warehouse discovery findings');
       return reply.status(500).send({ error: 'Internal server error', statusCode: 500 });

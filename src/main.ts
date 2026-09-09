@@ -61,6 +61,7 @@ import { decryptedViewsRoutes } from './routes/decrypted-views.js';
 import { decryptedViewsDecryptRoutes } from './routes/decrypted-views-decrypt.js';
 import { piiVaultDecryptRoutes } from './routes/pii-vault-decrypt.js';
 import { PiiVaultLookupService } from './services/pii-vault-lookup.js';
+import { PiiContentFindingsLookupService } from './services/pii-content-findings-lookup.js';
 
 const logger = createLogger('main');
 
@@ -388,10 +389,23 @@ async function main() {
   await fastify.register(lineageRoutes, { lineageRepository, firestoreRegistry, janitorService });
   await fastify.register(deletionRequestRoutes, { deletionRequestService });
   await fastify.register(certificateRoutes, { certificateService, githubActionsClient });
+  // Gated on PII_CONTENT_FINDINGS_RESOURCE_ID alone, same "off by default"
+  // convention as PII_VAULT_RESOURCE_ID below -- an unconfigured deployment
+  // (chameleon-pii-dbt not installed/run yet) has zero surface area here,
+  // and /pii-registry/discovery still works, just without the
+  // content-confirmed tier.
+  const contentFindingsSource = process.env.PII_CONTENT_FINDINGS_RESOURCE_ID
+    ? new PiiContentFindingsLookupService(new BigQuery({ projectId }), process.env.PII_CONTENT_FINDINGS_RESOURCE_ID)
+    : undefined;
+  if (!contentFindingsSource) {
+    logger.info('PII_CONTENT_FINDINGS_RESOURCE_ID not set; content-confirmed ghost-data findings are disabled');
+  }
+
   await fastify.register(piiRegistryRoutes, {
     piiRegistryService,
     writeToken: registryWriteToken,
     discoverySource: lineageRepository,
+    contentFindingsSource,
     schemaSource: schemaService,
     syncTrigger,
     sourceRedactionHook: sourceRedactionService,

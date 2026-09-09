@@ -805,6 +805,80 @@ describe('piiRegistryRoutes write API (auth + lifecycle)', () => {
     await app.close()
   });
 
+  it('lists content-confirmed (Stage 2, path-level) findings and hides ones already declared', async () => {
+    const service = new PiiRegistryService([], new FakeStore());
+    const contentFinding = {
+      resourceId: 'bigquery:acme.raw.raw_users',
+      columnName: 'attributes',
+      jsonPath: '$.contact.email',
+      classification: 'EMAIL',
+      pattern: 'EMAIL',
+      matchCount: 3,
+      sampledRows: 50,
+      scannedAt: '2026-09-09T10:58:08.000Z',
+    };
+    const contentFindingsSource = { getPathLevelFindings: async () => [contentFinding] };
+
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, { piiRegistryService: service, writeToken: WRITE_TOKEN, contentFindingsSource });
+
+    const before = await app.inject({ method: 'GET', url: '/pii-registry/discovery', headers: { 'x-tenant-id': 'acme' } });
+    const beforeBody = JSON.parse(before.body);
+    expect(beforeBody.contentFindingCount).toBe(1);
+    expect(beforeBody.contentFindings[0].jsonPath).toBe('$.contact.email');
+    // Schema-level tier is untouched -- no discoverySource configured here.
+    expect(beforeBody.count).toBe(0);
+
+    await app.inject({
+      method: 'POST',
+      url: '/pii-registry/resources',
+      headers: { authorization: `Bearer ${WRITE_TOKEN}`, 'x-tenant-id': 'acme' },
+      payload: { ...validInput, resourceId: contentFinding.resourceId },
+    });
+    const after = await app.inject({ method: 'GET', url: '/pii-registry/discovery', headers: { 'x-tenant-id': 'acme' } });
+    expect(JSON.parse(after.body).contentFindingCount).toBe(0);
+
+    await app.close();
+  });
+
+  it('/pii-registry/discovery degrades gracefully with an empty content-findings tier when contentFindingsSource is not configured', async () => {
+    const app = await makeApp();
+    const res = await app.inject({ method: 'GET', url: '/pii-registry/discovery', headers: { 'x-tenant-id': 'acme' } });
+    const body = JSON.parse(res.body);
+    expect(body.contentFindings).toEqual([]);
+    expect(body.contentFindingCount).toBe(0);
+    await app.close();
+  });
+
+  it('a content-findings read failure does not take down the schema-level tier, which already succeeded', async () => {
+    const service = new PiiRegistryService([], new FakeStore());
+    const finding = {
+      resourceId: 'bigquery:acme.fivetran_hubspot.contacts',
+      system: 'bigquery',
+      registryStatus: 'UNREGISTERED' as const,
+      columns: ['email'],
+      lastSeen: '2026-07-02T00:00:00.000Z',
+    };
+    const discoverySource = { getWarehouseDiscoveryFindings: async () => [finding] };
+    const contentFindingsSource = {
+      getPathLevelFindings: async () => {
+        throw new Error('BigQuery: quota exceeded');
+      },
+    };
+
+    const app = Fastify({ logger: false });
+    await app.register(piiRegistryRoutes, { piiRegistryService: service, writeToken: WRITE_TOKEN, discoverySource, contentFindingsSource });
+
+    const res = await app.inject({ method: 'GET', url: '/pii-registry/discovery', headers: { 'x-tenant-id': 'acme' } });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.count).toBe(1);
+    expect(body.contentFindings).toEqual([]);
+    expect(body.contentFindingCount).toBe(0);
+
+    await app.close();
+  });
+
   it('returns 400 with issues for an invalid declaration', async () => {
     const app = await makeApp();
     const res = await app.inject({
