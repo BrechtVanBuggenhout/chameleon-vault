@@ -90,11 +90,13 @@ await jest.unstable_mockModule('../src/gcp/cloud-kms.js', () => ({
     generateAndEncryptDek = mockGenerateAndEncryptDek;
     encryptDataEncryptionKey = mockEncryptDek;
     decryptDataEncryptionKey = mockDecryptDek;
+    ping = jest.fn(async () => {});
   }
 }));
 
 await jest.unstable_mockModule('../src/gcp/firestore-registry.js', () => ({
   FirestoreRegistry: class {
+    ping = jest.fn(async () => {});
     getKeyForUser = jest.fn(async (userId: string, _tenantId: string = 'default-tenant', keyVersionId?: string) => {
       const entry = mockRegistryStore.get(userId);
       if (!entry || entry.status === 'SHREDDED') return null; // Consistent with API_SPECIFICATION.md
@@ -259,7 +261,7 @@ describe('Crypto API Integration Tests', () => {
     await app.register(cors);
     await app.register(helmet);
     await registerRequestLogging(app);
-    await app.register(healthRoutes);
+    await app.register(healthRoutes, { firestore: firestoreRegistry, kms: kmsClient });
     await app.register(cryptoRoutes, { kmsClient, firestoreRegistry, lineageRepository, deletionRequestService });
     await app.register(lineageRoutes, { lineageRepository, firestoreRegistry, janitorService });
     await app.register(deletionRequestRoutes, { deletionRequestService });

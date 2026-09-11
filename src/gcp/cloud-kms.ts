@@ -50,6 +50,17 @@ export class CloudKMSClient {
   }
 
   /**
+   * Cheap, read-only reachability check against the real shared default
+   * key this service depends on -- used by GET /health so a KMS outage
+   * or misconfigured key path actually shows up there instead of the
+   * route unconditionally returning ok. getCryptoKey is a plain GET, no
+   * cryptographic operation and no quota impact beyond a normal read.
+   */
+  async ping(): Promise<void> {
+    await this.client.getCryptoKey({ name: this.getKeyPath() });
+  }
+
+  /**
    * Ensures a tenant-specific CryptoKey exists. Creates it if it doesn't.
    */
   async ensureTenantKey(tenantId: string): Promise<string> {

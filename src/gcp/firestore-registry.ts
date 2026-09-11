@@ -35,6 +35,18 @@ export class FirestoreRegistry {
     return `${tenantId}:${userId}`;
   }
 
+  /**
+   * Cheap, read-only reachability check against the real collection this
+   * service depends on -- used by GET /health so a Firestore outage
+   * actually shows up there instead of the route unconditionally
+   * returning ok. limit(1) so this stays cheap regardless of collection
+   * size; an empty result is a successful check (the query itself
+   * completing proves reachability, whether or not any doc matched).
+   */
+  async ping(): Promise<void> {
+    await this.db.collection(this.collectionName).limit(1).get();
+  }
+
   async getKeyForUser(userId: string, tenantId: string = 'default-tenant', keyVersionId?: string): Promise<{ encryptedDek: Buffer | null; activeDekId: string; encryptionVersion: string } | null> {
     try {
       const docId = this.getDocId(tenantId, userId);

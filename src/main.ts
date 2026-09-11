@@ -383,7 +383,7 @@ async function main() {
   }
 
   // 4. Register Routes with Injected Dependencies
-  await fastify.register(healthRoutes); // Health routes don't have external dependencies
+  await fastify.register(healthRoutes, { firestore: firestoreRegistry, kms: dekKmsClient });
   await fastify.register(versionRoutes, { sourceStalenessChecker });
   await fastify.register(cryptoRoutes, { kmsClient: dekKmsClient, firestoreRegistry, lineageRepository, deletionRequestService });
   await fastify.register(lineageRoutes, { lineageRepository, firestoreRegistry, janitorService });
