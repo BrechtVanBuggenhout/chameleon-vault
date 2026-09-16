@@ -225,6 +225,20 @@ describe('DeletionRequestService - cascade outcome gates certificate issuance', 
       updateDeletionRequestStatus: jest.fn(async (_id: string, newStatus: DeletionRequestStatus, updateFields: any) => {
         currentRequest = { ...currentRequest, ...updateFields, status: newStatus };
       }),
+      // Stateful CAS, matching the real Firestore-backed implementation:
+      // claims only if currentRequest's status is still one of
+      // allowedFromStatuses, otherwise reports the loss with the current
+      // (already-advanced) snapshot instead of writing anything.
+      claimTransition: jest.fn(async (_id: string, allowedFromStatuses: DeletionRequestStatus[], newStatus: DeletionRequestStatus) => {
+        if (!allowedFromStatuses.includes(currentRequest.status)) {
+          return { claimed: false, current: { ...currentRequest } };
+        }
+        currentRequest = { ...currentRequest, status: newStatus };
+        return { claimed: true };
+      }),
+      updateDeletionRequestFields: jest.fn(async (_id: string, updateFields: any) => {
+        currentRequest = { ...currentRequest, ...updateFields };
+      }),
     } as any;
     mockFirestoreRegistry = { shredKeyForUser: jest.fn().mockResolvedValue(undefined) } as any;
     mockLineageRepository = { recordEvent: jest.fn().mockResolvedValue(undefined) } as any;
@@ -406,6 +420,20 @@ describe('DeletionRequestService - CASCADE_IN_PROGRESS retries a stuck CASCADE_P
       updateDeletionRequestStatus: jest.fn(async (_id: string, newStatus: DeletionRequestStatus, updateFields: any) => {
         currentRequest = { ...currentRequest, ...updateFields, status: newStatus };
       }),
+      // Stateful CAS, matching the real Firestore-backed implementation:
+      // claims only if currentRequest's status is still one of
+      // allowedFromStatuses, otherwise reports the loss with the current
+      // (already-advanced) snapshot instead of writing anything.
+      claimTransition: jest.fn(async (_id: string, allowedFromStatuses: DeletionRequestStatus[], newStatus: DeletionRequestStatus) => {
+        if (!allowedFromStatuses.includes(currentRequest.status)) {
+          return { claimed: false, current: { ...currentRequest } };
+        }
+        currentRequest = { ...currentRequest, status: newStatus };
+        return { claimed: true };
+      }),
+      updateDeletionRequestFields: jest.fn(async (_id: string, updateFields: any) => {
+        currentRequest = { ...currentRequest, ...updateFields };
+      }),
     } as any;
     mockFirestoreRegistry = { shredKeyForUser: jest.fn().mockResolvedValue(undefined) } as any;
     mockLineageRepository = { recordEvent: jest.fn().mockResolvedValue(undefined) } as any;
@@ -557,6 +585,20 @@ describe('DeletionRequestService - source redaction integration', () => {
       getDeletionRequest: jest.fn(async () => ({ ...currentRequest })),
       updateDeletionRequestStatus: jest.fn(async (_id: string, newStatus: DeletionRequestStatus, updateFields: any) => {
         currentRequest = { ...currentRequest, ...updateFields, status: newStatus };
+      }),
+      // Stateful CAS, matching the real Firestore-backed implementation:
+      // claims only if currentRequest's status is still one of
+      // allowedFromStatuses, otherwise reports the loss with the current
+      // (already-advanced) snapshot instead of writing anything.
+      claimTransition: jest.fn(async (_id: string, allowedFromStatuses: DeletionRequestStatus[], newStatus: DeletionRequestStatus) => {
+        if (!allowedFromStatuses.includes(currentRequest.status)) {
+          return { claimed: false, current: { ...currentRequest } };
+        }
+        currentRequest = { ...currentRequest, status: newStatus };
+        return { claimed: true };
+      }),
+      updateDeletionRequestFields: jest.fn(async (_id: string, updateFields: any) => {
+        currentRequest = { ...currentRequest, ...updateFields };
       }),
     } as any;
     mockFirestoreRegistry = { shredKeyForUser: jest.fn().mockResolvedValue(undefined) } as any;

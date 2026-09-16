@@ -182,6 +182,66 @@ export class DeletionRequestRepository {
     logger.info({ deletionRequestId, newStatus }, 'Updated deletion request status');
   }
 
+  /**
+   * Atomic compare-and-swap on status alone: writes newStatus only if the
+   * document's status is still one of allowedFromStatuses at transaction
+   * time, otherwise writes nothing and hands back the current document.
+   * This is the exclusive gate advanceRequest claims *before* running a
+   * handler with a side effect that must not fire twice for one transition
+   * (e.g. minting a certificate) -- unlike updateDeletionRequestStatus
+   * above, which unconditionally writes after a handler has already run,
+   * leaving a window where two concurrent callers both read the same
+   * pre-write status and both proceed.
+   */
+  async claimTransition(
+    deletionRequestId: string,
+    allowedFromStatuses: DeletionRequestStatus[],
+    newStatus: DeletionRequestStatus
+  ): Promise<{ claimed: true } | { claimed: false; current: DeletionRequest }> {
+    const docRef = this.collection.doc(deletionRequestId);
+
+    return this.db.runTransaction(async (transaction) => {
+      const doc = await transaction.get(docRef);
+      if (!doc.exists) {
+        throw new Error(`Deletion request ${deletionRequestId} not found`);
+      }
+
+      const current = doc.data() as DeletionRequest;
+      if (!allowedFromStatuses.includes(current.status)) {
+        // Someone else already moved this document past the status we
+        // read it in -- don't write anything, hand back what's actually
+        // there so the loser can return the winner's state instead of
+        // re-running its handler.
+        return { claimed: false, current };
+      }
+
+      const now = Timestamp.now();
+      transaction.update(docRef, {
+        status: newStatus,
+        status_history: FieldValue.arrayUnion({ status: newStatus, timestamp: now.toDate() }),
+      });
+      return { claimed: true };
+    });
+  }
+
+  /**
+   * Attaches fields to a request whose status was already written by
+   * claimTransition -- deliberately does not touch status/status_history
+   * again, since re-writing the same status would append a second,
+   * misleadingly-timestamped status_history entry for what is really one
+   * transition split across two writes (claim, then attach).
+   */
+  async updateDeletionRequestFields(
+    deletionRequestId: string,
+    updateFields: Partial<DeletionRequest>
+  ): Promise<void> {
+    if (Object.keys(updateFields).length === 0) {
+      return;
+    }
+    await this.collection.doc(deletionRequestId).update(updateFields as DocumentData);
+    logger.info({ deletionRequestId, fields: Object.keys(updateFields) }, 'Updated deletion request fields');
+  }
+
   // Method to update janitor wipe status
   async updateJanitorWipeStatus(
     deletionRequestId: string, 

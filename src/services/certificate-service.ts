@@ -229,18 +229,19 @@ export class CertificateService {
    * be used to enumerate a tenant's certificate history the way a
    * by-sequence lookup could.
    */
-  async getCertificateByHash(certificateHash: string): Promise<{ certificate: string; tsaTimestamp?: TsaTimestampInfo } | null> {
+  async getCertificateByHash(certificateHash: string): Promise<{ certificate: string; tsaTimestamp?: TsaTimestampInfo; rekorEntry?: RekorLogEntryInfo } | null> {
     const entry = await this.chainRepository.getEntryByHash(certificateHash);
     if (!entry) return null;
 
     const deletionRequest = await this.deletionRequestRepo.getDeletionRequest(entry.deletion_request_id);
     if (!deletionRequest?.certificate_gcs_path) return null;
 
-    // tsaTimestamp is read from the GCS wrapper (below), not the Firestore
-    // entry above -- GCS is the source of truth a Firestore write failure
-    // in issueAndStoreCertificate's best-effort follow-up can never affect.
+    // tsaTimestamp/rekorEntry are read from the GCS wrapper (below), not the
+    // Firestore entry above -- GCS is the source of truth a Firestore write
+    // failure in issueAndStoreCertificate's best-effort follow-up can never
+    // affect.
     const stored = await this.gcsClient.downloadCertificate(deletionRequest.certificate_gcs_path);
-    return { certificate: stored.certificate, tsaTimestamp: stored.tsaTimestamp };
+    return { certificate: stored.certificate, tsaTimestamp: stored.tsaTimestamp, rekorEntry: stored.rekorEntry };
   }
 
   // Base (unversioned) path of the signing CryptoKey -- static for the

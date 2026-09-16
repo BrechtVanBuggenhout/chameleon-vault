@@ -218,6 +218,20 @@ await jest.unstable_mockModule('../src/gcp/deletion-request-repository.js', () =
         request.statusHistory.push({ status, timestamp: new Date() });
       }
     });
+    claimTransition = jest.fn(async (id: string, allowedFromStatuses: string[], newStatus: string) => {
+      const request = mockDeletionRequestStore.get(id);
+      if (!request) throw new Error(`Deletion request ${id} not found`);
+      if (!allowedFromStatuses.includes(request.status)) {
+        return { claimed: false, current: { ...request } };
+      }
+      Object.assign(request, { status: newStatus });
+      request.statusHistory.push({ status: newStatus, timestamp: new Date() });
+      return { claimed: true };
+    });
+    updateDeletionRequestFields = jest.fn(async (id: string, fields: any) => {
+      const request = mockDeletionRequestStore.get(id);
+      if (request) Object.assign(request, fields);
+    });
     updateJanitorWipeStatus = jest.fn(async () => {});
   }
 }));

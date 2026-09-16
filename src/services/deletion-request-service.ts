@@ -87,10 +87,46 @@ export class DeletionRequestService {
     const updateFields: Partial<DeletionRequest> = {};
     let afterStatusPersisted: (() => void) | undefined;
 
+    // Atomically claims this exact transition (status only) before running
+    // a handler with a side effect that must not fire twice -- e.g. two
+    // concurrent advanceRequest(..., 'CERTIFICATE_ISSUED', ...) calls both
+    // reading the same pre-write CASCADE_COMPLETE snapshot and both minting
+    // a certificate. The CAS is scoped to exactly the status this call read
+    // (request.status), which isValidTransition already confirmed can
+    // legally move to newStatus; if the document has since moved past it,
+    // some other caller won and this one backs off with the winner's state
+    // instead of re-running the handler. See claimTransition's own
+    // docstring for the compare-and-swap itself.
+    const claimOrLose = async (): Promise<DeletionRequest | undefined> => {
+      const result = await this.deletionRequestRepo.claimTransition(deletionRequestId, [request.status], newStatus);
+      if (result.claimed) return undefined;
+      logger.info(
+        { deletionRequestId, userId: request.user_id, from: request.status, to: newStatus },
+        'Lost the transition claim to a concurrent caller; returning its state instead of re-running this handler'
+      );
+      return result.current;
+    };
+
     switch (newStatus) {
-      case 'KEY_DESTROYED':
-        // Perform irreversible key destruction
-        await this.firestoreRegistry.shredKeyForUser(request.user_id, tenantId, deletionRequestId);
+      case 'KEY_DESTROYED': {
+        const lost = await claimOrLose();
+        if (lost) return lost;
+
+        try {
+          // Perform irreversible key destruction
+          await this.firestoreRegistry.shredKeyForUser(request.user_id, tenantId, deletionRequestId);
+        } catch (err) {
+          // The claim above already committed status: KEY_DESTROYED, but
+          // the key was never actually destroyed -- roll the document back
+          // to the status this claim moved it from rather than leave it
+          // falsely marked as key-destroyed. Safe to write unconditionally:
+          // claimTransition's CAS guaranteed this call is the only one that
+          // ever saw the document at request.status for this transition, so
+          // nothing else can be racing this rollback.
+          logger.error({ err, deletionRequestId, userId: request.user_id }, 'Key destruction failed after winning the transition claim -- rolling back status');
+          await this.deletionRequestRepo.updateDeletionRequestStatus(deletionRequestId, request.status, {});
+          throw err;
+        }
         updateFields.key_destroyed_at = new Date();
         await this.lineageRepo.recordEvent({
           operationId,
@@ -102,7 +138,9 @@ export class DeletionRequestService {
           destination: 'key-registry',
           context: { status: 'KEY_SHREDDED', deletion_request_id: deletionRequestId, user_id: request.user_id },
         }).catch(err => logger.error({ err, userId: request.user_id }, 'Background lineage logging failed (KEY_DESTROYED)'));
-        break;
+        await this.deletionRequestRepo.updateDeletionRequestFields(deletionRequestId, updateFields);
+        return { ...request, ...updateFields, status: newStatus };
+      }
       case 'CASCADE_PENDING': {
         const plan = await this.prepareCascadeTrigger(deletionRequestId, request, tenantId, operationId);
         if (plan.shortcutToComplete) {
@@ -129,6 +167,16 @@ export class DeletionRequestService {
           });
         }
 
+        // Claimed only once we know this is the real (non-shortcut) path --
+        // deliberately placed after plan-building rather than at the top of
+        // this case, so the shortcut above keeps writing straight to
+        // CASCADE_COMPLETE with no extra CASCADE_PENDING write in between,
+        // exactly as before. Plan-building itself is read-only (no wipes
+        // dispatched yet), so racing it twice is harmless either way; what
+        // this guards is the actual cascade dispatch below.
+        const lost = await claimOrLose();
+        if (lost) return lost;
+
         afterStatusPersisted = plan.afterStatusPersisted;
         logger.info({ deletionRequestId, userId: request.user_id }, 'Janitor cascade triggered for user');
 
@@ -143,7 +191,9 @@ export class DeletionRequestService {
           destination: 'janitor-service',
           context: { destinations: plan.taskDestinations },
         }).catch(err => logger.error({ err, userId: request.user_id }, 'Background lineage logging failed (JANITOR_TRIGGERED)'));
-        break;
+        await this.deletionRequestRepo.updateDeletionRequestFields(deletionRequestId, updateFields);
+        afterStatusPersisted?.();
+        return { ...request, ...updateFields, status: newStatus };
       }
       case 'CASCADE_IN_PROGRESS': {
         // Retry path from CASCADE_PARTIAL_FAILURE. Before this, the
@@ -177,6 +227,11 @@ export class DeletionRequestService {
           return request;
         }
 
+        // See the matching comment in CASCADE_PENDING above -- claimed
+        // after plan-building, for the same reason.
+        const lost = await claimOrLose();
+        if (lost) return lost;
+
         afterStatusPersisted = plan.afterStatusPersisted;
         logger.info({ deletionRequestId, userId: request.user_id }, 'Cascade retry triggered for user');
 
@@ -191,14 +246,24 @@ export class DeletionRequestService {
           destination: 'janitor-service',
           context: { destinations: plan.taskDestinations },
         }).catch(err => logger.error({ err, userId: request.user_id }, 'Background lineage logging failed (CASCADE_RETRY_TRIGGERED)'));
-        break;
+        await this.deletionRequestRepo.updateDeletionRequestFields(deletionRequestId, updateFields);
+        afterStatusPersisted?.();
+        return { ...request, ...updateFields, status: newStatus };
       }
       case 'CASCADE_COMPLETE':
-        // When cascade is done, automatically move to certificate issuance
+        // When cascade is done, automatically move to certificate issuance.
+        // No claim here -- this always writes unconditionally and
+        // immediately recurses into CERTIFICATE_ISSUED, which claims for
+        // itself; that's the transition whose side effect (minting a
+        // certificate) actually can't fire twice, and it's guarded either
+        // way this one lands.
         await this.deletionRequestRepo.updateDeletionRequestStatus(deletionRequestId, newStatus, updateFields);
         return this.advanceRequest(deletionRequestId, 'CERTIFICATE_ISSUED', operationId);
 
-      case 'CASCADE_PARTIAL_FAILURE':
+      case 'CASCADE_PARTIAL_FAILURE': {
+        const lost = await claimOrLose();
+        if (lost) return lost;
+
         // Deliberately does NOT cascade into CERTIFICATE_ISSUED, unlike
         // CASCADE_COMPLETE above -- this is the whole point of this state.
         // A signed Certificate of Destruction must never be issued while a
@@ -217,12 +282,36 @@ export class DeletionRequestService {
           destination: 'janitor-service',
           context: { failedDestinations: context?.failedDestinations ?? [] },
         }).catch(err => logger.error({ err, userId: request.user_id }, 'Background lineage logging failed (CASCADE_PARTIAL_FAILURE)'));
-        break;
+        await this.deletionRequestRepo.updateDeletionRequestFields(deletionRequestId, updateFields);
+        return { ...request, ...updateFields, status: newStatus };
+      }
 
-      case 'CERTIFICATE_ISSUED':
-        // Generate and store the certificate in GCS as required by infra
-        const { gcsPath } = await this.certificateService.issueAndStoreCertificate(request.user_id, request.deletion_request_id, tenantId);
-        
+      case 'CERTIFICATE_ISSUED': {
+        const lost = await claimOrLose();
+        if (lost) return lost;
+
+        // Generate and store the certificate in GCS as required by infra.
+        // The claim above is the exclusive gate -- only the caller that
+        // won it reaches this line, so issueAndStoreCertificate can never
+        // fire twice for one CASCADE_COMPLETE -> CERTIFICATE_ISSUED
+        // transition, even when two callers raced off the same stale read.
+        let gcsPath: string;
+        try {
+          ({ gcsPath } = await this.certificateService.issueAndStoreCertificate(request.user_id, request.deletion_request_id, tenantId));
+        } catch (err) {
+          // Same rollback reasoning as KEY_DESTROYED above: the claim
+          // already committed status: CERTIFICATE_ISSUED, but no
+          // certificate was actually produced. Roll back to the status
+          // this claim moved it from (CASCADE_COMPLETE) and rethrow, so
+          // prepareCascadeTrigger's own recovery catch runs exactly as it
+          // did before this fix -- forcing a visible CASCADE_PARTIAL_FAILURE
+          // with the real error message, instead of leaving the document
+          // stuck falsely claiming a certificate that doesn't exist.
+          logger.error({ err, deletionRequestId, userId: request.user_id }, 'Certificate issuance failed after winning the transition claim -- rolling back status');
+          await this.deletionRequestRepo.updateDeletionRequestStatus(deletionRequestId, request.status, {});
+          throw err;
+        }
+
         updateFields.certificate_issued_at = new Date();
         // Lets GET /certificate/:userId return the exact stored (chained)
         // certificate instead of re-signing a fresh one on every call.
@@ -237,8 +326,12 @@ export class DeletionRequestService {
           destination: 'certificate-service',
           context: { certificate_gcs_path: gcsPath },
         }).catch(err => logger.error({ err, userId: request.user_id }, 'Background lineage logging failed (CERTIFICATE_ISSUED)'));
-        break;
-      // Other states would have their own logic
+        await this.deletionRequestRepo.updateDeletionRequestFields(deletionRequestId, updateFields);
+        return { ...request, ...updateFields, status: newStatus };
+      }
+      // Other states (e.g. SHRED_REQUESTED) have no dedicated handler and
+      // fall through to the generic, unclaimed write below -- unchanged,
+      // pre-existing behavior; out of scope for this fix.
     }
 
     await this.deletionRequestRepo.updateDeletionRequestStatus(deletionRequestId, newStatus, updateFields);
