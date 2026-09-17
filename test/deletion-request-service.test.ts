@@ -78,8 +78,7 @@ describe('DeletionRequestService - State Transition Matrix', () => {
     expect(callIsValidTransition('CASCADE_IN_PROGRESS', 'CASCADE_COMPLETE')).toBe(true);
     expect(callIsValidTransition('CASCADE_IN_PROGRESS', 'CASCADE_PARTIAL_FAILURE')).toBe(true);
 
-    expect(callIsValidTransition('CASCADE_PARTIAL_FAILURE', 'CASCADE_IN_PROGRESS')).toBe(true);
-    expect(callIsValidTransition('CASCADE_PARTIAL_FAILURE', 'SHRED_REQUESTED')).toBe(true); // Allow retry from start
+    expect(callIsValidTransition('CASCADE_PARTIAL_FAILURE', 'CASCADE_IN_PROGRESS')).toBe(true); // The one real retry path
 
     expect(callIsValidTransition('CASCADE_COMPLETE', 'CERTIFICATE_ISSUED')).toBe(true);
     expect(callIsValidTransition('CASCADE_COMPLETE', 'CASCADE_PARTIAL_FAILURE')).toBe(true);
@@ -101,7 +100,20 @@ describe('DeletionRequestService - State Transition Matrix', () => {
     expect(callIsValidTransition('KEY_DESTROYED', 'CERTIFICATE_ISSUED')).toBe(false);
     expect(callIsValidTransition('KEY_DESTROYED', 'CASCADE_COMPLETE')).toBe(false);
 
-    // Going backwards (except for retry from CASCADE_PARTIAL_FAILURE)
+    // Same shape, found and closed the same week (CSC699 Week 1): this used
+    // to be listed as valid, as an "allow retry from start" escape hatch --
+    // but the switch never had a case for SHRED_REQUESTED either, so
+    // advancing into it silently fell through to a generic status write
+    // with none of key_destroyed_at/cascade_initiated_at/janitor_wipes
+    // reset or re-derived. There's nothing coherent left for "start over"
+    // to mean here anyway -- key destruction already irreversibly happened
+    // earlier, at KEY_DESTROYED. The one real retry path is
+    // CASCADE_PARTIAL_FAILURE -> CASCADE_IN_PROGRESS (see "should allow
+    // valid transitions" above), which actually re-runs the cleanup
+    // cascade instead of just relabeling the request.
+    expect(callIsValidTransition('CASCADE_PARTIAL_FAILURE', 'SHRED_REQUESTED')).toBe(false);
+
+    // Going backwards
     expect(callIsValidTransition('CASCADE_COMPLETE', 'SHRED_REQUESTED')).toBe(false);
     expect(callIsValidTransition('CERTIFICATE_ISSUED', 'KEY_DESTROYED')).toBe(false);
     expect(callIsValidTransition('CERTIFICATE_ISSUED', 'CASCADE_COMPLETE')).toBe(false);

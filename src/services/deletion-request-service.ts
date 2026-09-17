@@ -531,12 +531,28 @@ export class DeletionRequestService {
     // to reach it now: shortcutToCascadeComplete(), called exclusively
     // from inside prepareCascadeTrigger's own two callers, immediately
     // after that real check. See shortcutToCascadeComplete's docstring.
+    //
+    // It also does NOT allow CASCADE_PARTIAL_FAILURE -> SHRED_REQUESTED
+    // anymore. That entry used to be here as an "allow retry from start"
+    // escape hatch, but by the time a request reaches CASCADE_PARTIAL_FAILURE
+    // the one truly irreversible step (key destruction) has already
+    // happened -- there's no real "start over" left for this to mean.
+    // Because the switch below never had a case for SHRED_REQUESTED
+    // either, calling it silently fell through to the generic bottom-of-
+    // function write: status flipped back to SHRED_REQUESTED while
+    // key_destroyed_at, cascade_initiated_at, and the stale janitor_wipes
+    // array were left untouched and nothing was re-derived -- the same
+    // "advertised as valid, no real handler behind it" shape as the two
+    // bugs above. The real retry path already exists and is the only one
+    // that does anything coherent: CASCADE_PARTIAL_FAILURE ->
+    // CASCADE_IN_PROGRESS re-runs the actual cleanup cascade. Found and
+    // closed the same week as the other two, CSC699 Week 1.
     const transitions: Record<DeletionRequestStatus, DeletionRequestStatus[]> = {
       'SHRED_REQUESTED': ['KEY_DESTROYED', 'CASCADE_PARTIAL_FAILURE'],
       'KEY_DESTROYED': ['CASCADE_PENDING', 'CASCADE_PARTIAL_FAILURE'],
       'CASCADE_PENDING': ['CASCADE_IN_PROGRESS', 'CASCADE_COMPLETE', 'CASCADE_PARTIAL_FAILURE'],
       'CASCADE_IN_PROGRESS': ['CASCADE_COMPLETE', 'CASCADE_PARTIAL_FAILURE'],
-      'CASCADE_PARTIAL_FAILURE': ['CASCADE_IN_PROGRESS', 'SHRED_REQUESTED'],
+      'CASCADE_PARTIAL_FAILURE': ['CASCADE_IN_PROGRESS'],
       'CASCADE_COMPLETE': ['CERTIFICATE_ISSUED', 'CASCADE_PARTIAL_FAILURE'],
       'CERTIFICATE_ISSUED': [] // Terminal state
     };
