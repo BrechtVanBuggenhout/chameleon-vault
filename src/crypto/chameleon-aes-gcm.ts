@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+import { createCipheriv, createDecipheriv, randomBytes, type KeyObject } from 'crypto';
 
 const KEY_SIZE = 32; // 256 bits
 const AUTH_TAG_SIZE = 16; // 128 bits for GCM
@@ -23,9 +23,14 @@ export interface ChameleonEncryptionResult {
  * not passed in here.
  */
 export class ChameleonAesGcm {
-  static encrypt(plaintext: string, userId: string, dek: Buffer): ChameleonEncryptionResult {
-    if (dek.length !== KEY_SIZE) {
-      throw new Error(`DEK must be ${KEY_SIZE} bytes, got ${dek.length}`);
+  static encrypt(plaintext: string, userId: string, dek: Buffer | KeyObject): ChameleonEncryptionResult {
+    // dek is a KeyObject on the real, KMS-backed path (see
+    // CloudKMSClient.decryptDataEncryptionKey) -- kept as Buffer | KeyObject,
+    // not KeyObject-only, so crypto-correctness tests can keep exercising
+    // this directly with a raw key, no KMS involved.
+    const dekSize = Buffer.isBuffer(dek) ? dek.length : dek.symmetricKeySize;
+    if (dekSize !== KEY_SIZE) {
+      throw new Error(`DEK must be ${KEY_SIZE} bytes, got ${dekSize}`);
     }
 
     const iv = randomBytes(12);
@@ -42,9 +47,10 @@ export class ChameleonAesGcm {
     };
   }
 
-  static decrypt(ivB64: string, ciphertextB64: string, userId: string, dek: Buffer): string {
-    if (dek.length !== KEY_SIZE) {
-      throw new Error(`DEK must be ${KEY_SIZE} bytes, got ${dek.length}`);
+  static decrypt(ivB64: string, ciphertextB64: string, userId: string, dek: Buffer | KeyObject): string {
+    const dekSize = Buffer.isBuffer(dek) ? dek.length : dek.symmetricKeySize;
+    if (dekSize !== KEY_SIZE) {
+      throw new Error(`DEK must be ${KEY_SIZE} bytes, got ${dekSize}`);
     }
 
     const iv = Buffer.from(ivB64, 'base64');

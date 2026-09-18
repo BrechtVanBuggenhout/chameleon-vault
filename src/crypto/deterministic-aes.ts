@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'crypto';
+import { createCipheriv, createDecipheriv, randomBytes, createHash, type KeyObject } from 'crypto';
 import { createLogger } from '../logging/index.js';
 
 const logger = createLogger('deterministic-aes');
@@ -39,11 +39,16 @@ export class DeterministicAES {
   static encrypt(
     plaintext: string,
     userId: string,
-    dek: Buffer
+    dek: Buffer | KeyObject
   ): EncryptionResult {
     try {
-      if (dek.length !== KEY_SIZE) {
-        throw new Error(`DEK must be ${KEY_SIZE} bytes, got ${dek.length}`);
+      // dek is a KeyObject on the real, KMS-backed path (see
+      // CloudKMSClient.decryptDataEncryptionKey) -- kept as Buffer | KeyObject,
+      // not KeyObject-only, so crypto-correctness tests can keep exercising
+      // this directly with a raw key, no KMS involved.
+      const dekSize = Buffer.isBuffer(dek) ? dek.length : dek.symmetricKeySize;
+      if (dekSize !== KEY_SIZE) {
+        throw new Error(`DEK must be ${KEY_SIZE} bytes, got ${dekSize}`);
       }
 
       const iv = this.generateDeterministicIV(userId);
@@ -87,11 +92,12 @@ export class DeterministicAES {
   static decrypt(
     ciphertextB64: string,
     userId: string,
-    dek: Buffer
+    dek: Buffer | KeyObject
   ): DecryptionResult {
     try {
-      if (dek.length !== KEY_SIZE) {
-        throw new Error(`DEK must be ${KEY_SIZE} bytes, got ${dek.length}`);
+      const dekSize = Buffer.isBuffer(dek) ? dek.length : dek.symmetricKeySize;
+      if (dekSize !== KEY_SIZE) {
+        throw new Error(`DEK must be ${KEY_SIZE} bytes, got ${dekSize}`);
       }
 
       const combined = Buffer.from(ciphertextB64, 'base64');

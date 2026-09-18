@@ -105,7 +105,23 @@ export class CloudKMSClient {
     }
   }
 
-  async decryptDataEncryptionKey(encryptedDek: Buffer, tenantId?: string): Promise<Buffer> {
+  /**
+   * Returns the decrypted DEK wrapped as a KeyObject, never a plain Buffer.
+   * A raw Buffer's bytes are ordinary V8 heap data -- subject to the
+   * generational GC copying them to a new region during a scavenge before
+   * any explicit zeroing call runs, and readable in a heap dump for as
+   * long as some copy happens to survive. A KeyObject hands the actual key
+   * material to Node's native (OpenSSL-backed) key storage instead, which
+   * createCipheriv/createDecipheriv accept directly (stable since Node
+   * 12) -- the bytes never need to exist as an application-level Buffer
+   * except for the one intermediate copy below, which is zeroed
+   * immediately after wrapping.
+   *
+   * This is hardening, not a provable guarantee: KeyObject cleanup on GC
+   * is Node/OpenSSL's responsibility, not something this code can verify
+   * from here.
+   */
+  async decryptDataEncryptionKey(encryptedDek: Buffer, tenantId?: string): Promise<crypto.KeyObject> {
     try {
       const [decryptResponse] = await this.client.decrypt({
         name: this.getKeyPath(tenantId),
@@ -116,8 +132,24 @@ export class CloudKMSClient {
         throw new Error('Cloud KMS decryption failed: no plaintext returned');
       }
 
+      // The gRPC client's own returned buffer is a separate live copy of
+      // the plaintext DEK from the one we make below -- zero it too once
+      // we've copied what we need, rather than only zeroing our own copy
+      // and leaving this one to the garbage collector. Only possible when
+      // it's actually bytes (the client's own type is Uint8Array | string;
+      // in real usage it's always the former, but a string can't be
+      // zeroed at all -- JS strings are immutable).
+      const rawPlaintext = decryptResponse.plaintext;
+      const dekBuffer = Buffer.from(rawPlaintext);
+      if (rawPlaintext instanceof Uint8Array) {
+        rawPlaintext.fill(0);
+      }
+
+      const dekKeyObject = crypto.createSecretKey(dekBuffer);
+      dekBuffer.fill(0);
+
       logger.debug('Successfully decrypted DEK with Cloud KMS');
-      return Buffer.from(decryptResponse.plaintext);
+      return dekKeyObject;
     } catch (error) {
       logger.error({ error }, 'Failed to decrypt DEK with Cloud KMS');
       throw error;
@@ -125,12 +157,17 @@ export class CloudKMSClient {
   }
 
   async generateAndEncryptDek(tenantId?: string): Promise<Buffer> {
+    const newDek = DeterministicAES.generateRandomDEK();
     try {
-      const newDek = DeterministicAES.generateRandomDEK();
-      return this.encryptDataEncryptionKey(newDek, tenantId);
+      return await this.encryptDataEncryptionKey(newDek, tenantId);
     } catch (error) {
       logger.error({ error }, 'Failed to generate and encrypt new DEK with Cloud KMS');
       throw new Error('Failed to generate and encrypt new DEK');
+    } finally {
+      // Only the wrapped (encrypted) form is ever returned or persisted --
+      // the plaintext DEK generated above has no further use past this
+      // call, on success or failure alike.
+      newDek.fill(0);
     }
   }
 
