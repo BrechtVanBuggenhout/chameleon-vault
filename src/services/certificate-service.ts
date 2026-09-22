@@ -13,6 +13,8 @@ import { TsaClient, TsaTimestampInfo } from '../gcp/tsa-client.js';
 import { RekorClient, RekorLogEntryInfo } from '../gcp/rekor-client.js';
 import { connectorRegistry } from './registry.js';
 import { CertificateSigner } from '../certificate-signer/sign.js';
+import { EvidentiaryStatus } from '../types/evidentiary-status.js';
+import { decodeJwt } from 'jose';
 
 const logger = createLogger('certificate-service');
 
@@ -179,7 +181,42 @@ export class CertificateService {
    * silently mutate deletion-request state or consume a slot in the
    * tenant's certificate chain, so this fallback does neither.
    */
-  async getCertificateForUser(userId: string, tenantId: string = 'default-tenant'): Promise<{ certificate: string; stored: boolean }> {
+  /**
+   * Builds the per-mechanism evidentiary status for one specific
+   * certificate -- see EvidentiaryStatus's own doc comment for why it
+   * excludes a signature field and reports hash-chain *linkage* rather
+   * than full chain-integrity verification. chainSequence is read from the
+   * certificate's own JWT claims (decodeJwt -- no signature verification,
+   * this is our own already-fetched certificate, not an externally
+   * supplied one) rather than trusted from context, so this stays correct
+   * even if a future code path's "stored implies chained" assumption ever
+   * stops holding.
+   */
+  private buildEvidentiaryStatus(
+    certificate: string,
+    tsaTimestamp?: TsaTimestampInfo,
+    rekorEntry?: RekorLogEntryInfo
+  ): EvidentiaryStatus {
+    let chainSequence: number | null = null;
+    try {
+      const payload = decodeJwt(certificate);
+      chainSequence = typeof payload.chainSequence === 'number' ? payload.chainSequence : null;
+    } catch (error) {
+      // A real certificate is always a real JWT -- this should never
+      // happen. Defensive only: a decode hiccup here must never break
+      // certificate retrieval itself, just fall back to "not linked".
+      logger.warn({ error }, 'Failed to decode certificate JWT while building evidentiary status');
+    }
+
+    return {
+      hashChain: { linked: chainSequence !== null, chainSequence },
+      timestamp: tsaTimestamp?.status ?? 'NOT_ATTEMPTED',
+      transparencyLog: rekorEntry?.status ?? 'NOT_ATTEMPTED',
+      hardwareAttestation: 'NOT_AVAILABLE',
+    };
+  }
+
+  async getCertificateForUser(userId: string, tenantId: string = 'default-tenant'): Promise<{ certificate: string; stored: boolean; evidentiaryStatus: EvidentiaryStatus }> {
     const [keyStatus, deletionRequest] = await Promise.all([
       this.firestoreRegistry.getKeyStatus(userId, tenantId),
       this.deletionRequestRepo.getLatestCompletedDeletionRequestForUser(userId, tenantId),
@@ -189,7 +226,11 @@ export class CertificateService {
 
     if (deletionRequest.status === 'CERTIFICATE_ISSUED' && deletionRequest.certificate_gcs_path) {
       const stored = await this.gcsClient.downloadCertificate(deletionRequest.certificate_gcs_path);
-      return { certificate: stored.certificate, stored: true };
+      return {
+        certificate: stored.certificate,
+        stored: true,
+        evidentiaryStatus: this.buildEvidentiaryStatus(stored.certificate, stored.tsaTimestamp, stored.rekorEntry),
+      };
     }
 
     const ghostDataSummary = await this.lineageRepo.getGhostDataFindings(userId, tenantId);
@@ -201,7 +242,10 @@ export class CertificateService {
       knownDestinationTypes: connectorRegistry.getRegisteredConnectorNames(),
     });
     const { certificate } = await this.certificateSigner.signClaims({ ...baseClaims, previousCertificateHash: null, chainSequence: null });
-    return { certificate, stored: false };
+    // Unchained fallback issuance -- neither TSA nor Rekor is ever
+    // attempted on this path, so both report NOT_ATTEMPTED rather than
+    // FAILED (nothing failed; nothing was tried).
+    return { certificate, stored: false, evidentiaryStatus: this.buildEvidentiaryStatus(certificate) };
   }
 
   /**
@@ -212,12 +256,12 @@ export class CertificateService {
    * delegates to getCertificateForUser above rather than duplicating GCS
    * retrieval here -- same trusted path a direct-by-ID lookup already uses.
    */
-  async getLatestCertificateForTenant(tenantId: string = 'default-tenant'): Promise<{ certificate: string; userId: string } | null> {
+  async getLatestCertificateForTenant(tenantId: string = 'default-tenant'): Promise<{ certificate: string; userId: string; evidentiaryStatus: EvidentiaryStatus } | null> {
     const deletionRequest = await this.deletionRequestRepo.getMostRecentCertificateIssuedForTenant(tenantId);
     if (!deletionRequest) return null;
 
-    const { certificate } = await this.getCertificateForUser(deletionRequest.user_id, tenantId);
-    return { certificate, userId: deletionRequest.user_id };
+    const { certificate, evidentiaryStatus } = await this.getCertificateForUser(deletionRequest.user_id, tenantId);
+    return { certificate, userId: deletionRequest.user_id, evidentiaryStatus };
   }
 
   /**

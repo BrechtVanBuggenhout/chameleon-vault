@@ -22,12 +22,13 @@ export async function certificateRoutes(
     const tenantId = (request.headers['x-tenant-id'] as string) || 'default-tenant';
 
     try {
-      const { certificate } = await certificateService.getCertificateForUser(userId, tenantId);
+      const { certificate, evidentiaryStatus } = await certificateService.getCertificateForUser(userId, tenantId);
 
       return {
         certificate,
         tenantId,
         userId,
+        evidentiaryStatus,
         timestamp: new Date().toISOString()
       };
     } catch (error: unknown) {
@@ -73,6 +74,7 @@ export async function certificateRoutes(
         certificate: result.certificate,
         tenantId,
         userId: result.userId,
+        evidentiaryStatus: result.evidentiaryStatus,
         timestamp: new Date().toISOString()
       };
     } catch (error: unknown) {

@@ -24,6 +24,15 @@ await jest.unstable_mockModule('../src/config/env.js', () => ({
 
 const { CertificateService } = await import('../src/services/certificate-service.js');
 
+// A syntactically valid (unsigned) JWT-shaped string -- buildEvidentiaryStatus
+// decodes this via jose's decodeJwt (no signature check) to read
+// chainSequence, so the mock needs a real three-segment token, not just any
+// string.
+function fakeJwt(payload: Record<string, unknown>): string {
+  const b64url = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  return `${b64url({ alg: 'PS256' })}.${b64url(payload)}.fake-signature`;
+}
+
 // Real bug this replaced: findLatestCertificate used to probe 5 hardcoded
 // demo user IDs and show whichever one it found first -- a real customer
 // with real certificates saw "no certificates yet" regardless of their real
@@ -74,7 +83,11 @@ describe('CertificateService.getLatestCertificateForTenant', () => {
       getLatestCompletedDeletionRequestForUser: jest.fn().mockResolvedValue(baseRequest),
     };
     mockGcsClient = {
-      downloadCertificate: jest.fn().mockResolvedValue({ certificate: 'stored-jwt-for-usr-real-042' }),
+      downloadCertificate: jest.fn().mockResolvedValue({
+        certificate: fakeJwt({ sub: 'usr-real-042', chainSequence: 7, previousCertificateHash: 'abc123' }),
+        tsaTimestamp: { status: 'OBTAINED' },
+        rekorEntry: { status: 'PUBLISHED' },
+      }),
     };
 
     service = new CertificateService(
@@ -92,7 +105,16 @@ describe('CertificateService.getLatestCertificateForTenant', () => {
     const result = await service.getLatestCertificateForTenant('acme-tenant');
 
     expect(mockDeletionRequestRepo.getMostRecentCertificateIssuedForTenant).toHaveBeenCalledWith('acme-tenant');
-    expect(result).toEqual({ certificate: 'stored-jwt-for-usr-real-042', userId: 'usr-real-042' });
+    expect(result).toEqual({
+      certificate: fakeJwt({ sub: 'usr-real-042', chainSequence: 7, previousCertificateHash: 'abc123' }),
+      userId: 'usr-real-042',
+      evidentiaryStatus: {
+        hashChain: { linked: true, chainSequence: 7 },
+        timestamp: 'OBTAINED',
+        transparencyLog: 'PUBLISHED',
+        hardwareAttestation: 'NOT_AVAILABLE',
+      },
+    });
   });
 
   it('delegates to getCertificateForUser for the actual retrieval -- not a separate, duplicated GCS read path', async () => {
