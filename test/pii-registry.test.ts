@@ -236,7 +236,7 @@ describe('POST /pii-registry/sync-now', () => {
     const app = Fastify({ logger: false });
     await app.register(piiRegistryRoutes, {
       piiRegistryService: new PiiRegistryService(devPiiRegistry),
-      syncTrigger: { trigger: async () => ({ status: 'ok', resources_synced: 1, users_synced: 1, errors: [] }) },
+      syncTrigger: { trigger: async () => ({ status: 'ok', resources_queued: 1, chunks_queued: 1, errors: [] }) },
     });
 
     const response = await app.inject({ method: 'POST', url: '/pii-registry/sync-now' });
@@ -250,7 +250,7 @@ describe('POST /pii-registry/sync-now', () => {
     await app.register(piiRegistryRoutes, {
       piiRegistryService: new PiiRegistryService(devPiiRegistry),
       writeToken: WRITE_TOKEN,
-      syncTrigger: { trigger: async () => ({ status: 'ok', resources_synced: 1, users_synced: 1, errors: [] }) },
+      syncTrigger: { trigger: async () => ({ status: 'ok', resources_queued: 1, chunks_queued: 1, errors: [] }) },
     });
 
     const response = await app.inject({
@@ -289,7 +289,7 @@ describe('POST /pii-registry/sync-now', () => {
       syncTrigger: {
         trigger: async () => {
           triggered = true;
-          return { status: 'ok', resources_synced: 2, users_synced: 5, errors: [] };
+          return { status: 'ok', resources_queued: 2, chunks_queued: 5, errors: [] };
         },
       },
     });
@@ -303,8 +303,8 @@ describe('POST /pii-registry/sync-now', () => {
     expect(triggered).toBe(true);
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
-    expect(body.resources_synced).toBe(2);
-    expect(body.users_synced).toBe(5);
+    expect(body.resources_queued).toBe(2);
+    expect(body.chunks_queued).toBe(5);
 
     await app.close();
   });
